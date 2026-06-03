@@ -1,0 +1,335 @@
+[
+  {
+    "id": "CA4-001",
+    "description": "Geo-Country IS 'BR': request do Brasil e elegivel",
+    "ca": "CA-4",
+    "sub": "geo-country-is-match",
+    "input": {
+      "rule_logic": "AND",
+      "conditions": [{"vector": "GeoCountry", "operator": "is", "value": "BR"}],
+      "context": {"country": "BR", "city": "Sao Paulo"}
+    },
+    "expect": {"eligible": true}
+  },
+  {
+    "id": "CA4-002",
+    "description": "Geo-Country IS 'US': request do Brasil nao e elegivel",
+    "ca": "CA-4",
+    "sub": "geo-country-is-no-match",
+    "input": {
+      "rule_logic": "AND",
+      "conditions": [{"vector": "GeoCountry", "operator": "is", "value": "US"}],
+      "context": {"country": "BR", "city": "Sao Paulo"}
+    },
+    "expect": {"eligible": false}
+  },
+  {
+    "id": "CA4-003",
+    "description": "Geo-Country IS-NOT 'US': request do Brasil e elegivel",
+    "ca": "CA-4",
+    "sub": "geo-country-isnot-match",
+    "input": {
+      "rule_logic": "AND",
+      "conditions": [{"vector": "GeoCountry", "operator": "is_not", "value": "US"}],
+      "context": {"country": "BR", "city": "Sao Paulo"}
+    },
+    "expect": {"eligible": true}
+  },
+  {
+    "id": "CA4-004",
+    "description": "Geo-Country IS-NOT 'BR': request do Brasil nao e elegivel",
+    "ca": "CA-4",
+    "sub": "geo-country-isnot-self",
+    "input": {
+      "rule_logic": "AND",
+      "conditions": [{"vector": "GeoCountry", "operator": "is_not", "value": "BR"}],
+      "context": {"country": "BR", "city": "Sao Paulo"}
+    },
+    "expect": {"eligible": false}
+  },
+  {
+    "id": "CA4-005",
+    "description": "Geo-City CONTAINS 'paulo': Sao Paulo contem 'paulo'",
+    "ca": "CA-4",
+    "sub": "geo-city-contains",
+    "input": {
+      "rule_logic": "AND",
+      "conditions": [{"vector": "GeoCity", "operator": "contains", "value": "paulo"}],
+      "context": {"country": "BR", "city": "Sao Paulo"}
+    },
+    "expect": {"eligible": true}
+  },
+  {
+    "id": "CA4-006",
+    "description": "Site-URL CONTAINS 'news.example.com': URL correspondente",
+    "ca": "CA-4",
+    "sub": "site-url-contains",
+    "input": {
+      "rule_logic": "AND",
+      "conditions": [{"vector": "SiteURL", "operator": "contains", "value": "news.example.com"}],
+      "context": {"site_url": "https://news.example.com/article/123"}
+    },
+    "expect": {"eligible": true}
+  },
+  {
+    "id": "CA4-007",
+    "description": "Site-URL CONTAINS '/business/': URL de outra secao nao corresponde",
+    "ca": "CA-4",
+    "sub": "site-url-contains-no-match",
+    "input": {
+      "rule_logic": "AND",
+      "conditions": [{"vector": "SiteURL", "operator": "contains", "value": "/business/"}],
+      "context": {"site_url": "https://news.example.com/sports/article/123"}
+    },
+    "expect": {"eligible": false}
+  },
+  {
+    "id": "CA4-008",
+    "description": "Client-UserAgent CONTAINS 'android': UA mobile corresponde",
+    "ca": "CA-4",
+    "sub": "ua-contains-match",
+    "input": {
+      "rule_logic": "AND",
+      "conditions": [{"vector": "ClientUA", "operator": "contains", "value": "android"}],
+      "context": {"user_agent": "Mozilla/5.0 (Linux; Android 14)"}
+    },
+    "expect": {"eligible": true}
+  },
+  {
+    "id": "CA4-009",
+    "description": "Client-UserAgent CONTAINS 'chrome': UA Firefox nao corresponde",
+    "ca": "CA-4",
+    "sub": "ua-contains-no-match",
+    "input": {
+      "rule_logic": "AND",
+      "conditions": [{"vector": "ClientUA", "operator": "contains", "value": "chrome"}],
+      "context": {"user_agent": "Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0"}
+    },
+    "expect": {"eligible": false}
+  },
+  {
+    "id": "CA4-010",
+    "description": "Time-DayOfWeek IS '3' (quarta): request na quarta e elegivel",
+    "ca": "CA-4",
+    "sub": "dayofweek-is-match",
+    "input": {
+      "rule_logic": "AND",
+      "conditions": [{"vector": "TimeDayOfWeek", "operator": "is", "value": "3"}],
+      "context": {"request_time": "2026-06-03T12:00:00Z"}
+    },
+    "expect": {
+      "eligible": true,
+      "comment": "2026-06-03 e quarta-feira (weekday=3)"
+    }
+  },
+  {
+    "id": "CA4-011",
+    "description": "Time-DayOfWeek IS-NOT '3': request na quarta nao e elegivel",
+    "ca": "CA-4",
+    "sub": "dayofweek-isnot-self",
+    "input": {
+      "rule_logic": "AND",
+      "conditions": [{"vector": "TimeDayOfWeek", "operator": "is_not", "value": "3"}],
+      "context": {"request_time": "2026-06-03T12:00:00Z"}
+    },
+    "expect": {"eligible": false}
+  },
+  {
+    "id": "CA4-012",
+    "description": "Site-Variable IS 'sports': secao sports corresponde",
+    "ca": "CA-4",
+    "sub": "site-var-is-match",
+    "input": {
+      "rule_logic": "AND",
+      "conditions": [{"vector": "SiteVariable", "operator": "is", "value": "sports", "site_var_key": "section"}],
+      "context": {"site_vars": {"section": "sports"}}
+    },
+    "expect": {"eligible": true}
+  },
+  {
+    "id": "CA4-013",
+    "description": "Site-Variable IS 'finance': secao sports nao corresponde",
+    "ca": "CA-4",
+    "sub": "site-var-is-no-match",
+    "input": {
+      "rule_logic": "AND",
+      "conditions": [{"vector": "SiteVariable", "operator": "is", "value": "finance", "site_var_key": "section"}],
+      "context": {"site_vars": {"section": "sports"}}
+    },
+    "expect": {"eligible": false}
+  },
+  {
+    "id": "CA4-014",
+    "description": "AND: todas as condicoes devem passar — uma falha descarta",
+    "ca": "CA-4",
+    "sub": "and-all-must-pass",
+    "input": {
+      "rule_logic": "AND",
+      "conditions": [
+        {"vector": "GeoCountry", "operator": "is", "value": "BR"},
+        {"vector": "GeoCity", "operator": "is", "value": "Rio de Janeiro"}
+      ],
+      "context": {"country": "BR", "city": "Sao Paulo"}
+    },
+    "expect": {
+      "eligible": false,
+      "comment": "Pais bate mas cidade nao bate; AND exige ambos"
+    }
+  },
+  {
+    "id": "CA4-015",
+    "description": "OR: qualquer condicao satisfaz — uma verdadeira e suficiente",
+    "ca": "CA-4",
+    "sub": "or-any-passes",
+    "input": {
+      "rule_logic": "OR",
+      "conditions": [
+        {"vector": "GeoCountry", "operator": "is", "value": "US"},
+        {"vector": "GeoCity", "operator": "is", "value": "Sao Paulo"}
+      ],
+      "context": {"country": "BR", "city": "Sao Paulo"}
+    },
+    "expect": {
+      "eligible": true,
+      "comment": "Pais nao bate (BR != US) mas cidade bate; OR e suficiente"
+    }
+  },
+  {
+    "id": "CA4-016",
+    "description": "RuleSet vazio (sem condicoes) e sempre elegivel (open rule)",
+    "ca": "CA-4",
+    "sub": "empty-ruleset-always-eligible",
+    "input": {
+      "rule_logic": "AND",
+      "conditions": [],
+      "context": {"country": "BR"}
+    },
+    "expect": {"eligible": true}
+  },
+  {
+    "id": "CA4-017",
+    "description": "Sem RuleSets referenciados: sem restricao de segmentacao — elegivel",
+    "ca": "CA-4",
+    "sub": "no-ruleset-ids-eligible",
+    "input": {
+      "rule_set_ids": [],
+      "context": {"country": "US"}
+    },
+    "expect": {"eligible": true}
+  },
+  {
+    "id": "CA4-018",
+    "description": "RuleSet ID desconhecido: fail-closed — inelegivel",
+    "ca": "CA-4",
+    "sub": "unknown-ruleset-ineligible",
+    "input": {
+      "rule_set_ids": ["nonexistent-ruleset-id"],
+      "context": {"country": "BR"}
+    },
+    "expect": {
+      "eligible": false,
+      "comment": "Stale banner referenciando rule set deletado: fail-closed (protecao contra erros silenciosos)"
+    }
+  },
+  {
+    "id": "CA4-019",
+    "description": "Anti-contradicao: AND com dois IS no mesmo vetor => Impossible (CA-4)",
+    "ca": "CA-4",
+    "sub": "anticontradiction-two-is-same-vector",
+    "input": {
+      "rule_logic": "AND",
+      "conditions": [
+        {"vector": "GeoCountry", "operator": "is", "value": "BR"},
+        {"vector": "GeoCountry", "operator": "is", "value": "US"}
+      ],
+      "context": {"country": "BR"}
+    },
+    "expect": {
+      "eligible": false,
+      "impossible_after_validate": true,
+      "comment": "Request so pode ter um pais; AND com dois IS diferentes e impossivel — silencia o banner (CA-4)"
+    }
+  },
+  {
+    "id": "CA4-020",
+    "description": "Anti-contradicao: IS 'BR' AND IS-NOT 'BR' no mesmo vetor => Impossible",
+    "ca": "CA-4",
+    "sub": "anticontradiction-is-and-isnot-same-value",
+    "input": {
+      "rule_logic": "AND",
+      "conditions": [
+        {"vector": "GeoCountry", "operator": "is", "value": "BR"},
+        {"vector": "GeoCountry", "operator": "is_not", "value": "BR"}
+      ],
+      "context": {"country": "BR"}
+    },
+    "expect": {
+      "eligible": false,
+      "impossible_after_validate": true,
+      "comment": "IS BR AND IS-NOT BR e logicamente impossivel — silencia o banner"
+    }
+  },
+  {
+    "id": "CA4-021",
+    "description": "Anti-contradicao: todos os 7 dias excluidos por IS-NOT => Impossible",
+    "ca": "CA-4",
+    "sub": "anticontradiction-all-days-excluded",
+    "input": {
+      "rule_logic": "AND",
+      "conditions": [
+        {"vector": "TimeDayOfWeek", "operator": "is_not", "value": "0"},
+        {"vector": "TimeDayOfWeek", "operator": "is_not", "value": "1"},
+        {"vector": "TimeDayOfWeek", "operator": "is_not", "value": "2"},
+        {"vector": "TimeDayOfWeek", "operator": "is_not", "value": "3"},
+        {"vector": "TimeDayOfWeek", "operator": "is_not", "value": "4"},
+        {"vector": "TimeDayOfWeek", "operator": "is_not", "value": "5"},
+        {"vector": "TimeDayOfWeek", "operator": "is_not", "value": "6"}
+      ],
+      "context": {"request_time": "2026-06-03T12:00:00Z"}
+    },
+    "expect": {
+      "eligible": false,
+      "impossible_after_validate": true,
+      "comment": "Excluir todos os 7 dias da semana com IS-NOT e impossivel"
+    }
+  },
+  {
+    "id": "CA4-022",
+    "description": "OR com dois IS no mesmo vetor NAO e marcado como Impossible",
+    "ca": "CA-4",
+    "sub": "or-two-is-not-impossible",
+    "input": {
+      "rule_logic": "OR",
+      "conditions": [
+        {"vector": "GeoCountry", "operator": "is", "value": "BR"},
+        {"vector": "GeoCountry", "operator": "is", "value": "US"}
+      ],
+      "context": {"country": "BR"}
+    },
+    "expect": {
+      "eligible": true,
+      "impossible_after_validate": false,
+      "comment": "OR com dois paises diferentes e valido (BR ou US)"
+    }
+  },
+  {
+    "id": "CA4-023",
+    "description": "RuleSet com Impossible=true silencia o banner apos Validate()",
+    "ca": "CA-4",
+    "sub": "impossible-ruleset-blocks-banner",
+    "input": {
+      "rule_logic": "AND",
+      "conditions": [
+        {"vector": "GeoCountry", "operator": "is", "value": "BR"},
+        {"vector": "GeoCountry", "operator": "is", "value": "US"}
+      ],
+      "validate_first": true,
+      "context": {"country": "BR"}
+    },
+    "expect": {
+      "eligible": false,
+      "impossible_after_validate": true,
+      "comment": "Apos Validate(), RuleSet deve ser Impossible e Eligible() deve retornar false (CA-4)"
+    }
+  }
+]

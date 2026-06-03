@@ -1,0 +1,218 @@
+[
+  {
+    "id": "CA6-001",
+    "description": "Impressao so contabilizada no pixel /lg (nao no request /asyncjs)",
+    "ca": "CA-6",
+    "sub": "impression-only-at-pixel",
+    "input": {
+      "endpoint": "/lg",
+      "params": {
+        "did": "dec-123",
+        "bid": "ban-1",
+        "cid": "camp-1",
+        "zid": "zone-1",
+        "tid": "tenant-1",
+        "tier": "SERVED_TIER_REMNANT"
+      }
+    },
+    "expect": {
+      "http_status": 200,
+      "content_type_prefix": "image/gif",
+      "impression_events_emitted": 1,
+      "event": {
+        "decision_id": "dec-123",
+        "banner_id": "ban-1",
+        "campaign_id": "camp-1",
+        "zone_id": "zone-1",
+        "tenant_id": "tenant-1",
+        "blank": false,
+        "billable": true
+      }
+    }
+  },
+  {
+    "id": "CA6-002",
+    "description": "/asyncjs NAO contabiliza impressao — apenas enfileira AdRequest",
+    "ca": "CA-6",
+    "sub": "asyncjs-no-impression",
+    "input": {
+      "endpoint": "/asyncjs",
+      "params": {"zoneid": "zone-1", "tid": "t1", "cb": "12345"}
+    },
+    "expect": {
+      "http_status": 200,
+      "content_type_prefix": "application/javascript",
+      "impression_events_emitted": 0,
+      "ad_request_events_emitted": 1,
+      "comment": "O request conta a chegada do JS tag; a impressao so e contabilizada quando o pixel /lg carrega"
+    }
+  },
+  {
+    "id": "CA6-003",
+    "description": "Clique via /ck: token HMAC valido resulta em 302 e emite evento de clique",
+    "ca": "CA-6",
+    "sub": "click-302-redirect",
+    "input": {
+      "endpoint": "/ck",
+      "valid_token": true,
+      "dest_url": "https://advertiser.example.com/landing",
+      "params": {
+        "did": "dec-456",
+        "bid": "ban-2",
+        "cid": "camp-2",
+        "zid": "zone-2",
+        "tid": "tenant-1"
+      }
+    },
+    "expect": {
+      "http_status": 302,
+      "location": "https://advertiser.example.com/landing",
+      "click_events_emitted": 1,
+      "event": {
+        "decision_id": "dec-456",
+        "dest_url": "https://advertiser.example.com/landing"
+      }
+    }
+  },
+  {
+    "id": "CA6-004",
+    "description": "Conversao via /ct: pixel de conversao retorna 200 e emite evento",
+    "ca": "CA-6",
+    "sub": "conversion-pixel",
+    "input": {
+      "endpoint": "/ct",
+      "params": {
+        "did": "dec-789",
+        "bid": "ban-3",
+        "cid": "camp-3",
+        "tid": "tenant-1",
+        "adid": "origin-dec-001"
+      }
+    },
+    "expect": {
+      "http_status": 200,
+      "content_type_prefix": "image/gif",
+      "conversion_events_emitted": 1,
+      "event": {
+        "decision_id": "dec-789",
+        "attribution_decision_id": "origin-dec-001"
+      }
+    }
+  },
+  {
+    "id": "CA6-005",
+    "description": "Impressao em branco (BLANK): blank=true, billable=false no evento",
+    "ca": "CA-6",
+    "sub": "blank-impression-event",
+    "input": {
+      "endpoint": "/lg",
+      "params": {
+        "did": "dec-blank",
+        "bid": "",
+        "cid": "",
+        "zid": "zone-1",
+        "tid": "tenant-1",
+        "tier": "SERVED_TIER_BLANK"
+      }
+    },
+    "expect": {
+      "http_status": 200,
+      "impression_events_emitted": 1,
+      "event": {
+        "blank": true,
+        "billable": false,
+        "served_tier": "SERVED_TIER_BLANK"
+      }
+    }
+  },
+  {
+    "id": "CA6-006",
+    "description": "Token HMAC invalido em /ck: 400, sem evento de clique",
+    "ca": "CA-6",
+    "sub": "click-invalid-token-rejected",
+    "input": {
+      "endpoint": "/ck",
+      "params": {
+        "tok": "tampered.invalidMAC",
+        "did": "dec-x",
+        "bid": "b",
+        "cid": "c",
+        "zid": "z",
+        "tid": "t"
+      }
+    },
+    "expect": {
+      "http_status": 400,
+      "click_events_emitted": 0
+    }
+  },
+  {
+    "id": "CA6-007",
+    "description": "Sem CK_HMAC_SECRET (signer nil): /ck retorna 503 fail-closed",
+    "ca": "CA-6",
+    "sub": "click-no-signer-503",
+    "input": {
+      "endpoint": "/ck",
+      "signer_nil": true,
+      "params": {
+        "tok": "anything",
+        "did": "d",
+        "bid": "b",
+        "cid": "c",
+        "zid": "z",
+        "tid": "t"
+      }
+    },
+    "expect": {
+      "http_status": 503,
+      "click_events_emitted": 0,
+      "comment": "fail-closed: sem secret configurado, nenhum clique e processado"
+    }
+  },
+  {
+    "id": "CA6-008",
+    "description": "Dedupe idempotente: mesmo event_id emitido duas vezes — segundo descartado",
+    "ca": "CA-6",
+    "sub": "dedupe-idempotent",
+    "input": {
+      "duplicate_event_id": "evt-dup-001",
+      "emit_count": 2
+    },
+    "expect": {
+      "events_produced": 1,
+      "comment": "at-least-once sem dupla contagem: seenIDs deduplicam dentro do processo"
+    }
+  },
+  {
+    "id": "CA6-009",
+    "description": "UA bruto reduzido a classe grossa antes de emitir AdRequest (TX-5)",
+    "ca": "CA-6",
+    "sub": "ua-coarse-class-tx5",
+    "input": {
+      "endpoint": "/asyncjs",
+      "raw_ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+      "params": {"zoneid": "z1", "tid": "t1", "cb": "1"}
+    },
+    "expect": {
+      "ua_class_emitted_not_raw_ua": true,
+      "ua_class_max_length": 30,
+      "must_not_contain": ["Windows NT", "AppleWebKit"],
+      "comment": "Raw UA nunca sai do processo como PII (TX-5/DA-11)"
+    }
+  },
+  {
+    "id": "CA6-010",
+    "description": "Referer sanitizado: query string e fragment removidos antes de emitir",
+    "ca": "CA-6",
+    "sub": "referer-sanitized",
+    "input": {
+      "endpoint": "/asyncjs",
+      "referer": "https://publisher.example.com/article?session_token=abc123&uid=456",
+      "params": {"zoneid": "z1", "tid": "t1", "cb": "1"}
+    },
+    "expect": {
+      "referer_url_emitted": "https://publisher.example.com/article",
+      "must_not_contain": ["session_token", "uid="]
+    }
+  }
+]

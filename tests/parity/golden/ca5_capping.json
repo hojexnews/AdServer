@@ -1,0 +1,168 @@
+[
+  {
+    "id": "CA5-001",
+    "description": "campaign_total cap=2: permite 2 impressoes, bloqueia a 3a",
+    "ca": "CA-5",
+    "sub": "campaign-total-limits",
+    "input": {
+      "user_id": "user-abc",
+      "campaign": {"id": "camp-1", "cap_total": 2, "cap_session": 0, "cap_clock": 0},
+      "banner": {"id": "ban-1", "cap_total": 0, "cap_session": 0, "cap_clock": 0},
+      "calls": 3
+    },
+    "expect": {
+      "results": [true, true, false],
+      "comment": "cap_total=2: impressoes 1 e 2 permitidas; impressao 3 bloqueada"
+    }
+  },
+  {
+    "id": "CA5-002",
+    "description": "session cap=1: permite 1, bloqueia 2a na mesma sessao",
+    "ca": "CA-5",
+    "sub": "session-cap",
+    "input": {
+      "user_id": "user-abc",
+      "campaign": {"id": "camp-1", "cap_total": 0, "cap_session": 1, "cap_clock": 0},
+      "banner": {"id": "ban-1", "cap_total": 0, "cap_session": 0, "cap_clock": 0},
+      "calls": 2
+    },
+    "expect": {
+      "results": [true, false],
+      "comment": "cap_session=1: 1a impressao permitida; 2a bloqueada na mesma sessao"
+    }
+  },
+  {
+    "id": "CA5-003",
+    "description": "clock cap=2/hora: permite 2, bloqueia 3a na janela",
+    "ca": "CA-5",
+    "sub": "clock-cap",
+    "input": {
+      "user_id": "user-abc",
+      "campaign": {"id": "camp-1", "cap_total": 0, "cap_session": 0, "cap_clock": 2, "cap_clock_window_sec": 3600},
+      "banner": {"id": "ban-1", "cap_total": 0, "cap_session": 0, "cap_clock": 0},
+      "calls": 3
+    },
+    "expect": {
+      "results": [true, true, false],
+      "comment": "cap_clock=2/hora: 2 impressoes permitidas; 3a bloqueada"
+    }
+  },
+  {
+    "id": "CA5-004",
+    "description": "Banner cap sobrescreve campaign cap (cap banner mais restritivo)",
+    "ca": "CA-5",
+    "sub": "banner-overrides-campaign",
+    "input": {
+      "user_id": "user-abc",
+      "campaign": {"id": "camp-1", "cap_total": 10, "cap_session": 0, "cap_clock": 0},
+      "banner": {"id": "ban-1", "cap_total": 1, "cap_session": 0, "cap_clock": 0},
+      "calls": 2
+    },
+    "expect": {
+      "results": [true, false],
+      "comment": "banner.cap_total=1 sobrescreve campaign.cap_total=10 (DA-6); apos 1 impressao, bloqueado"
+    }
+  },
+  {
+    "id": "CA5-005",
+    "description": "Sem user_id (sem cookie/identificador estavel): fail-safe aborta entrega capeada",
+    "ca": "CA-5",
+    "sub": "no-userid-failsafe",
+    "input": {
+      "user_id": "",
+      "campaign": {"id": "camp-1", "cap_total": 5, "cap_session": 0, "cap_clock": 0},
+      "banner": {"id": "ban-1", "cap_total": 0, "cap_session": 0, "cap_clock": 0},
+      "calls": 1
+    },
+    "expect": {
+      "results": [false],
+      "comment": "user_id vazio: silencio preferido a estouro de contabilidade (DA-6 fail-safe)"
+    }
+  },
+  {
+    "id": "CA5-006",
+    "description": "Redis indisponivel em campanha capeada: fail-safe nega entrega",
+    "ca": "CA-5",
+    "sub": "redis-down-capped-denies",
+    "input": {
+      "user_id": "user-abc",
+      "campaign": {"id": "camp-1", "cap_total": 5, "cap_session": 0, "cap_clock": 0},
+      "banner": {"id": "ban-1", "cap_total": 0, "cap_session": 0, "cap_clock": 0},
+      "redis_down": true,
+      "calls": 1
+    },
+    "expect": {
+      "results": [false],
+      "comment": "Redis down em campanha capeada: fail-safe nega (nao pode garantir o cap, DA-6)"
+    }
+  },
+  {
+    "id": "CA5-007",
+    "description": "Redis indisponivel em campanha SEM cap: permitido (sem Redis touch no caminho rapido)",
+    "ca": "CA-5",
+    "sub": "redis-down-uncapped-allows",
+    "input": {
+      "user_id": "user-abc",
+      "campaign": {"id": "camp-1", "cap_total": 0, "cap_session": 0, "cap_clock": 0},
+      "banner": {"id": "ban-1", "cap_total": 0, "cap_session": 0, "cap_clock": 0},
+      "redis_down": true,
+      "calls": 1
+    },
+    "expect": {
+      "results": [true],
+      "comment": "Campanha sem caps nao toca Redis; Redis down nao afeta entrega"
+    }
+  },
+  {
+    "id": "CA5-008",
+    "description": "Usuarios diferentes nao compartilham estado de capping",
+    "ca": "CA-5",
+    "sub": "user-isolation",
+    "input": {
+      "campaign": {"id": "camp-1", "cap_total": 1, "cap_session": 0, "cap_clock": 0},
+      "banner": {"id": "ban-1", "cap_total": 0, "cap_session": 0, "cap_clock": 0},
+      "user_calls": [
+        {"user_id": "user-A", "calls": 1},
+        {"user_id": "user-B", "calls": 1}
+      ]
+    },
+    "expect": {
+      "user_results": [
+        {"user_id": "user-A", "results": [true]},
+        {"user_id": "user-B", "results": [true]}
+      ],
+      "comment": "user-A capeado nao afeta user-B (contadores independentes)"
+    }
+  },
+  {
+    "id": "CA5-009",
+    "description": "Rotacao de salt: nova janela permite apos rotacao",
+    "ca": "CA-5",
+    "sub": "salt-rotation-new-window",
+    "input": {
+      "user_id": "user-abc",
+      "campaign": {"id": "camp-1", "cap_total": 1, "cap_session": 0, "cap_clock": 0},
+      "banner": {"id": "ban-1", "cap_total": 0, "cap_session": 0, "cap_clock": 0},
+      "salt_rotation": true
+    },
+    "expect": {
+      "pre_rotation_results": [true],
+      "post_rotation_results": [true],
+      "comment": "Apos rotacao do salt, a chave Redis muda; nova janela de capping e iniciada"
+    }
+  },
+  {
+    "id": "CA5-010",
+    "description": "Salt vazio na construcao do Capper: panic (fail-closed)",
+    "ca": "CA-5",
+    "sub": "empty-salt-panics",
+    "input": {
+      "salt": "",
+      "expect_panic": true
+    },
+    "expect": {
+      "panic": true,
+      "comment": "Salt vazio e defect de seguranca; capping.New() deve entrar em panic (fail-closed)"
+    }
+  }
+]

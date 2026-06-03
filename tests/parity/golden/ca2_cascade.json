@@ -1,0 +1,263 @@
+[
+  {
+    "id": "CA2-001",
+    "description": "Override vence sobre Contract e Remnant presentes",
+    "ca": "CA-2",
+    "sub": "override-wins",
+    "input": {
+      "zone_id": "z1",
+      "tenant_id": "t1",
+      "request_time": "2026-06-03T12:00:00Z",
+      "user_id": "",
+      "campaigns": [
+        {"id": "ov1", "tier": "OVERRIDE", "priority": 10, "active": true},
+        {"id": "ct1", "tier": "CONTRACT", "priority": 5,  "active": true, "goal_impressions": 1000, "delivered_impressions": 500},
+        {"id": "rm1", "tier": "REMNANT",  "priority": 1,  "active": true, "ecpm_minor_units": 200}
+      ],
+      "banners": [
+        {"id": "ban-ov1", "campaign_id": "ov1", "active": true},
+        {"id": "ban-ct1", "campaign_id": "ct1", "active": true},
+        {"id": "ban-rm1", "campaign_id": "rm1", "active": true}
+      ]
+    },
+    "expect": {
+      "served_tier": "SERVED_TIER_OVERRIDE",
+      "campaign_id": "ov1",
+      "banner_id": "ban-ov1",
+      "blank": false
+    }
+  },
+  {
+    "id": "CA2-002",
+    "description": "Contract vence sobre Remnant quando Override ausente",
+    "ca": "CA-2",
+    "sub": "contract-beats-remnant",
+    "input": {
+      "zone_id": "z1",
+      "tenant_id": "t1",
+      "request_time": "2026-06-03T12:00:00Z",
+      "user_id": "",
+      "campaigns": [
+        {"id": "ct1", "tier": "CONTRACT", "priority": 5, "active": true, "goal_impressions": 1000, "delivered_impressions": 0},
+        {"id": "rm1", "tier": "REMNANT",  "priority": 1, "active": true, "ecpm_minor_units": 999}
+      ],
+      "banners": [
+        {"id": "ban-ct1", "campaign_id": "ct1", "active": true},
+        {"id": "ban-rm1", "campaign_id": "rm1", "active": true}
+      ]
+    },
+    "expect": {
+      "served_tier": "SERVED_TIER_CONTRACT",
+      "campaign_id": "ct1",
+      "banner_id": "ban-ct1",
+      "blank": false
+    }
+  },
+  {
+    "id": "CA2-003",
+    "description": "Contract com maior deficit de pacing vence (DA-4)",
+    "ca": "CA-2",
+    "sub": "contract-deficit-ordering",
+    "input": {
+      "zone_id": "z1",
+      "tenant_id": "t1",
+      "request_time": "2026-06-03T12:00:00Z",
+      "user_id": "",
+      "campaigns": [
+        {"id": "ct-low",  "tier": "CONTRACT", "priority": 5, "active": true, "goal_impressions": 1000, "delivered_impressions": 900},
+        {"id": "ct-high", "tier": "CONTRACT", "priority": 5, "active": true, "goal_impressions": 1000, "delivered_impressions": 100}
+      ],
+      "banners": [
+        {"id": "ban-ct-low",  "campaign_id": "ct-low",  "active": true},
+        {"id": "ban-ct-high", "campaign_id": "ct-high", "active": true}
+      ]
+    },
+    "expect": {
+      "served_tier": "SERVED_TIER_CONTRACT",
+      "campaign_id": "ct-high",
+      "comment": "ct-high tem deficit 90% vs ct-low 10%; maior deficit vence (DA-4)",
+      "blank": false
+    }
+  },
+  {
+    "id": "CA2-004",
+    "description": "Remnant preenche quando Override e Contract ausentes",
+    "ca": "CA-2",
+    "sub": "remnant-fills",
+    "input": {
+      "zone_id": "z1",
+      "tenant_id": "t1",
+      "request_time": "2026-06-03T12:00:00Z",
+      "user_id": "",
+      "campaigns": [
+        {"id": "rm1", "tier": "REMNANT", "priority": 1, "active": true, "ecpm_minor_units": 200}
+      ],
+      "banners": [
+        {"id": "ban-rm1", "campaign_id": "rm1", "active": true}
+      ]
+    },
+    "expect": {
+      "served_tier": "SERVED_TIER_REMNANT",
+      "campaign_id": "rm1",
+      "blank": false
+    }
+  },
+  {
+    "id": "CA2-005",
+    "description": "Remnant ordenado por eCPM decrescente (mesma asset_code)",
+    "ca": "CA-2",
+    "sub": "remnant-ecpm-ordering",
+    "input": {
+      "zone_id": "z1",
+      "tenant_id": "t1",
+      "request_time": "2026-06-03T12:00:00Z",
+      "user_id": "",
+      "campaigns": [
+        {"id": "rm-low",  "tier": "REMNANT", "priority": 1, "active": true, "ecpm_minor_units": 100},
+        {"id": "rm-high", "tier": "REMNANT", "priority": 1, "active": true, "ecpm_minor_units": 500}
+      ],
+      "banners": [
+        {"id": "ban-rm-low",  "campaign_id": "rm-low",  "active": true},
+        {"id": "ban-rm-high", "campaign_id": "rm-high", "active": true}
+      ]
+    },
+    "expect": {
+      "served_tier": "SERVED_TIER_REMNANT",
+      "campaign_id": "rm-high",
+      "comment": "rm-high eCPM=500 minor-units > rm-low eCPM=100; maior eCPM vence",
+      "blank": false
+    }
+  },
+  {
+    "id": "CA2-006",
+    "description": "Nenhum elegivel em nenhum estrato: BLANK, pagina nao quebra",
+    "ca": "CA-2",
+    "sub": "blank-no-eligible",
+    "input": {
+      "zone_id": "z1",
+      "tenant_id": "t1",
+      "request_time": "2026-06-03T12:00:00Z",
+      "user_id": "",
+      "campaigns": [],
+      "banners": []
+    },
+    "expect": {
+      "served_tier": "SERVED_TIER_BLANK",
+      "campaign_id": null,
+      "banner_id": null,
+      "blank": true,
+      "page_must_not_break": true
+    }
+  },
+  {
+    "id": "CA2-007",
+    "description": "Campanha inativa e ignorada, resulta em BLANK",
+    "ca": "CA-2",
+    "sub": "inactive-campaign-blank",
+    "input": {
+      "zone_id": "z1",
+      "tenant_id": "t1",
+      "request_time": "2026-06-03T12:00:00Z",
+      "user_id": "",
+      "campaigns": [
+        {"id": "c1", "tier": "REMNANT", "priority": 1, "active": false}
+      ],
+      "banners": [
+        {"id": "ban-c1", "campaign_id": "c1", "active": true}
+      ]
+    },
+    "expect": {
+      "served_tier": "SERVED_TIER_BLANK",
+      "blank": true
+    }
+  },
+  {
+    "id": "CA2-008",
+    "description": "Campanha expirada (EndAt no passado) e ignorada",
+    "ca": "CA-2",
+    "sub": "expired-campaign-blank",
+    "input": {
+      "zone_id": "z1",
+      "tenant_id": "t1",
+      "request_time": "2026-06-03T12:00:00Z",
+      "user_id": "",
+      "campaigns": [
+        {"id": "c1", "tier": "REMNANT", "priority": 1, "active": true, "end_at": "2026-06-03T11:00:00Z"}
+      ],
+      "banners": [
+        {"id": "ban-c1", "campaign_id": "c1", "active": true}
+      ]
+    },
+    "expect": {
+      "served_tier": "SERVED_TIER_BLANK",
+      "blank": true
+    }
+  },
+  {
+    "id": "CA2-009",
+    "description": "Banner inativo: campanha sem banner elegivel resulta em BLANK",
+    "ca": "CA-2",
+    "sub": "inactive-banner-blank",
+    "input": {
+      "zone_id": "z1",
+      "tenant_id": "t1",
+      "request_time": "2026-06-03T12:00:00Z",
+      "user_id": "",
+      "campaigns": [
+        {"id": "c1", "tier": "REMNANT", "priority": 1, "active": true}
+      ],
+      "banners": [
+        {"id": "ban-c1", "campaign_id": "c1", "active": false}
+      ]
+    },
+    "expect": {
+      "served_tier": "SERVED_TIER_BLANK",
+      "blank": true
+    }
+  },
+  {
+    "id": "CA2-010",
+    "description": "Campanha de outro tenant e invisivel (isolamento CA-1)",
+    "ca": "CA-2",
+    "sub": "tenant-isolation-blank",
+    "input": {
+      "zone_id": "z1",
+      "tenant_id": "t1",
+      "request_time": "2026-06-03T12:00:00Z",
+      "user_id": "",
+      "campaigns": [
+        {"id": "c1", "tier": "REMNANT", "priority": 1, "active": true, "tenant_id": "other-tenant"}
+      ],
+      "banners": [
+        {"id": "ban-c1", "campaign_id": "c1", "active": true}
+      ]
+    },
+    "expect": {
+      "served_tier": "SERVED_TIER_BLANK",
+      "blank": true
+    }
+  },
+  {
+    "id": "CA2-011",
+    "description": "Zona desconhecida no snapshot: fail-closed BLANK (CA-1)",
+    "ca": "CA-2",
+    "sub": "unknown-zone-fail-closed",
+    "input": {
+      "zone_id": "nonexistent-zone",
+      "tenant_id": "t1",
+      "request_time": "2026-06-03T12:00:00Z",
+      "user_id": "",
+      "campaigns": [
+        {"id": "rm1", "tier": "REMNANT", "priority": 1, "active": true}
+      ],
+      "banners": [
+        {"id": "ban-rm1", "campaign_id": "rm1", "active": true}
+      ]
+    },
+    "expect": {
+      "served_tier": "SERVED_TIER_BLANK",
+      "blank": true,
+      "reason": "zone not in snapshot"
+    }
+  }
+]
