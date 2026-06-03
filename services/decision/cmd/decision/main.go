@@ -5,34 +5,40 @@
 //	POST /v1/decide   — ad selection request; returns JSON creative or blank.
 //	GET  /healthz     — liveness probe.
 //
-// Design constraints:
+// Design constraints (invariants):
 //   - stdlib net/http only (no fasthttp, no framework).
 //   - No synchronous network call in the hot path beyond Redis capping
-//     (capping is I2; here the NoOpCapper is wired).
-//   - Every response includes a decision_id and model_version (even blank).
-//   - The IP address is resolved to geo and then immediately discarded (TX-5).
+//     (best-effort + fail-safe DA-6).
+//   - Every response includes a decision_id and model_version (even blank — TX-1).
+//   - The IP address is resolved to geo and then immediately discarded (TX-5/DA-11).
 //   - tenant_id is propagated through every Decision struct.
-//   - The DecisionSink interface is a no-op in I0; the Redpanda producer is I2.
+//   - DecisionSink (I2): Redpanda producer with WAL + at-least-once + dedupe.
+//   - Capper (I2): Redis-backed with fail-safe — no id → abort capped campaigns.
+//   - GeoResolver (I2): MaxMind GeoLite2 in memory; degraded to empty on miss.
+//   - Ranker (Fase 2 extension point): DefaultRanker in I0/I2; ML ranker in I4+.
 package main
 
 import (
-	cryptorand "crypto/rand"
 	"context"
-	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	commonv1 "github.com/hojex/adserver/gen/go/adserver/common/v1"
 	decisionv1 "github.com/hojex/adserver/gen/go/adserver/decision/v1"
 	"github.com/hojex/adserver/internal/cascade"
+	"github.com/hojex/adserver/internal/capping"
+	"github.com/hojex/adserver/internal/geo"
 	"github.com/hojex/adserver/internal/rules"
 	"github.com/hojex/adserver/internal/snapshot"
+	"github.com/hojex/adserver/internal/telemetry"
+	"github.com/redis/go-redis/v9"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -42,16 +48,13 @@ import (
 
 // DecisionSink receives a Decision after it is built.  Implementations are
 // fire-and-forget: they MUST NOT block the hot path.
-//
-// The Redpanda-backed implementation with WAL + at-least-once + dedupe by
-// event_id arrives in I2 (internal/telemetry).
 type DecisionSink interface {
 	// Emit sends the decision asynchronously.  Any error is logged by the
 	// implementation; callers do not check the return value.
 	Emit(ctx context.Context, d *decisionv1.Decision)
 }
 
-// StdoutSink writes decisions as JSON lines to stdout (I0 / debug).
+// StdoutSink writes decisions as JSON lines to stdout (debug / fallback).
 type StdoutSink struct{ logger *slog.Logger }
 
 func (s *StdoutSink) Emit(_ context.Context, d *decisionv1.Decision) {
@@ -67,6 +70,13 @@ func (s *StdoutSink) Emit(_ context.Context, d *decisionv1.Decision) {
 	s.logger.Info("decision", "payload", string(b))
 }
 
+// producerSink wraps *telemetry.Producer to satisfy DecisionSink.
+type producerSink struct{ p *telemetry.Producer }
+
+func (s *producerSink) Emit(ctx context.Context, d *decisionv1.Decision) {
+	s.p.Emit(ctx, d)
+}
+
 // ---------------------------------------------------------------------------
 // HTTP request / response types
 // ---------------------------------------------------------------------------
@@ -77,8 +87,10 @@ type DecideRequest struct {
 	TenantID string `json:"tenant_id"`
 	// ZoneID is the publisher placement requesting an ad.
 	ZoneID string `json:"zone_id"`
-	// Geo is the pre-derived geo.  The IP was already discarded by the
-	// caller before reaching this endpoint (TX-5 / DA-11).
+	// Geo fields: pre-derived by the collector before reaching this endpoint.
+	// The collector discards the IP after deriving these (TX-5/DA-11).
+	// When called from the asyncjs JS tag, the collector derives geo from
+	// the client IP and passes only country+city here.
 	GeoCountry string `json:"geo_country,omitempty"`
 	GeoCity    string `json:"geo_city,omitempty"`
 	// UserAgent of the end-user browser.
@@ -89,13 +101,15 @@ type DecideRequest struct {
 	SiteVars map[string]string `json:"site_vars,omitempty"`
 	// UserID is the hashed+salted stable identifier for frequency capping
 	// (DA-6).  Empty = no stable identifier; all capped campaigns are skipped.
+	// The hashing and salting are done CLIENT-SIDE (in the ad tag or collector);
+	// the decision service only sees the opaque hashed value.
 	UserID string `json:"user_id,omitempty"`
 }
 
 // DecideResponse is the JSON response from POST /v1/decide.
 // Empty creative fields mean a blank impression (CA-2).
 type DecideResponse struct {
-	// DecisionID must always be present (even for blank impressions).
+	// DecisionID must always be present (even for blank impressions — TX-1).
 	DecisionID   string `json:"decision_id"`
 	ModelVersion string `json:"model_version"`
 	TenantID     string `json:"tenant_id"`
@@ -136,15 +150,18 @@ func (h *decisionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Geo is passed in already-derived by the caller.
-	// No IP is present in this handler (TX-5).
+	// Geo is passed in already-derived by the collector (TX-5/DA-11):
+	// no IP is present or needed in this handler.
 	g := &commonv1.Geo{
 		Country: req.GeoCountry,
 		City:    req.GeoCity,
 	}
 
 	now := time.Now().UTC()
-	decisionID := newDecisionID(now)
+
+	// decision_id is the ULID for this decision — emitted on EVERY response
+	// including blank (TX-1 invariant).
+	decisionID := telemetry.NewULID()
 
 	snap := h.snap.Snapshot()
 
@@ -168,12 +185,12 @@ func (h *decisionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Build the Decision log entry (TX-1).
 	// model_version is "" for cascata pura (DETERMINISTIC per decision.proto).
-	// decision_id MUST be present on every decision — even blank.
+	// decision_id MUST be present on every decision — even blank (TX-1).
 	envelope := &commonv1.Envelope{
 		TenantId:      req.TenantID,
-		EventId:       decisionID, // event_id == decision_id for the root event
+		EventId:       decisionID, // event_id == decision_id for the root decision event
 		DecisionId:    decisionID,
-		ModelVersion:  "", // cascata pura — no ML ranker in I0
+		ModelVersion:  "", // cascata pura — no ML ranker in I0/I2
 		OccurredAt:    timestamppb.New(now),
 		SchemaVersion: "1.0.0",
 		Source:        "delivery-decision",
@@ -198,8 +215,7 @@ func (h *decisionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		decision.BannerId = result.Banner.ID
 	}
 
-	// Fire-and-forget emission.
-	// I2 will replace StdoutSink with the Redpanda WAL producer.
+	// Fire-and-forget emission.  The Redpanda producer (I2) is non-blocking.
 	h.sink.Emit(r.Context(), decision)
 
 	// Build HTTP response.
@@ -240,16 +256,78 @@ func main() {
 		Level: slog.LevelInfo,
 	}))
 
-	// Stub snapshot — I1 will wire the real Loader from db/config/.
+	// ---------------------------------------------------------------------------
+	// Snapshot store — I1 will wire the real Loader from db/config/.
+	// ---------------------------------------------------------------------------
 	snap := snapshot.EmptySnapshot()
 	store := snapshot.NewStore(snap)
 
-	// Cascade engine with no-op ranker and no-op capper (I0).
+	// ---------------------------------------------------------------------------
+	// Geo resolver (I2): MaxMind GeoLite2 in memory.
+	// Falls back to EmptyResolver if the .mmdb file is absent (DA-9).
+	// NOTE: The decision service itself does NOT see raw IPs — geo is derived
+	// by the collector and passed as pre-resolved fields in the JSON body (TX-5).
+	// The geo resolver is kept here for any future direct-client paths.
+	// ---------------------------------------------------------------------------
+	geoDBPath := envOr("GEOIP_DB_PATH", "")
+	_ = geo.NewMaxMindResolver(geoDBPath, logger) // wired; unused in I2 direct path
+
+	// ---------------------------------------------------------------------------
+	// Capper (I2): Redis-backed with fail-safe (DA-6).
+	// Falls back to NoOpCapper if Redis is not configured.
+	// ---------------------------------------------------------------------------
+	var cappingImpl cascade.Capper = cascade.NoOpCapper{}
+	redisAddr := envOr("REDIS_ADDR", "")
+	if redisAddr != "" {
+		rdb := redis.NewClient(&redis.Options{
+			Addr:         redisAddr,
+			DialTimeout:  10 * time.Millisecond,
+			ReadTimeout:  10 * time.Millisecond,
+			WriteTimeout: 10 * time.Millisecond,
+		})
+		cappingSalt := envOr("CAPPING_SALT", "default-salt-rotate-me")
+		cappingImpl = capping.New(rdb, cappingSalt)
+		logger.Info("capping: Redis-backed capper active", "addr", redisAddr)
+	} else {
+		logger.Warn("capping: REDIS_ADDR not set; using NoOpCapper (no cap enforcement)")
+	}
+
+	// ---------------------------------------------------------------------------
+	// Cascade engine with real capper + default (no-op) ranker.
+	// Ranker extension point (Fase 2 / TX-4): wire ML ranker here when ready.
+	// ---------------------------------------------------------------------------
 	rulesEngine := rules.New()
-	cascadeEngine := cascade.New(rulesEngine)
+	cascadeEngine := cascade.New(rulesEngine, cascade.WithCapper(cappingImpl))
 
-	sink := &StdoutSink{logger: logger}
+	// ---------------------------------------------------------------------------
+	// Decision sink (I2): Redpanda producer with WAL + at-least-once + dedupe.
+	// Falls back to StdoutSink if brokers are not configured.
+	// ---------------------------------------------------------------------------
+	var sink DecisionSink = &StdoutSink{logger: logger}
+	brokers := envOr("REDPANDA_BROKERS", "")
+	if brokers != "" {
+		walPath := envOr("TELEMETRY_WAL_PATH", "/tmp/decision.wal")
+		p, err := telemetry.NewProducer(telemetry.Config{
+			Brokers:    strings.Split(brokers, ","),
+			WALPath:    walPath,
+			WALSync:    envOr("TELEMETRY_WAL_SYNC", "") == "true",
+			QueueDepth: 8192,
+			Logger:     logger,
+		})
+		if err != nil {
+			logger.Warn("telemetry: producer init failed; using StdoutSink", "err", err)
+		} else {
+			sink = &producerSink{p: p}
+			logger.Info("telemetry: Redpanda producer active", "brokers", brokers, "wal", walPath)
+			defer p.Close()
+		}
+	} else {
+		logger.Warn("telemetry: REDPANDA_BROKERS not set; using StdoutSink")
+	}
 
+	// ---------------------------------------------------------------------------
+	// HTTP server
+	// ---------------------------------------------------------------------------
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -293,7 +371,7 @@ func main() {
 	}()
 
 	<-ctx.Done()
-	logger.Info("shutting down")
+	logger.Info("shutting down decision service")
 
 	shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -311,16 +389,4 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
-}
-
-// newDecisionID generates a time-sortable unique ID for the decision.
-// Format: <RFC3339Nano timestamp>-<8 random bytes hex>
-// I2 may replace this with a proper ULID library if canonical format is needed.
-func newDecisionID(t time.Time) string {
-	b := make([]byte, 8)
-	if _, err := cryptorand.Read(b); err != nil {
-		// Extremely unlikely; fall back to timestamp-only.
-		return t.Format("20060102T150405.999999999Z")
-	}
-	return t.Format("20060102T150405.999999999Z") + "-" + hex.EncodeToString(b)
 }

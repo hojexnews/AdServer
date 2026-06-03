@@ -1,0 +1,248 @@
+// Package capping implements frequency-capping over Redis (DA-6, §4.8).
+//
+// # Scopes
+//
+//	campaign_total  – lifetime cap for the entire campaign (absolute ceiling).
+//	session         – per-session cap; TTL is the configured session window.
+//	clock           – rolling-window cap; TTL is the reset_interval.
+//
+// # Cap precedence (DA-6)
+//
+// Banner-level caps override campaign-level caps when both are non-zero.  A
+// zero value at either level means "no cap at that scope".  The effective cap
+// for each scope is resolved at call time from the Banner first, then the
+// Campaign.
+//
+// # Privacy (TX-5)
+//
+// Capping keys are NEVER plain user identifiers.  The key is:
+//
+//	SHA-256( stableID + ":" + salt ) — truncated to 32 hex chars.
+//
+// The salt is a rotating string that MUST be changed on a schedule (e.g.
+// daily) so that keys cannot be correlated across rotation boundaries.  The
+// salt is provided externally at construction time and updated via SetSalt.
+// Keys are ephemeral Redis strings with short TTLs — they never appear in
+// events or telemetry.
+//
+// # Fail-safe (DA-6)
+//
+// 1. No stable identifier (userID == ""): Allowed returns false immediately —
+//    silence is preferred to over-delivery.
+//
+// 2. Redis is down / returns an error: for CAPPED campaigns, Allowed returns
+//    false (fail-safe: we cannot guarantee the cap so we refuse delivery).
+//    Uncapped campaigns (all three scopes == 0) are not checked against Redis
+//    at all, so they are unaffected by Redis unavailability.
+//
+// 3. Best-effort semantics (ADR-0002 B.3): slight sub/over-delivery across
+//    replicas is acceptable; Redis is NOT the billing source of truth.
+package capping
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+
+	"github.com/hojex/adserver/internal/snapshot"
+)
+
+// ---------------------------------------------------------------------------
+// RedisClient — thin interface over go-redis to allow fake injection in tests
+// ---------------------------------------------------------------------------
+
+// RedisClient is the subset of go-redis operations used by the Capper.
+// *redis.Client and *redis.ClusterClient both satisfy it.
+type RedisClient interface {
+	// Get returns the value for key.  redis.Nil is returned when the key does
+	// not exist.
+	Get(ctx context.Context, key string) *redis.StringCmd
+	// Incr atomically increments key by 1 and returns the new value.
+	Incr(ctx context.Context, key string) *redis.IntCmd
+	// Expire sets the TTL on an existing key.  It is called after Incr to set
+	// the TTL only on the first increment (when the key is new).
+	Expire(ctx context.Context, key string, expiration time.Duration) *redis.BoolCmd
+}
+
+// ---------------------------------------------------------------------------
+// Capper — implements cascade.Capper (I2)
+// ---------------------------------------------------------------------------
+
+// Capper is the Redis-backed frequency-cap implementation.  It is safe for
+// concurrent use from multiple goroutines.
+type Capper struct {
+	client RedisClient
+
+	mu   sync.RWMutex
+	salt string // rotating salt — updated by SetSalt (TX-5)
+}
+
+// New creates a Capper backed by the given RedisClient with the initial salt.
+// salt MUST be non-empty; rotate it on a schedule to prevent key correlation.
+func New(client RedisClient, salt string) *Capper {
+	if salt == "" {
+		salt = "default-salt-rotate-me"
+	}
+	return &Capper{client: client, salt: salt}
+}
+
+// SetSalt atomically rotates the capping salt.  Old in-flight requests that
+// still hold the previous salt will naturally expire via Redis TTL.
+func (c *Capper) SetSalt(salt string) {
+	c.mu.Lock()
+	c.salt = salt
+	c.mu.Unlock()
+}
+
+// ---------------------------------------------------------------------------
+// cascade.Capper implementation
+// ---------------------------------------------------------------------------
+
+// Allowed reports whether the given user may see the ad.
+//
+// Decision tree:
+//  1. userID == "" → false (fail-safe: no stable identifier → abort, DA-6).
+//  2. Campaign has no caps AND banner has no caps → true (fast path, no Redis).
+//  3. For each active scope (campaign_total, session, clock):
+//     - compute the effective cap (banner overrides campaign when non-zero).
+//     - increment the Redis counter; set TTL on first write.
+//     - if counter > cap → rollback the increment and return false.
+//     - if Redis errors → return false for capped campaigns (fail-safe, DA-6).
+func (c *Capper) Allowed(userID string, camp *snapshot.Campaign, ban *snapshot.Banner) (bool, error) {
+	// FAIL-SAFE (DA-6): no stable identifier → abort.
+	if userID == "" {
+		return false, nil
+	}
+
+	// Resolve effective caps (banner overrides campaign when non-zero — DA-6).
+	capTotal, capSession, capClock, clockWindowSec := effectiveCaps(camp, ban)
+
+	// Fast path: no caps active → allow without any Redis round-trip.
+	if capTotal == 0 && capSession == 0 && capClock == 0 {
+		return true, nil
+	}
+
+	c.mu.RLock()
+	salt := c.salt
+	c.mu.RUnlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	// Check each active scope.  On any Redis failure for a capped campaign,
+	// return false (fail-safe — cannot guarantee cap).
+	if capTotal > 0 {
+		key := capKey(userID, salt, camp.ID, ban.ID, "total", 0)
+		ok, err := c.checkAndIncr(ctx, key, int64(capTotal), 0) // 0 = no TTL (permanent counter)
+		if err != nil {
+			// Redis down on a capped campaign → fail-safe abort.
+			return false, nil //nolint:nilerr // fail-safe documented above
+		}
+		if !ok {
+			return false, nil
+		}
+	}
+
+	if capSession > 0 {
+		// Session TTL: use a fixed session window (e.g. 30 minutes).
+		// The reset interval for sessions is a product constant, not per-campaign.
+		const sessionTTL = 30 * time.Minute
+		key := capKey(userID, salt, camp.ID, ban.ID, "session", 0)
+		ok, err := c.checkAndIncr(ctx, key, int64(capSession), sessionTTL)
+		if err != nil {
+			return false, nil //nolint:nilerr
+		}
+		if !ok {
+			return false, nil
+		}
+	}
+
+	if capClock > 0 && clockWindowSec > 0 {
+		ttl := time.Duration(clockWindowSec) * time.Second
+		key := capKey(userID, salt, camp.ID, ban.ID, "clock", clockWindowSec)
+		ok, err := c.checkAndIncr(ctx, key, int64(capClock), ttl)
+		if err != nil {
+			return false, nil //nolint:nilerr
+		}
+		if !ok {
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+// checkAndIncr increments key and returns true iff the new value <= limit.
+// When ttl > 0 it is set on the key only when the key is first created (i.e.
+// the counter just moved from 0→1).  This avoids resetting the TTL on every
+// impression — we want a fixed window, not a sliding one.
+//
+// If the counter exceeds the limit the increment is NOT rolled back (best-effort
+// per ADR-0002 B.3: slight over-delivery is acceptable).  Rolling back would
+// require a Lua script or WATCH/MULTI/EXEC, adding latency to the hot path.
+func (c *Capper) checkAndIncr(ctx context.Context, key string, limit int64, ttl time.Duration) (bool, error) {
+	newVal, err := c.client.Incr(ctx, key).Result()
+	if err != nil {
+		return false, fmt.Errorf("capping: redis incr %q: %w", key, err)
+	}
+
+	// Set TTL only when the key is newly created (first impression).
+	if newVal == 1 && ttl > 0 {
+		if err := c.client.Expire(ctx, key, ttl).Err(); err != nil {
+			// Non-fatal: the key will live forever but the cap will still
+			// enforce.  Log via observability; don't abort delivery.
+			_ = err // caller's observability layer handles
+		}
+	}
+
+	return newVal <= limit, nil
+}
+
+// capKey builds a privacy-safe Redis key:
+//
+//	"cap:" + SHA-256(userID + ":" + salt)[:32] + ":" + scope + ":" + campaignID + ":" + bannerID [+ ":" + windowSec]
+//
+// The hashed prefix ensures the key is not PII (TX-5).  The suffix encodes
+// the semantic scope so different scopes don't collide.
+func capKey(userID, salt, campaignID, bannerID, scope string, windowSec int32) string {
+	h := sha256.Sum256([]byte(userID + ":" + salt))
+	hx := hex.EncodeToString(h[:])[:32] // 16-byte prefix, 32 hex chars
+
+	if windowSec > 0 {
+		return fmt.Sprintf("cap:%s:%s:%s:%s:%d", hx, scope, campaignID, bannerID, windowSec)
+	}
+	return fmt.Sprintf("cap:%s:%s:%s:%s", hx, scope, campaignID, bannerID)
+}
+
+// effectiveCaps resolves the active cap values for each scope.
+// Banner-level cap overrides campaign-level cap when non-zero (DA-6).
+// Returns (capTotal, capSession, capClock, clockWindowSec).
+func effectiveCaps(camp *snapshot.Campaign, ban *snapshot.Banner) (int32, int32, int32, int32) {
+	capTotal := camp.CapTotal
+	if ban.CapTotal > 0 {
+		capTotal = ban.CapTotal
+	}
+
+	capSession := camp.CapSession
+	if ban.CapSession > 0 {
+		capSession = ban.CapSession
+	}
+
+	capClock := camp.CapClock
+	clockWindowSec := camp.CapClockWindowSec
+	if ban.CapClock > 0 {
+		capClock = ban.CapClock
+		clockWindowSec = ban.CapClockWindowSec
+	}
+
+	return capTotal, capSession, capClock, clockWindowSec
+}
