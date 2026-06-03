@@ -13,23 +13,32 @@
 GO      := go
 GOFLAGS :=
 
-## go-build: compila todos os pacotes Go do monorepo
-go-build:
-	$(GO) build $(GOFLAGS) ./...
+# Pacotes Go do modulo, EXCLUINDO node_modules/ (web/ e bff/ sao projetos npm;
+# algumas deps npm vendoram .go benignos — ex.: flatted — que NAO devem entrar
+# no build/test do hot path). `go list` resolve em tempo de parse do make.
+#   GOPKGS      — todos os pacotes (para vet/test; test-only e' valido aqui).
+#   GOBUILDPKGS — apenas pacotes com fontes NAO-teste (go build falha em
+#                 pacotes so-de-teste como tests/parity; .GoFiles os exclui).
+GOPKGS      := $(shell $(GO) list ./... 2>/dev/null | grep -v '/node_modules/')
+GOBUILDPKGS := $(shell $(GO) list -f '{{if or .GoFiles .CgoFiles}}{{.ImportPath}}{{end}}' ./... 2>/dev/null | grep -v '/node_modules/')
 
-## go-vet: analise estatica (go vet) em todos os pacotes
+## go-build: compila os pacotes com fontes nao-teste (sem node_modules)
+go-build:
+	$(GO) build $(GOFLAGS) $(GOBUILDPKGS)
+
+## go-vet: analise estatica (go vet) em todos os pacotes (sem node_modules)
 go-vet:
-	$(GO) vet $(GOFLAGS) ./...
+	$(GO) vet $(GOFLAGS) $(GOPKGS)
 
 ## go-test: executa a suite de testes unitarios e golden tests (sem infra)
 go-test:
-	$(GO) test $(GOFLAGS) -count=1 -race ./...
+	$(GO) test $(GOFLAGS) -count=1 -race $(GOPKGS)
 
 ## go-test-integration: testes que requerem Redis + Redpanda + MaxMind mmdb
 ## Marcados com //go:build integration; NAO rodam no CI padrao.
 ## Use: REDIS_ADDR=localhost:6379 REDPANDA_BROKERS=localhost:9092 make go-test-integration
 go-test-integration:
-	$(GO) test $(GOFLAGS) -count=1 -race -tags=integration ./...
+	$(GO) test $(GOFLAGS) -count=1 -race -tags=integration $(GOPKGS)
 
 ## go-bench: roda benchmarks no hot path (cascade + rules + money + capping)
 go-bench:

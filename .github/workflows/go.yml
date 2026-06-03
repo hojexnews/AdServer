@@ -1,0 +1,60 @@
+# go (Fase 1) — hot path: build, vet, test e golden de paridade.
+#
+# Materializa o gate "go test verde" da Fase 1. O motor Go (cascata DA-3,
+# regras §4.6, capping DA-6, collector lg/ck/ct) e a suite de paridade
+# (tests/parity, gate de cutover) rodam SEM infra externa (testes que exigem
+# Redis/Redpanda/MaxMind sao //go:build integration e NAO rodam aqui).
+#
+# node_modules/ (web/ e bff/ sao projetos npm) nao existe neste job — nao ha
+# `npm install` — entao `./...` ja e limpo; ainda assim os alvos de make/go.mk
+# excluem node_modules por robustez.
+name: go (Fase 1)
+
+on:
+  pull_request:
+    paths:
+      - "internal/**"
+      - "services/**"
+      - "tests/**"
+      - "gen/go/**"
+      - "go.mod"
+      - "go.sum"
+      - "make/go.mk"
+      - "make/parity.mk"
+      - ".github/workflows/go.yml"
+  push:
+    branches: [main]
+    paths:
+      - "internal/**"
+      - "services/**"
+      - "tests/**"
+      - "gen/go/**"
+      - "go.mod"
+      - "go.sum"
+
+permissions:
+  contents: read
+
+env:
+  # Segredos de TESTE — o boot real e fail-closed (sem estes vars o servico
+  # recusa subir). Aqui sao valores ficticios so para a suite de testes.
+  CAPPING_SALT: ci-test-salt-not-a-real-secret
+  CK_HMAC_SECRET: ci-test-hmac-not-a-real-secret
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: build
+        run: make go-build
+      - name: vet
+        run: make go-vet
+      - name: test (unit + golden, -race)
+        run: make go-test
+      - name: parity golden (gate de cutover, sem infra)
+        run: make parity-golden
