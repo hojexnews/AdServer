@@ -1,6 +1,7 @@
-# Código gerado pelo buf (não versionado; gerado no CI/local)
+# Codigo gerado pelo buf: a partir da Fase 1 (ADR-0002 §C), gen/ e VERSIONADO
+# na raiz. proto/gen/ nunca foi usada e nao existe; mantemos aqui apenas como
+# guardrail caso alguma ferramenta a crie acidentalmente.
 proto/gen/
-gen/
 # Binários locais de tooling
 .bin/
 # State de IaC (NUNCA versionar)

@@ -51,12 +51,21 @@ porção da Fase 0 construível agora num repositório greenfield.
   **instrumentação no motor Go** e nos collectors lg/ck/ct é **Fase 1** (implementa
   este contrato).
 
-### ⏭️ Próximo passo (Fase 1 — MVP de paridade)
+### ⏭️ Próximo passo — Fase 1 (MVP de paridade) **ABERTA**
 
-Motor de decisão em **Go** (cascata em memória DA-3, capping Redis + fail-safe
-DA-6), collectors lg/ck/ct emitindo `Decision`/telemetria, pipeline
-Redpanda→ClickHouse(`StatsHourly` + "ao vivo")→Iceberg, ledger Postgres. Ver
-roadmap em [docs/stack-tecnologico.md §4](docs/stack-tecnologico.md).
+A Fase 1 foi **aberta e sequenciada** em
+[ADR-0002](docs/adr/0002-fase-1-sequenciamento-e-layout.md), que ratifica o
+**layout do monorepo** (módulo Go único `github.com/hojex/adserver`), resolve as
+perguntas em aberto bloqueantes (BFF Node/TS+tRPC, budget de latência, capping
+eventual+fail-safe, atribuição last-click 7d, premissa de volume) e define **5
+incrementos** (I0…I4) com os `CA-n` que cada um fecha. Nada de cutover antes de I4
+com golden + shadow + dual-run dentro da tolerância.
+
+Escopo da Fase 1: motor de decisão em **Go** (cascata em memória DA-3, capping
+Redis + fail-safe DA-6), collectors lg/ck/ct emitindo `Decision`/telemetria,
+pipeline Redpanda→ClickHouse(`StatsHourly` + "ao vivo")→Iceberg, ledger Postgres +
+billing CPM/CPC/CPA/Tenancy, console Next.js + BFF. Ver roadmap em
+[docs/stack-tecnologico.md §4](docs/stack-tecnologico.md).
 
 ---
 

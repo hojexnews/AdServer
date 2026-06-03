@@ -10,13 +10,17 @@ managed:
 
 plugins:
   # ---- Go (hot path) ----
+  # Saida na raiz do repo (../gen/go a partir de proto/) para que o
+  # import path github.com/hojex/adserver/gen/go/... resolva corretamente
+  # com o go.mod na raiz. O codigo gerado e versionado (Fase 1, ADR-0002 §C).
   - remote: buf.build/protocolbuffers/go
-    out: gen/go
+    out: ../gen/go
     opt:
       - paths=source_relative
 
   # ---- TypeScript / ECMAScript (front Next.js) ----
+  # Saida na raiz do repo (../gen/ts a partir de proto/).
   - remote: buf.build/bufbuild/es
-    out: gen/ts
+    out: ../gen/ts
     opt:
       - target=ts

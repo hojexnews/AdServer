@@ -8,6 +8,11 @@ BIN      := $(CURDIR)/.bin
 BUF      := $(shell command -v buf 2>/dev/null || echo $(BIN)/buf)
 BUF_VER  := 1.70.0
 
+# Fan-out paralelo: cada servico/area versiona seu proprio fragmento em make/.
+# Ex.: make/go.mk (decision-engine), make/db.mk (clickhouse), make/data.mk.
+# Nao edite o root Makefile para adicionar alvos especificos de servico.
+-include make/*.mk
+
 .DEFAULT_GOAL := help
 
 ## help: lista os alvos
