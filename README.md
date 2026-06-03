@@ -51,21 +51,42 @@ porção da Fase 0 construível agora num repositório greenfield.
   **instrumentação no motor Go** e nos collectors lg/ck/ct é **Fase 1** (implementa
   este contrato).
 
-### ⏭️ Próximo passo — Fase 1 (MVP de paridade) **ABERTA**
+## Estado atual — Fase 1 (MVP de paridade) **em andamento**
 
 A Fase 1 foi **aberta e sequenciada** em
 [ADR-0002](docs/adr/0002-fase-1-sequenciamento-e-layout.md), que ratifica o
 **layout do monorepo** (módulo Go único `github.com/hojex/adserver`), resolve as
-perguntas em aberto bloqueantes (BFF Node/TS+tRPC, budget de latência, capping
-eventual+fail-safe, atribuição last-click 7d, premissa de volume) e define **5
-incrementos** (I0…I4) com os `CA-n` que cada um fecha. Nada de cutover antes de I4
-com golden + shadow + dual-run dentro da tolerância.
+perguntas em aberto bloqueantes (BFF Node/TS+tRPC, budget p99 ≤25 ms hot path puro,
+capping eventual+fail-safe, atribuição last-click 7d, premissa de volume) e define
+**5 incrementos** (I0…I4). Nada de cutover antes do gate de paridade
+(golden + shadow + dual-run) dentro da tolerância.
 
-Escopo da Fase 1: motor de decisão em **Go** (cascata em memória DA-3, capping
-Redis + fail-safe DA-6), collectors lg/ck/ct emitindo `Decision`/telemetria,
-pipeline Redpanda→ClickHouse(`StatsHourly` + "ao vivo")→Iceberg, ledger Postgres +
-billing CPM/CPC/CPA/Tenancy, console Next.js + BFF. Ver roadmap em
-[docs/stack-tecnologico.md §4](docs/stack-tecnologico.md).
+### ✅ Entregue na Fase 1 (código-completo; cutover pende de infra)
+
+| Inc | Artefato | Local | Cobre |
+|---|---|---|---|
+| **I0** | Motor de decisão Go — cascata DA-3, regras §4.6 (+anti-contradição), snapshot, geo, helpers Money | [internal/](internal/) · [services/decision/](services/decision/) | CA-2, CA-4 |
+| **I1** | Ledger double-entry + config §4.1 + Asset Registry (SQL, RLS por tenant) | [db/](db/) | CA-1 (RLS), CA-7 |
+| **I2** | Capping Redis+fail-safe DA-6, telemetria WAL+dedupe, collector lg/ck/ct + asyncjs/pixel/302/VAST 4.x | [internal/capping/](internal/capping/) · [internal/telemetry/](internal/telemetry/) · [services/collector/](services/collector/) | CA-3, CA-5, CA-6, CA-8 |
+| **I3** | Pipeline Redpanda→ClickHouse(`StatsHourly` + "ao vivo")→Iceberg; dedupe por `event_id`; billing batch | [data/](data/) | CA-6, CA-7 |
+| **I4** | Console Next.js + BFF tRPC (fronteira de ACL, vínculo N:N, dashboards ≤1h vs ao vivo, anti-contradição) | [web/console/](web/console/) · [bff/](bff/) | CA-1 |
+| **Gate** | Golden tests CA-mapeados (85 casos) + harness shadow/dual-run + tolerâncias | [tests/parity/](tests/parity/) | §5 (cutover) |
+
+**Gates verdes:** `security-reviewer` + `privacy-compliance-auditor` sem CRITICAL/HIGH
+abertos (1 CRITICAL + 4 HIGH + 4 MEDIUM remediados — token HMAC no `/ck`, tenant
+derivado server-side, VAST sem injeção, UA reduzido a classe, capping confinado,
+salt fail-closed, row-policy ClickHouse robusta, SSRF `/vast`, allowlist de logs OTel).
+`make verify` (TX-1/TX-2) + `go test` (incl. `tests/parity`) + typecheck/build de
+web/bff **verdes**. CI: [buf](.github/workflows/buf.yml) · [no-float](.github/workflows/no-float.yml) · [go](.github/workflows/go.yml).
+
+### ⏭️ Pendente de ambiente (não-código) para fechar a Fase 1
+
+Cutover só após **infra real**: aplicar [platform/](platform/) em cloud; subir
+Postgres/Redis/Redpanda/ClickHouse; conectar o produtor↔ClickHouse (formato
+Protobuf); MaxMind `.mmdb`; e rodar **shadow-traffic + dual-run contábil** contra
+o Revive legado dentro da tolerância (`parity-shadow`/`parity-dual-run`). CA-3/CA-9
+operacionais (upload de criativo, MaxMind auto-update, Mailer/SMTP) dependem desse
+ambiente. Ver matriz CA-1…CA-9→status em [tests/parity/](tests/parity/).
 
 ---
 
