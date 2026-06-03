@@ -52,6 +52,11 @@ publisher (DA-11).
 - **`adserver.telemetry.v1`** (`adserver/telemetry/v1/events.proto`)
   - `AdRequest` (asyncjs.php), `Impression` (lg.php), `Click` (ck.php -> 302),
     `Conversion` (ct.php) — DA-8.
+- **`adserver.decision.v1`** (`adserver/decision/v1/decision.proto`)
+  - `Decision` (decision log: `propensity`, `served_tier`, `candidates[]`,
+    `ml_fail_open`), `Candidate`, enum `ExplorationPolicy` — fecha o loop de
+    atribuição/OPE (TX-1). Contrato em
+    [`contracts/telemetry/propensity-logging.md`](../contracts/telemetry/propensity-logging.md).
 
 ## Comandos (rode a partir de `proto/`)
 

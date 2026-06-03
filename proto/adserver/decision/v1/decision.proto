@@ -1,0 +1,134 @@
+// Pacote: adserver.decision.v1
+//
+// Registro de DECISAO de veiculacao (decision log), emitido pelo motor de
+// delivery no instante em que escolhe o criativo. E a pedra angular do
+// LOOP DE ATRIBUICAO (TX-1): carrega a PROPENSAO da acao servida, sem a
+// qual nao ha avaliacao off-policy (OPE/IPS/DR) nem ML honesto.
+//
+// COMO FECHA O LOOP: este Decision e chaveado por `decision_id` (no
+// envelope). Os eventos de telemetria lg/ck/ct (Impression/Click/
+// Conversion) carregam o MESMO `decision_id` e fazem JOIN aqui. Assim a
+// recompensa (clique/conversao) liga-se a acao servida e a sua propensao.
+//
+// PRECISAO: `propensity`/`score` sao DOUBLE de propósito — sao sinais de
+// ML/ranking (probabilidades e scores), NAO dinheiro. A proibicao de float
+// (TX-2) vale so para dinheiro (pacote money.v1); aqui float e legitimo.
+//
+// REGRA BACKWARD-COMPAT (TX-1): gerenciado por Buf (breaking-check na CI).
+// NUNCA reutilize numeros de campo; ao remover, mova para `reserved`.
+syntax = "proto3";
+
+package adserver.decision.v1;
+
+import "adserver/common/v1/envelope.proto";
+
+option go_package = "github.com/hojex/adserver/gen/go/adserver/decision/v1;decisionv1";
+
+// Politica de exploracao vigente no momento da decisao.
+//
+// Determina como `propensity` foi calculada. DETERMINISTIC = cascata pura
+// (DA-3) sem re-ranker: a acao foi servida com certeza dado o contexto, logo
+// propensity = 1.0 (fail-open de TX-4). As demais sao bandits/exploracao
+// sobre o ranker calibrado (stack §2.3).
+enum ExplorationPolicy {
+  // Default proto3: politica nao informada/desconhecida.
+  EXPLORATION_POLICY_UNSPECIFIED = 0;
+  // Cascata deterministica pura (DA-3), sem re-ranker. propensity = 1.0.
+  EXPLORATION_POLICY_DETERMINISTIC = 1;
+  // Epsilon-greedy (epsilon decrescente no MVP, stack §2.3).
+  EXPLORATION_POLICY_EPSILON_GREEDY = 2;
+  // Thompson Sampling sobre o ranker calibrado.
+  EXPLORATION_POLICY_THOMPSON = 3;
+  // LinUCB (upper confidence bound contextual).
+  EXPLORATION_POLICY_LINUCB = 4;
+}
+
+// Candidato avaliado DENTRO do estrato elegivel da cascata (DA-3/TX-4).
+//
+// A IA so re-rankeia dentro de cada estrato; jamais fura a ordem
+// Override > Contract > Remnant. Logar o conjunto de candidatos habilita
+// estimadores de OPE mais ricos e auditoria do ranking.
+message Candidate {
+  // Campanha candidata.
+  string campaign_id = 1;
+
+  // Banner/criativo candidato.
+  string banner_id = 2;
+
+  // Estrato da cascata a que este candidato pertence (DA-3). O re-ranking
+  // so compara candidatos do MESMO estrato elegivel.
+  adserver.common.v1.ServedTier tier = 3;
+
+  // Score do ranker para este candidato (ex.: eCPM = pCTR_calibrado x rate,
+  // no MESMO ativo/tenant — comparacao cross-moeda e proibida, TX-2). DOUBLE:
+  // sinal de ML, nao dinheiro.
+  double score = 4;
+
+  // Probabilidade de ESTE candidato ser escolhido sob a politica de logging,
+  // dado o contexto. Para o candidato servido, casa com Decision.propensity.
+  // Em (0,1]; positividade (>0) e requisito de OPE (overlap/positivity).
+  double propensity = 5;
+
+  // true para o candidato efetivamente servido (exatamente um por Decision).
+  bool served = 6;
+
+  // Reservado para evolucao (ex.: features_hash, calibration_version) sem
+  // reuso de numeros.
+  reserved 7 to 12;
+}
+
+// Registro canonico de uma decisao de veiculacao (decision log).
+//
+// Emitido uma vez por decisao, no hot path, no MESMO span que produz o
+// `decision_id`. Fonte de verdade da propensao para o loop de atribuicao.
+message Decision {
+  // Envelope universal (TX-1). AQUI o `decision_id` e a CHAVE primaria do
+  // log (todos os lg/ck/ct apontam para ele); `model_version` identifica o
+  // ranker (vazio quando DETERMINISTIC). `occurred_at` = instante da decisao.
+  adserver.common.v1.Envelope envelope = 1;
+
+  // Zona (placement) para a qual a decisao foi tomada.
+  string zone_id = 2;
+
+  // Campanha SERVIDA (vazio se served_tier == SERVED_TIER_BLANK).
+  string campaign_id = 3;
+
+  // Banner/criativo SERVIDO (vazio se impressao em branco).
+  string banner_id = 4;
+
+  // Estrato da cascata que venceu (DA-3): OVERRIDE/CONTRACT/REMNANT/BLANK.
+  adserver.common.v1.ServedTier served_tier = 5;
+
+  // PROPENSAO da acao servida: P(acao_servida | contexto) sob a politica de
+  // logging, em (0,1]. NUCLEO do OPE/IPS/DR. Para cascata pura
+  // (DETERMINISTIC) e 1.0. NUNCA pode ser 0 para uma acao que foi servida
+  // (violaria positividade). DOUBLE: probabilidade de ML, nao dinheiro.
+  double propensity = 6;
+
+  // Politica de exploracao vigente (define como propensity foi obtida).
+  ExplorationPolicy exploration_policy = 7;
+
+  // Taxa de exploracao efetiva no instante da decisao (epsilon do
+  // epsilon-greedy; 0 para exploit puro/DETERMINISTIC). Auditoria do schedule
+  // de exploracao. DOUBLE: hiperparametro de ML, nao dinheiro.
+  double epsilon = 8;
+
+  // Conjunto de candidatos elegiveis considerados (mesmo estrato). Pode ser
+  // truncado por limite de tamanho; nesse caso `candidate_count` carrega o
+  // total real. Vazio quando served_tier == SERVED_TIER_BLANK.
+  repeated Candidate candidates = 9;
+
+  // Tamanho REAL do conjunto elegivel (pode exceder len(candidates) se houve
+  // truncamento de log). Sinal de competicao/densidade de inventario.
+  uint32 candidate_count = 10;
+
+  // true quando a decisao caiu no fail-open de TX-4 (ML estourou o orcamento
+  // de latencia e degradou para a cascata pura DA-3). Nesse caso
+  // exploration_policy = DETERMINISTIC e propensity = 1.0. Sinal para nao
+  // contaminar o treino com decisoes degradadas.
+  bool ml_fail_open = 11;
+
+  // Reservado para evolucao (ex.: feature_vector_ref, ranker_latency_ms,
+  // experiment_id/variant) sem reuso de numeros.
+  reserved 12 to 20;
+}
