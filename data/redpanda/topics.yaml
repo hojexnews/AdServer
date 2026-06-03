@@ -1,0 +1,166 @@
+# data/redpanda/topics.yaml
+#
+# Definicao declarativa dos topicos Redpanda (API Kafka) do AdServer.
+# Consumido pelo rpk (Redpanda CLI) via `rpk topic create` ou pelo
+# operador Redpanda em Kubernetes (reconciliado via GitOps/Argo CD).
+#
+# DECISAO DE TOPOLOGIA: BUS UNICO POR TIPO DE EVENTO (4 topicos)
+# ---------------------------------------------------------------
+# Escolha: 4 topicos especializados (ad-request, impression, click, conversion)
+# em vez de 1 topico universal.
+#
+# Justificativa:
+#   1. PARTICIONAMENTO SEM HOT PARTITION: cada topico particiona por
+#      hash(event_id) — chave de alta cardinalidade, distribuicao uniforme
+#      (ULID/UUID). Nunca por tenant_id (poucos valores -> skew severo) e
+#      nunca por zone_id no topico de conversions (zona ausente no evento).
+#      Topicos separados permitem estrategias de particao/retencao/compactacao
+#      independentes por evento sem sobrepor schemas distintos.
+#   2. RETENCAO DIFERENCIADA: AdRequest (alta frequencia, curta retencao para
+#      replay de ingestao) vs. Conversion (baixa frequencia, retencao longa
+#      pois e sinal de billing e treino de pCVR).
+#   3. ISOLAMENTO DE CONSUMIDORES: o ClickHouse Kafka engine, o job de billing
+#      Iceberg e futuros consumidores (fraude/IVT, ML) podem assinar apenas o
+#      topico relevante sem filtrar payload. Schema evolution por topico e
+#      independente; a CI do Buf valida breaking-change por pacote proto.
+#   4. OBSERVABILIDADE OPERACIONAL: lag por tipo de evento e visivel sem
+#      desagregar payload. Identificar backpressure em conversions vs.
+#      impressions e trivial.
+#   5. ESCALABILIDADE FUTURA: topico de impressions pode ter mais particoes
+#      que conversions (volume muito maior) sem rebalancear um bus monolitico.
+#
+# Alternativa rejeitada: 1 topico unico "adserver.events" com type dispatch.
+#   Contra: skew de volume (AdRequest >> Conversion) num mesmo particionar
+#   uniforme prejudica a latencia de conversions; retencao e o minimo-comum;
+#   consumidores filtram payload (CPU) e o ClickHouse Kafka engine precisa de
+#   1 tabela por topico de qualquer forma — nao ha ganho real de topologia.
+#
+# SCHEMA (fio): Protobuf serializado com envelope adserver.common.v1.Envelope
+# em campo 1. O contrato canonico esta em proto/adserver/telemetry/v1/ e
+# proto/adserver/common/v1/. Compatibilidade BACKWARD e verificada pelo Buf
+# em CI (TX-1). Consumidores DEVEM ignorar campos desconhecidos.
+#
+# PARTICIONAMENTO: hash(event_id) via Kafka producer API (key = event_id).
+# O zone_id e carregado no payload (nao na chave) para preservar o hash
+# uniforme por event_id. Consumers que precisam de locality por zone_id
+# fazem filtro client-side ou usam o mecanismo de consumer-group por zona.
+# Nunca hash(tenant_id): tenant_id tem cardinalidade baixa (< 200 tenants,
+# premissa ADR-0002 B.1) e causaria hot partitions severas.
+#
+# REPLICACAO: fator 3 (producao). Ajustar para 1 em ambientes de dev/CI.
+# MIN_ISR: 2 (producao). Garante durabilidade sem bloquear writes se 1 broker
+# estiver em manutencao. Produtores usam acks=all para at-least-once.
+#
+# RETENCAO: ver campo `retention.ms` por topico. A retencao deve cobrir
+# o ciclo de replay de ingestao (reprocessamento de eventos atrasados) mais
+# uma folga operacional. Conversions tem retencao maior pois sao sinais
+# de billing e de treino de pCVR com lookback de 7 dias (ADR-0002 B.7).
+#
+# IDEMPOTENCIA: acks=all + enable.idempotence=true no producer garante
+# at-least-once no broker. Dedupe exactly-once e responsabilidade do
+# consumidor via event_id (ReplacingMergeTree no ClickHouse, ver DDL).
+
+topics:
+
+  # -------------------------------------------------------------------------
+  # ad-request: disparo do asyncjs (topo do funil, maior volume)
+  # -------------------------------------------------------------------------
+  - name: adserver.ad-request.v1
+    partitions: 16
+    replication_factor: 3
+    config:
+      # 48h de retencao: cobre replay de ingestao com folga operacional.
+      # AdRequest e o evento de maior volume; retencao curta controla custo
+      # de storage. O Iceberg e a fonte de verdade de longo prazo.
+      retention.ms: "172800000"          # 48 horas
+      retention.bytes: "-1"              # sem limite por particao (volume-driven)
+      cleanup.policy: "delete"           # delete por tempo; nao compactar (sem chave de negocio)
+      min.insync.replicas: "2"
+      # Protobuf binario; sem schema de mensagem no header (schema_version viaja
+      # no envelope Protobuf). Producer usa key=event_id (bytes do ULID/UUID).
+      message.format.version: "3.0"
+      # Compressao no broker para reducao de storage e throughput de rede.
+      compression.type: "lz4"
+
+  # -------------------------------------------------------------------------
+  # impression: pixel 1x1 carregado com o banner (base de faturamento CPM)
+  # -------------------------------------------------------------------------
+  - name: adserver.impression.v1
+    partitions: 16
+    replication_factor: 3
+    config:
+      # 72h: impressions sao base de faturamento CPM; retencao maior que
+      # ad-request para absorver latencia de processamento IVT (TX-6) que
+      # roda na ingestao com latencia de minutos (ADR-0001).
+      retention.ms: "259200000"          # 72 horas
+      retention.bytes: "-1"
+      cleanup.policy: "delete"
+      min.insync.replicas: "2"
+      compression.type: "lz4"
+
+  # -------------------------------------------------------------------------
+  # click: redirect server-side (base de faturamento CPC)
+  # -------------------------------------------------------------------------
+  - name: adserver.click.v1
+    partitions: 8
+    replication_factor: 3
+    config:
+      # 96h: cliques sao raros comparado a impressions (CTR tipico <5%),
+      # porem sao sinais de atribuicao com janela de lookback de 7 dias
+      # (ADR-0002 B.7). Retencao cobre replay do job de billing.
+      retention.ms: "345600000"          # 96 horas
+      retention.bytes: "-1"
+      cleanup.policy: "delete"
+      min.insync.replicas: "2"
+      compression.type: "lz4"
+
+  # -------------------------------------------------------------------------
+  # conversion: pixel terminal (base de faturamento CPA + label de treino pCVR)
+  # -------------------------------------------------------------------------
+  - name: adserver.conversion.v1
+    partitions: 4
+    replication_factor: 3
+    config:
+      # 10 dias: conversions tem janela de atribuicao de 7 dias (ADR-0002 B.7)
+      # + folga de 3 dias para replay do job de billing e reprocessamento.
+      # Volume muito menor que os outros topicos; retencao generosa e barata.
+      retention.ms: "864000000"          # 10 dias
+      retention.bytes: "-1"
+      cleanup.policy: "delete"
+      min.insync.replicas: "2"
+      compression.type: "lz4"
+
+  # -------------------------------------------------------------------------
+  # decision: decision log (loop de atribuicao TX-1, treino de pCVR)
+  # -------------------------------------------------------------------------
+  - name: adserver.decision.v1
+    partitions: 16
+    replication_factor: 3
+    config:
+      # 10 dias: decision_id e a chave do loop de atribuicao (TX-1). O job de
+      # billing e o treino de pCVR fazem JOIN entre conversions e decisions
+      # dentro da janela de 7 dias; retencao de 10 dias cobre com folga.
+      retention.ms: "864000000"          # 10 dias
+      retention.bytes: "-1"
+      cleanup.policy: "delete"
+      min.insync.replicas: "2"
+      compression.type: "lz4"
+
+# -------------------------------------------------------------------------
+# Configuracao do producer (referencia — implementado no internal/telemetry/)
+# -------------------------------------------------------------------------
+# Documentado aqui como contrato de expectativa para o collector (I2).
+# O producer Go em internal/telemetry/ DEVE usar:
+#   acks=all              -> at-least-once garantido no broker
+#   enable.idempotence=true -> sem duplicatas no producer (idempotent producer)
+#   compression.type=lz4  -> compressao client-side (aditiva ao broker)
+#   linger.ms=5           -> micro-batching (5ms de buffer para throughput)
+#   batch.size=65536      -> batch de 64KB por particao
+#   key=event_id (bytes)  -> chave de particao (hash uniforme)
+#   WAL local             -> durabilidade antes do ACK do broker (fire-and-forget
+#                            com persistencia local; ver internal/telemetry/)
+#
+# FRONTEIRA: esta config e REFERENCIA. A implementacao do producer esta em
+# services/collector/ + internal/telemetry/ (decision-engine-engineer, I2).
+# Este arquivo documenta o contrato esperado para que o consumidor ClickHouse
+# e o Iceberg sink possam ser validados de forma independente.

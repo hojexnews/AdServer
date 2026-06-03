@@ -1,0 +1,122 @@
+# data/iceberg/specs/billing_hourly.yaml
+#
+# Tabela de postings de billing horario no Iceberg (resultado do billing batch).
+#
+# PAPEL DESTA TABELA:
+#   O job de billing batch (jobs/billing_batch_hourly.py) le as tabelas de
+#   eventos (events_impression, events_click, events_conversion) e escreve
+#   aqui os "postings de billing" — uma linha por campanha/banner/zona/hora
+#   com o valor faturavel calculado (CPM/CPC/CPA/Tenancy).
+#
+#   Esta tabela e a ENTRADA do money-ledger-guardian (db/ledger/).
+#   O guardian le os postings aqui e gera os journal_entries/postings do
+#   ledger double-entry em Postgres. A fronteira e:
+#     Iceberg billing_hourly  ->  [contrato de leitura]  ->  db/ledger/
+#   Este arquivo documenta o LADO DE ESCRITA (analytics batch) e o ESQUEMA
+#   de leitura esperado pelo guardian. O ledger em si pertence ao guardian.
+#
+# IDEMPOTENCIA DO JOB:
+#   O billing batch e idempotente por (tenant_id, hour_bucket, campaign_id,
+#   banner_id, zone_id, pricing_model, currency). Reprocessamento do mesmo
+#   periodo substitui os postings via MERGE INTO (DELETE + INSERT por hora).
+#   O guardian so processa postings com status='pending' e muda para
+#   'posted' apos o journal_entry; reprocessamento gera conflito resolvido
+#   pela idempotency_key no ledger.
+#
+# DINHEIRO: billable_amount em Decimal(38,18). NUNCA Float (TX-2/DA-10).
+
+tables:
+
+  - name: adserver.billing_hourly
+    description: >
+      Postings de billing horario gerados pelo job batch (DA-7). Fonte de
+      leitura para o money-ledger-guardian (db/ledger/). NUNCA gerada a
+      partir do streaming ClickHouse -- apenas do Iceberg events_* (ADR-0001).
+      billable_amount em Decimal(38,18): NUNCA Float (TX-2/DA-10).
+    schema:
+      fields:
+        - name: billing_id
+          type: string
+          required: true
+          doc: "UUID v7 gerado pelo job. PK logica do posting."
+        - name: tenant_id
+          type: string
+          required: true
+        - name: hour_bucket
+          type: timestamptz
+          required: true
+          doc: "toStartOfHour(occurred_at) da janela de billing."
+        - name: campaign_id
+          type: string
+          required: true
+        - name: banner_id
+          type: string
+          required: true
+        - name: zone_id
+          type: string
+          required: false
+          doc: "Vazio para pricing_model=CPA (conversao sem zone_id)."
+        - name: pricing_model
+          type: string
+          required: true
+          doc: "CPM | CPC | CPA | TENANCY"
+        - name: billable_units
+          type: long
+          required: true
+          doc: "Impressoes (CPM), cliques (CPC), conversoes (CPA) faturadas."
+        - name: rate_amount
+          type: decimal(38, 18)
+          required: true
+          doc: "Taxa contratual em Decimal (nunca Float, TX-2). CPM=por 1000 imp."
+        - name: rate_asset_code
+          type: string
+          required: true
+          doc: "Ativo da taxa (ex.: BRL, USD). Ledger isolado por ativo (DA-10)."
+        - name: rate_scale
+          type: integer
+          required: true
+          doc: "Scale do ativo (autoritativo no Asset Registry)."
+        - name: billable_amount
+          type: decimal(38, 18)
+          required: true
+          doc: "Valor faturavel em Decimal(38,18). NUNCA Float. billable_units * rate / 1000 (CPM)."
+        - name: currency
+          type: string
+          required: true
+          doc: "asset_code da campanha (rotulo; sem conversao automatica, DA-10)."
+        - name: attribution_lookback_days
+          type: integer
+          required: false
+          doc: "Janela de lookback usada (ex.: 7). Parametro do job, nao do schema (ADR-0002 B.7)."
+        - name: attribution_model
+          type: string
+          required: false
+          doc: "Modelo de atribuicao (ex.: last_click). Fase 1 = last_click."
+        - name: job_run_id
+          type: string
+          required: true
+          doc: "ID da execucao do job (para rastreabilidade e reprocessamento)."
+        - name: job_run_at
+          type: timestamptz
+          required: true
+          doc: "Timestamp de execucao do job (processing-time)."
+        - name: iceberg_snapshot_id
+          type: long
+          required: true
+          doc: "Snapshot ID do Iceberg events_* usado pelo job (reproducibilidade)."
+        - name: status
+          type: string
+          required: true
+          doc: "pending | posted | error. Guardian le 'pending' e transiciona para 'posted'."
+    partition:
+      - field: tenant_id
+      - transform: year(hour_bucket)
+        name: year
+      - transform: month(hour_bucket)
+        name: month
+    write:
+      format: parquet
+      compression: zstd
+    properties:
+      write.target-file-size-bytes: "33554432"
+      history.expire.max-snapshot-age-ms: "63072000000"  # 2 anos (auditoria contabil)

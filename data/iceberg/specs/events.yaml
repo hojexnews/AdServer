@@ -1,0 +1,338 @@
+# data/iceberg/specs/events.yaml
+#
+# Especificacao das tabelas Apache Iceberg (fonte de verdade contabil e de treino).
+#
+# PAPEL DO ICEBERG NO PIPELINE (ADR-0001 / ADR-0002 §D):
+#   Iceberg e a UNICA fonte de verdade para:
+#     1. Faturamento (billing batch horario, DA-7): o job de billing SEMPRE
+#        reconcilia contra o Iceberg, NUNCA contra o streaming (ClickHouse).
+#     2. Treino de modelos (pCTR/pCVR): time-travel garante reproducibilidade
+#        de datasets de treino a partir de um snapshot imutavel.
+#     3. Atribuicao fechada: o join click->conversion com lookback de 7 dias
+#        (ADR-0002 B.7) e feito sobre o Iceberg, onde os dados sao completos
+#        e deduplicados.
+#
+# TIME-TRAVEL (Iceberg native):
+#   Toda tabela Iceberg mantem historico de snapshots. O billing batch
+#   referencia um snapshot especifico (por snapshot_id ou timestamp) para
+#   garantir que reprocessamento de um periodo passado produza o mesmo
+#   resultado (reproducibilidade contabil).
+#
+# PARTICAO:
+#   Todas as tabelas particionam por (tenant_id, year, month, day) para:
+#     - Pushdown de predicado eficiente em queries de billing por periodo.
+#     - Pruning de arquivos Parquet por tenant (isolamento e performance).
+#     - Compactacao e expurgo independentes por particao.
+#   NOTA: particionar por tenant_id aqui (Iceberg) e DIFERENTE de particionar
+#   o Redpanda por tenant_id. No Iceberg, a particao e metadata de objeto
+#   storage, nao chave de routing de mensagem; hot-partition nao e um problema
+#   (sem consumer groups). O Iceberg organiza particoes em diretorio de S3/GCS.
+#
+# DEDUPLICACAO:
+#   O Iceberg recebe dados do job de sink (ex.: ClickHouse -> Iceberg export,
+#   ou Redpanda -> Iceberg via conector S3/Flink-less). O job de sink deve
+#   garantir exatamente uma linha por event_id usando MERGE INTO (upsert) ou
+#   DELETE + INSERT. Ver jobs/iceberg_sink_job.py para o esqueleto.
+#
+# DINHEIRO: DECIMAL(38,18) em todas as colunas de valor monetario (nunca FLOAT).
+#   O scale de 18 cobre todos os ativos do Asset Registry (ERC-20=18 casas).
+#   Para fiat (BRL/USD/EUR, scale=2) e stablecoin (USDC, scale=6), os valores
+#   sao armazenados com scale=18 (zeros adicionais a direita nao alteram o valor).
+#   A coluna asset_code acompanha sempre o valor para identificar o ativo.
+#
+# FORMATO: Parquet com compressao ZSTD (melhor razao tamanho/cpu para analytics).
+# CATÁLOGO: Apache Iceberg REST Catalog (ou AWS Glue, dependendo do deploy).
+
+catalog:
+  type: rest                             # REST Catalog (compativel com Nessie, Lakeformation, Polaris)
+  uri: "${ICEBERG_CATALOG_URI}"          # ex.: http://iceberg-rest:8181
+  warehouse: "${ICEBERG_WAREHOUSE}"      # ex.: s3://adserver-lakehouse/
+
+tables:
+
+  # ===========================================================================
+  # iceberg_ad_request: registro de todas as oportunidades de impressao
+  # ===========================================================================
+  - name: adserver.events_ad_request
+    description: >
+      Tabela de verdade de AdRequests (oportunidades de impressao). Fonte para
+      calculo de fill rate e escassez de inventario. Sem PII (TX-5).
+      Particionado por (tenant_id, year, month, day) para pruning eficiente.
+    schema:
+      fields:
+        - name: event_id
+          type: string
+          required: true
+          doc: "ULID/UUID, chave de dedupe (TX-1). PK logica."
+        - name: tenant_id
+          type: string
+          required: true
+        - name: decision_id
+          type: string
+          required: false
+        - name: model_version
+          type: string
+          required: false
+        - name: occurred_at
+          type: timestamptz
+          required: true
+          doc: "Event-time (UTC). Base das janelas de billing e atribuicao."
+        - name: ingested_at
+          type: timestamptz
+          required: true
+          doc: "Processing-time: quando o evento chegou ao Iceberg."
+        - name: schema_version
+          type: string
+          required: false
+        - name: source
+          type: string
+          required: false
+        - name: zone_id
+          type: string
+          required: true
+        - name: site_id
+          type: string
+          required: false
+        - name: geo_country
+          type: string
+          required: false
+          doc: "ISO 3166-1 alpha-2. Sem PII (TX-5)."
+        - name: geo_city
+          type: string
+          required: false
+          doc: "Cidade derivada. Granularidade maxima; sem coordenadas. Sem PII."
+    partition:
+      - field: tenant_id
+      - transform: year(occurred_at)
+        name: year
+      - transform: month(occurred_at)
+        name: month
+      - transform: day(occurred_at)
+        name: day
+    write:
+      format: parquet
+      compression: zstd
+    properties:
+      write.parquet.compression-codec: zstd
+      write.metadata.compression-codec: gzip
+      write.target-file-size-bytes: "134217728"   # 128 MB por arquivo Parquet
+      history.expire.max-snapshot-age-ms: "7776000000"  # 90 dias de snapshots
+
+  # ===========================================================================
+  # iceberg_impression: impressoes validadas (base de billing CPM)
+  # ===========================================================================
+  - name: adserver.events_impression
+    description: >
+      Impressoes validadas pos-IVT (ivt_status = '' clean). Fonte de verdade
+      para billing CPM. Inclui blank=true (impressao em branco) para calculo
+      de fill rate e inventory_loss (CA-6). Sem PII (TX-5).
+    schema:
+      fields:
+        - name: event_id
+          type: string
+          required: true
+        - name: tenant_id
+          type: string
+          required: true
+        - name: decision_id
+          type: string
+          required: false
+        - name: model_version
+          type: string
+          required: false
+        - name: occurred_at
+          type: timestamptz
+          required: true
+        - name: ingested_at
+          type: timestamptz
+          required: true
+        - name: schema_version
+          type: string
+          required: false
+        - name: source
+          type: string
+          required: false
+        - name: campaign_id
+          type: string
+          required: false
+        - name: banner_id
+          type: string
+          required: false
+        - name: zone_id
+          type: string
+          required: true
+        - name: served_tier
+          type: string
+          required: false
+          doc: "OVERRIDE|CONTRACT|REMNANT|BLANK (enum ServedTier)"
+        - name: billable
+          type: boolean
+          required: true
+        - name: blank
+          type: boolean
+          required: true
+        - name: ivt_status
+          type: string
+          required: false
+          doc: "'' = clean/nao avaliado. 'bot', 'datacenter', 'dup' = IVT."
+    partition:
+      - field: tenant_id
+      - transform: year(occurred_at)
+        name: year
+      - transform: month(occurred_at)
+        name: month
+      - transform: day(occurred_at)
+        name: day
+    write:
+      format: parquet
+      compression: zstd
+    properties:
+      write.target-file-size-bytes: "134217728"
+      history.expire.max-snapshot-age-ms: "7776000000"  # 90 dias
+
+  # ===========================================================================
+  # iceberg_click: cliques validados (base de billing CPC)
+  # ===========================================================================
+  - name: adserver.events_click
+    description: >
+      Cliques registrados pelo redirect server-side (ck.php -> 302). Fonte de
+      verdade para billing CPC e para a janela de atribuicao click->conversion
+      (lookback 7 dias, ADR-0002 B.7). Sem PII (TX-5).
+    schema:
+      fields:
+        - name: event_id
+          type: string
+          required: true
+        - name: tenant_id
+          type: string
+          required: true
+        - name: decision_id
+          type: string
+          required: true
+          doc: "Liga o clique a decisao originadora (atribuicao, TX-1)."
+        - name: model_version
+          type: string
+          required: false
+        - name: occurred_at
+          type: timestamptz
+          required: true
+        - name: ingested_at
+          type: timestamptz
+          required: true
+        - name: schema_version
+          type: string
+          required: false
+        - name: source
+          type: string
+          required: false
+        - name: campaign_id
+          type: string
+          required: true
+        - name: banner_id
+          type: string
+          required: true
+        - name: zone_id
+          type: string
+          required: true
+        - name: dest_url
+          type: string
+          required: false
+    partition:
+      - field: tenant_id
+      - transform: year(occurred_at)
+        name: year
+      - transform: month(occurred_at)
+        name: month
+      - transform: day(occurred_at)
+        name: day
+    write:
+      format: parquet
+      compression: zstd
+    properties:
+      write.target-file-size-bytes: "67108864"     # 64 MB (volume menor)
+      history.expire.max-snapshot-age-ms: "7776000000"
+
+  # ===========================================================================
+  # iceberg_conversion: conversoes validadas (base de billing CPA + treino pCVR)
+  # ===========================================================================
+  - name: adserver.events_conversion
+    description: >
+      Conversoes validadas (deduplicated=false) com valor monetario em Decimal.
+      Fonte de verdade para billing CPA e para o label de treino de pCVR.
+      conversion_value em Decimal(38,18): NUNCA Float (TX-2/DA-10).
+      O scale autoritativo vem do Asset Registry; a coluna asset_code identifica
+      o ativo (sem conversao automatica, DA-10).
+    schema:
+      fields:
+        - name: event_id
+          type: string
+          required: true
+        - name: tenant_id
+          type: string
+          required: true
+        - name: decision_id
+          type: string
+          required: false
+        - name: model_version
+          type: string
+          required: false
+          doc: "Identifica o ranker. Crucial para treino off-policy de pCVR."
+        - name: occurred_at
+          type: timestamptz
+          required: true
+        - name: ingested_at
+          type: timestamptz
+          required: true
+        - name: schema_version
+          type: string
+          required: false
+        - name: source
+          type: string
+          required: false
+        - name: campaign_id
+          type: string
+          required: true
+        - name: banner_id
+          type: string
+          required: true
+        # conversion_value: representacao em minor units (Int64) E Decimal
+        # O minor unit (int64) e o valor canonico no fio (money.proto).
+        # O Decimal e derivado para queries analiticas (nunca Float).
+        - name: conversion_value_amount
+          type: long
+          required: false
+          doc: "Minor units (int64, TX-2). Zero se sem valor declarado."
+        - name: conversion_value_asset_code
+          type: string
+          required: false
+          doc: "Codigo do ativo no Asset Registry (ex.: BRL, USD). Rotulo; sem cambio."
+        - name: conversion_value_scale
+          type: integer
+          required: false
+          doc: "Scale do ativo (autoritativo no Asset Registry; carregado para auditoria)."
+        - name: conversion_value_decimal
+          type: decimal(38, 18)
+          required: false
+          doc: "amount / 10^scale como Decimal(38,18). NUNCA Float (TX-2). Derivado."
+        - name: attribution_decision_id
+          type: string
+          required: false
+          doc: "decision_id da impressao/clique atribuido (pode diferir do envelope)."
+        - name: deduplicated
+          type: boolean
+          required: true
+          doc: "true=duplicata; excluir de billing e treino."
+    partition:
+      - field: tenant_id
+      - transform: year(occurred_at)
+        name: year
+      - transform: month(occurred_at)
+        name: month
+      - transform: day(occurred_at)
+        name: day
+    write:
+      format: parquet
+      compression: zstd
+    properties:
+      write.target-file-size-bytes: "33554432"     # 32 MB (volume muito menor)
+      history.expire.max-snapshot-age-ms: "31536000000"  # 1 ano (billing/treino)
