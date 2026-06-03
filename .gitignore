@@ -16,3 +16,10 @@ proto/gen/
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Node.js / web e BFF (nunca commitar node_modules)
+node_modules/
+.next/
+dist/
+bff/dist/
+web/console/.next/

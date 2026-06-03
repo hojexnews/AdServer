@@ -1,0 +1,43 @@
+/**
+ * Tokens CSS-first (Tailwind v4).
+ * White-label: variáveis CSS sobrescrevíveis por tenant em runtime.
+ */
+
+@import "tailwindcss";
+
+@theme {
+  /* Paleta base — sobrescrita por tenant via middleware */
+  --color-brand-50: oklch(97% 0.02 255);
+  --color-brand-100: oklch(93% 0.05 255);
+  --color-brand-500: oklch(55% 0.18 255);
+  --color-brand-600: oklch(48% 0.20 255);
+  --color-brand-700: oklch(40% 0.20 255);
+  --color-brand-900: oklch(25% 0.15 255);
+
+  /* Indicadores de fonte de dados (ADR-0001) */
+  --color-source-consolidated: oklch(55% 0.15 155); /* verde */
+  --color-source-live: oklch(55% 0.18 35);          /* âmbar */
+
+  /* Status */
+  --color-status-ok: oklch(55% 0.15 155);
+  --color-status-warn: oklch(70% 0.18 85);
+  --color-status-error: oklch(55% 0.20 25);
+
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+}
+
+/* Acessibilidade: foco visível em todos os interativos */
+:focus-visible {
+  outline: 2px solid var(--color-brand-500);
+  outline-offset: 2px;
+}
+
+/* Redução de movimento */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

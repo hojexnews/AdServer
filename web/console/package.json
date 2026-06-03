@@ -1,0 +1,38 @@
+{
+  "name": "@adserver/console",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Console self-service do anunciante — Next.js 16 + App Router + tRPC client.",
+  "scripts": {
+    "dev": "next dev --turbopack",
+    "build": "next build",
+    "typecheck": "tsc --noEmit",
+    "lint": "next lint --max-warnings 0"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.80.2",
+    "@trpc/client": "11.0.0",
+    "@trpc/react-query": "11.0.0",
+    "@trpc/server": "11.0.0",
+    "@trpc/next": "11.0.0",
+    "decimal.js": "10.4.3",
+    "next": "15.3.3",
+    "react": "19.1.0",
+    "react-dom": "19.1.0",
+    "react-hook-form": "^7.56.4",
+    "react-querybuilder": "^8.7.1",
+    "recharts": "^2.15.3",
+    "zod": "3.24.4",
+    "@hookform/resolvers": "^3.9.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.1.6",
+    "@types/react-dom": "^19.1.5",
+    "eslint": "^9.28.0",
+    "eslint-config-next": "15.3.3",
+    "typescript": "^5.8.3",
+    "tailwindcss": "^4.1.8",
+    "@tailwindcss/postcss": "^4.1.8"
+  }
+}
