@@ -1,0 +1,46 @@
+// Pacote: adserver.money.v1
+//
+// Tipo monetario canonico do sistema (TX-2 / DA-10).
+//
+// REGRAS INVIOLAVEIS:
+//   - FLOAT E PROIBIDO. Dinheiro no fio e SEMPRE int64 de minor-units
+//     acompanhado de um `scale` explicito. Float introduz erro de
+//     arredondamento inaceitavel em ledger/faturamento.
+//   - SEM CONVERSAO CAMBIAL AUTOMATICA (DA-10). Cada ativo e um ledger
+//     isolado; cambio so existe como par de postings explicito com taxa
+//     registrada por humano/desk.
+//   - Comparacoes de eCPM/preco so sao validas DENTRO da mesma moeda e
+//     do mesmo tenant. Comparar Money de assets diferentes e um erro.
+syntax = "proto3";
+
+package adserver.money.v1;
+
+option go_package = "github.com/hojex/adserver/gen/go/adserver/money/v1;moneyv1";
+
+// Valor monetario agnostico a moeda (TX-2).
+//
+// Valor real = amount * 10^(-scale). Ex.: BRL 12,34 => {asset_code:"BRL",
+// amount:1234, scale:2}. USDC 1,500000 => {asset_code:"USDC",
+// amount:1500000, scale:6}.
+message Money {
+  // Codigo do ativo (ex.: "BRL", "USD", "USDC"). E a chave no Asset
+  // Registry, que e a fonte autoritativa de `scale` por ativo. Tratar
+  // como rotulo opaco: dois Money so sao comparaveis se asset_code for
+  // identico.
+  string asset_code = 1;
+
+  // Quantia em MINOR UNITS (unidades inteiras na menor fracao do ativo).
+  // Pode ser negativo (estornos, ajustes de ledger). Nunca usar float
+  // para derivar este valor.
+  int64 amount = 2;
+
+  // Numero de casas decimais (expoente). AUTORITATIVO no Asset Registry
+  // (BRL=2, USDC=6, ERC-20=18, ...). NUNCA se infere a partir do
+  // asset_code no codigo consumidor: sempre carregar/validar contra o
+  // Registry. Incluido no fio para o valor ser autocontido.
+  uint32 scale = 3;
+
+  // Reservado para metadados monetarios futuros (ex.: rounding_mode,
+  // asset_registry_version) sem reabrir numeros de campo.
+  reserved 4 to 7;
+}

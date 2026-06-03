@@ -1,0 +1,13 @@
+# Código gerado pelo buf (não versionado; gerado no CI/local)
+proto/gen/
+gen/
+# Binários locais de tooling
+.bin/
+# State de IaC (NUNCA versionar)
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+# Segredos
+*.env
+.env

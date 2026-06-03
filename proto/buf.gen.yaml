@@ -1,0 +1,22 @@
+# buf.gen.yaml — geracao de codigo a partir do Schema Registry (TX-1)
+#
+# Go e o hot path (delivery-edge, collectors lg/ck/ct, agregacao
+# StatsHourly). TypeScript serve o front Next.js. Rode `buf generate`
+# a partir do diretorio `proto/`.
+version: v2
+
+managed:
+  enabled: true
+
+plugins:
+  # ---- Go (hot path) ----
+  - remote: buf.build/protocolbuffers/go
+    out: gen/go
+    opt:
+      - paths=source_relative
+
+  # ---- TypeScript / ECMAScript (front Next.js) ----
+  - remote: buf.build/bufbuild/es
+    out: gen/ts
+    opt:
+      - target=ts

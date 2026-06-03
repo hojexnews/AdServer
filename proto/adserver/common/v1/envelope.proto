@@ -1,0 +1,99 @@
+// Pacote: adserver.common.v1
+//
+// Envelope universal de eventos (TX-1). Todo evento de telemetria, ledger
+// ou dominio EMBUTE este envelope como campo 1. Ele carrega os quatro
+// campos criticos (tenant_id, event_id, decision_id, model_version) que
+// fecham o loop de atribuicao e a dedupe/idempotencia.
+//
+// REGRA BACKWARD-COMPAT (TX-1): este contrato e gerenciado por Buf com
+// checagem de breaking-change na CI (compatibilidade BACKWARD obrigatoria).
+// NUNCA reutilize numeros de campo; NUNCA mude o tipo de um campo
+// existente; ao remover um campo, mova-o para `reserved`. Adicionar
+// campos novos com numeros novos e sempre permitido.
+syntax = "proto3";
+
+package adserver.common.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/hojex/adserver/gen/go/adserver/common/v1;commonv1";
+
+// Envelope universal anexado a todo evento do sistema (TX-1).
+message Envelope {
+  // Identificador do tenant (pseudonimo). Particiona dados e isola
+  // ledgers; jamais carrega PII (a PII vive no cofre de compliance,
+  // referenciada por este id — DA-11/TX-5).
+  string tenant_id = 1;
+
+  // Identificador unico do evento (ULID ou UUID). Chave de
+  // dedupe/idempotencia: o mesmo event_id processado duas vezes deve
+  // produzir efeito unico (collectors at-least-once, consumidores
+  // exactly-once por dedupe).
+  string event_id = 2;
+
+  // Liga o evento a decisao de veiculacao que o originou. Junto de
+  // model_version, FECHA O LOOP DE ATRIBUICAO (treino de pCVR e
+  // avaliacao off-policy). Sem decision_id nao ha ML (TX-1).
+  string decision_id = 3;
+
+  // Versao do ranker/modelo que produziu a decisao. Vazio ("") quando a
+  // decisao veio da cascata deterministica pura (DA-3), sem re-ranker.
+  // Necessario para avaliacao off-policy e atribuicao por versao.
+  string model_version = 4;
+
+  // Instante em que o evento OCORREU (event-time), nao o de ingestao.
+  // Base para janelas de atribuicao e para a agregacao horaria
+  // StatsHourly (DA-7).
+  google.protobuf.Timestamp occurred_at = 5;
+
+  // Versao semantica do contrato deste evento (ex.: "1.0.0"). Permite
+  // que consumidores apliquem logica condicional durante migracoes,
+  // independente da evolucao de schema do Protobuf.
+  string schema_version = 6;
+
+  // Componente emissor do evento (ex.: "delivery-edge", "collector-lg",
+  // "ingest-ivt"). Util para observabilidade e roteamento.
+  string source = 7;
+
+  // Reservado para evolucao compativel do envelope (ex.: trace_id,
+  // partition_key, consent_flags). Sinaliza espaco para crescer sem
+  // colidir numeros de campo.
+  reserved 8 to 15;
+}
+
+// Geolocalizacao minima derivada, SEM PII (TX-5).
+//
+// Derivada do IP do request via GeoLite2 no collector. O IP BRUTO NUNCA
+// entra no evento nem e persistido: o collector descarta o IP logo apos
+// derivar este geo (privacy by design — TX-5/DA-11).
+message Geo {
+  // Codigo de pais ISO 3166-1 alpha-2 (ex.: "BR", "US"). Pode ser vazio
+  // se a derivacao falhar.
+  string country = 1;
+
+  // Cidade derivada (ex.: "Sao Paulo"). Granularidade maxima permitida;
+  // sem coordenadas precisas, sem CEP, sem qualquer dado reidentificavel.
+  string city = 2;
+
+  // Reservado para sinais geo agregados nao-PII (ex.: region/UF,
+  // continent). Mantem a porta aberta sem reabrir o debate de privacidade.
+  reserved 3 to 7;
+}
+
+// Camada da cascata deterministica que serviu o anuncio (DA-3).
+//
+// Ordem da cascata: Override -> Contract -> Remnant -> impressao em
+// branco. Carregado nas impressoes para auditoria de inventario e para
+// atribuir receita a camada correta.
+enum ServedTier {
+  // Valor default (proto3): camada nao informada/desconhecida.
+  SERVED_TIER_UNSPECIFIED = 0;
+  // Veiculacao forcada por override (maxima prioridade).
+  SERVED_TIER_OVERRIDE = 1;
+  // Veiculacao por contrato/garantido.
+  SERVED_TIER_CONTRACT = 2;
+  // Veiculacao remnant (inventario nao-garantido).
+  SERVED_TIER_REMNANT = 3;
+  // Nenhum anuncio elegivel: impressao em branco.
+  SERVED_TIER_BLANK = 4;
+}

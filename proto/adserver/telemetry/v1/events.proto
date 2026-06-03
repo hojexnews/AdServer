@@ -1,0 +1,172 @@
+// Pacote: adserver.telemetry.v1
+//
+// Eventos de telemetria volumetrica do ad server (§4.7, DA-8).
+//
+// Os quatro eventos refletem os endpoints de medicao:
+//   - AdRequest   -> asyncjs.php?zoneid=...  (disparo do tag)
+//   - Impression  -> lg.php                  (pixel 1x1 carregado)
+//   - Click       -> ck.php -> 302           (redirect server-side)
+//   - Conversion  -> ct.php                  (pixel terminal)
+//
+// Todo evento EMBUTE adserver.common.v1.Envelope como campo 1 (TX-1).
+// Numeracao de campos comeca em 2 e e contigua/estavel. Aplica-se a
+// regra BACKWARD-compat de TX-1 (Buf breaking-check na CI).
+//
+// PRIVACY (TX-5/DA-11): nenhum evento carrega IP bruto nem PII. Geo e
+// derivado e minimo; chaves de capping sao efemeras/hasheadas e NAO
+// aparecem aqui.
+syntax = "proto3";
+
+package adserver.telemetry.v1;
+
+import "adserver/common/v1/envelope.proto";
+import "adserver/money/v1/money.proto";
+
+option go_package = "github.com/hojex/adserver/gen/go/adserver/telemetry/v1;telemetryv1";
+
+// Requisicao de anuncio (disparo do asyncjs em asyncjs.php?zoneid=...).
+//
+// Topo do funil: registra a oportunidade de impressao antes da decisao
+// de veiculacao. Sem PII (TX-5).
+message AdRequest {
+  // Envelope universal (TX-1). Para o AdRequest, decision_id/model_version
+  // podem ja estar preenchidos se a decisao acontece no mesmo span.
+  adserver.common.v1.Envelope envelope = 1;
+
+  // Zona (placement) que disparou o request (do parametro zoneid).
+  string zone_id = 2;
+
+  // Site/propriedade dona da zona. Casa com a regra de targeting
+  // "Site - Variable" (DA-11).
+  string site_id = 3;
+
+  // Geo derivado do IP via GeoLite2; o IP foi descartado no collector
+  // (TX-5). Pais/cidade apenas.
+  adserver.common.v1.Geo geo = 4;
+
+  // User-Agent do request. Usado para targeting de device/browser e como
+  // sinal de IVT (TX-6). Nao e PII persistente.
+  string user_agent = 5;
+
+  // URL de origem (Referer) da pagina hospedeira. Pode ser vazio se o
+  // navegador suprimir o header.
+  string referer_url = 6;
+
+  // Token anti-cache injetado pelo tag (cachebuster) para evitar caching
+  // intermediario da resposta do request.
+  string cachebuster = 7;
+
+  // Variaveis customizadas (first-party data) injetadas pelo publisher
+  // antes do disparo (ex.: gender=male), casadas pela regra
+  // "Site - Variable" (DA-11). Mapa OPACO de chave/valor: tratar como
+  // dados first-party do publisher, sem assumir semantica nem PII.
+  map<string, string> custom_vars = 8;
+
+  // Reservado para sinais futuros do request (ex.: viewport, consent
+  // string, ad_unit_path) sem colisao de numeros.
+  reserved 9 to 15;
+}
+
+// Impressao medida pelo pixel 1x1 (lg.php), DA-8.
+//
+// Emitida quando o banner e efetivamente carregado/renderizado. Base de
+// faturamento CPM (apos filtro de IVT na ingestao, TX-6).
+message Impression {
+  // Envelope universal (TX-1). decision_id liga esta impressao a decisao
+  // que escolheu o banner; model_version indica o ranker (vazio se
+  // cascata pura).
+  adserver.common.v1.Envelope envelope = 1;
+
+  // Campanha veiculada.
+  string campaign_id = 2;
+
+  // Banner/criativo veiculado.
+  string banner_id = 3;
+
+  // Zona onde a impressao ocorreu.
+  string zone_id = 4;
+
+  // Camada da cascata que serviu o anuncio (DA-3).
+  adserver.common.v1.ServedTier served_tier = 5;
+
+  // true se a impressao e faturavel (ex.: trafego valido, contrato
+  // ativo). Faturamento real so apos filtro de IVT na ingestao (TX-6).
+  bool billable = 6;
+
+  // true quando served_tier == SERVED_TIER_BLANK (impressao em branco:
+  // nenhum anuncio elegivel). Redundante com served_tier por
+  // conveniencia de consulta.
+  bool blank = 7;
+
+  // Marcacao de fraude/IVT atribuida na INGESTAO (TX-6), fora do hot
+  // path. Vazio ("") = clean/nao avaliado; valores nao-vazios indicam o
+  // motivo (ex.: "bot", "datacenter", "dup"). CPM so fatura trafego
+  // marcado como valido.
+  string ivt_status = 8;
+
+  // Reservado para evolucao (ex.: viewability, render_time_ms,
+  // measured_currency) sem reuso de numeros.
+  reserved 9 to 15;
+}
+
+// Clique medido pelo redirect server-side (ck.php -> HTTP 302), DA-8.
+//
+// O servidor registra o clique e entao redireciona (302) para dest_url.
+// Base de faturamento CPC.
+message Click {
+  // Envelope universal (TX-1). decision_id liga o clique a impressao/
+  // decisao originadora (atribuicao).
+  adserver.common.v1.Envelope envelope = 1;
+
+  // Campanha clicada.
+  string campaign_id = 2;
+
+  // Banner/criativo clicado.
+  string banner_id = 3;
+
+  // Zona onde o clique ocorreu.
+  string zone_id = 4;
+
+  // URL de destino para a qual o servidor emite o 302 (landing page do
+  // anunciante).
+  string dest_url = 5;
+
+  // Reservado para evolucao (ex.: ivt_status do clique, click_position)
+  // sem colidir numeros.
+  reserved 6 to 15;
+}
+
+// Conversao medida pelo pixel terminal (ct.php), DA-8.
+//
+// Disparado na pagina de sucesso do anunciante. Base de faturamento CPA
+// e sinal de label para treino de pCVR.
+message Conversion {
+  // Envelope universal (TX-1). model_version aqui e crucial: junto do
+  // decision_id atribuido, fecha o loop de treino de pCVR / off-policy.
+  adserver.common.v1.Envelope envelope = 1;
+
+  // Campanha creditada pela conversao.
+  string campaign_id = 2;
+
+  // Banner/criativo creditado.
+  string banner_id = 3;
+
+  // Valor monetario da conversao (TX-2). Money canonico (int64 +
+  // scale); NUNCA float. Opcional: zero/ausente para conversoes sem
+  // valor declarado.
+  adserver.money.v1.Money conversion_value = 4;
+
+  // decision_id da impressao/clique ATRIBUIDO a esta conversao (pode
+  // diferir do decision_id no envelope, que e o do proprio evento de
+  // conversao). Resolvido dentro da JANELA DE ATRIBUICAO configurada
+  // (ex.: 7 dias post-click / 1 dia post-view); fecha o loop de pCVR.
+  string attribution_decision_id = 5;
+
+  // true se esta conversao foi marcada como duplicada (mesma jornada
+  // contada mais de uma vez) e portanto NAO deve faturar/treinar.
+  bool deduplicated = 6;
+
+  // Reservado para evolucao (ex.: attribution_model, conversion_type,
+  // order_id_hash) sem reuso de numeros.
+  reserved 7 to 15;
+}

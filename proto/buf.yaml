@@ -1,0 +1,31 @@
+# buf.yaml — Schema Registry Protobuf do AdServer (TX-1)
+#
+# Contrato de eventos único, Protobuf-first, gerenciado com Buf.
+# A CI roda `buf lint` e `buf breaking` para GARANTIR compatibilidade
+# BACKWARD obrigatoria (TX-1): consumidores antigos continuam lendo
+# mensagens novas. Mudancas breaking sao rejeitadas no pipeline.
+version: v2
+
+modules:
+  - path: .
+
+lint:
+  # STANDARD cobre o conjunto recomendado pelo Buf (nomes, sufixos,
+  # pacotes versionados, etc.). Mantemos comentarios obrigatorios para
+  # que o registry seja autodocumentado.
+  use:
+    - STANDARD
+    - COMMENTS
+  except:
+    # RPCs nao se aplicam: este modulo so define mensagens de evento.
+    - RPC_REQUEST_STANDARD_NAME
+    - RPC_RESPONSE_STANDARD_NAME
+    - RPC_REQUEST_RESPONSE_UNIQUE
+  enum_zero_value_suffix: _UNSPECIFIED
+
+breaking:
+  # WIRE_JSON garante compatibilidade tanto no fio (binario) quanto em
+  # JSON. Combinado com `buf breaking --against` na CI, materializa a
+  # regra BACKWARD-compat de TX-1.
+  use:
+    - WIRE_JSON

@@ -1,0 +1,9 @@
+code,name,scale,kind,chain_id,contract_address,custody_mode,price_source,price_governance,enabled
+BRL,Real Brasileiro,2,fiat,,,none,none,,true
+USD,US Dollar,2,fiat,,,none,none,,true
+EUR,Euro,2,fiat,,,none,none,,true
+USDC,USD Coin,6,stablecoin,1,0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48,safe_multisig,none,,true
+USDT,Tether USD,6,stablecoin,1,0xdAC17F958D2ee523a2206206994597C13D831ec7,safe_multisig,none,,true
+ERC20,ERC-20 generico,18,crypto,1,,safe_multisig,none,,true
+AEV,Aevum,,token,,,client_supply,administered,Comite de Tesouraria,false
+BND,Bond (Aevum),,token,,,client_supply,administered,Comite de Tesouraria,false
