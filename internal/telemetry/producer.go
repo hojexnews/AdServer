@@ -39,6 +39,9 @@ type Producer struct {
 	logger  *slog.Logger
 	walPath string
 
+	// wireFormat selects Protobuf (production) or JSONEachRow (dev/ClickHouse).
+	wireFormat WireFormat
+
 	queue chan pendingRecord
 	wg    sync.WaitGroup
 
@@ -75,6 +78,9 @@ type Config struct {
 	QueueDepth int
 	// Logger is the structured logger; nil = no-op.
 	Logger *slog.Logger
+	// WireFormat selects Protobuf (default, production) or JSONEachRow
+	// (local dev, to match the ClickHouse kafka engine).  See wire.go.
+	WireFormat WireFormat
 }
 
 // NewProducer creates and starts a Producer.
@@ -106,9 +112,9 @@ func NewProducer(cfg Config) (*Producer, error) {
 	if len(cfg.Brokers) > 0 {
 		opts := []kgo.Opt{
 			kgo.SeedBrokers(cfg.Brokers...),
-			kgo.RequiredAcks(kgo.AllISRAcks()),             // acks=all
-			kgo.ProducerBatchMaxBytes(64 * 1024),           // 64 KB
-			kgo.ProducerLinger(5 * time.Millisecond),       // 5 ms linger
+			kgo.RequiredAcks(kgo.AllISRAcks()),                   // acks=all
+			kgo.ProducerBatchMaxBytes(64 * 1024),                 // 64 KB
+			kgo.ProducerLinger(5 * time.Millisecond),             // 5 ms linger
 			kgo.RecordPartitioner(kgo.StickyKeyPartitioner(nil)), // hash(key)
 		}
 		client, err := kgo.NewClient(opts...)
@@ -122,12 +128,13 @@ func NewProducer(cfg Config) (*Producer, error) {
 	}
 
 	p := &Producer{
-		client:  kClient,
-		wal:     wal,
-		logger:  logger,
-		walPath: cfg.WALPath,
-		queue:   make(chan pendingRecord, cfg.QueueDepth),
-		seenIDs: make(map[string]struct{}),
+		client:     kClient,
+		wal:        wal,
+		logger:     logger,
+		walPath:    cfg.WALPath,
+		wireFormat: cfg.WireFormat,
+		queue:      make(chan pendingRecord, cfg.QueueDepth),
+		seenIDs:    make(map[string]struct{}),
 	}
 
 	// Replay WAL entries into the queue on startup.
@@ -312,7 +319,7 @@ func (p *Producer) enqueue(topic, eventID string, msg proto.Message) {
 		p.seenMu.Unlock()
 	}
 
-	payload, err := proto.Marshal(msg)
+	payload, err := marshalWire(p.wireFormat, msg)
 	if err != nil {
 		p.logger.Error("telemetry: marshal", "topic", topic, "err", err)
 		return

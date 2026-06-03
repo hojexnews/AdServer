@@ -71,6 +71,7 @@ capping eventual+fail-safe, atribuição last-click 7d, premissa de volume) e de
 | **I3** | Pipeline Redpanda→ClickHouse(`StatsHourly` + "ao vivo")→Iceberg; dedupe por `event_id`; billing batch | [data/](data/) | CA-6, CA-7 |
 | **I4** | Console Next.js + BFF tRPC (fronteira de ACL, vínculo N:N, dashboards ≤1h vs ao vivo, anti-contradição) | [web/console/](web/console/) · [bff/](bff/) | CA-1 |
 | **Gate** | Golden tests CA-mapeados (85 casos) + harness shadow/dual-run + tolerâncias | [tests/parity/](tests/parity/) | §5 (cutover) |
+| **I5** | Integração local: loader Postgres→snapshot (decision serve config real), produtor↔ClickHouse (wire JSON p/ dev), seed demo, docker-compose, smoke E2E | [internal/configload/](internal/configload/) · [deploy/local/](deploy/local/) · [db/seed/](db/seed/) | wiring I1↔I0; CA-1 (loader BYPASSRLS) |
 
 **Gates verdes:** `security-reviewer` + `privacy-compliance-auditor` sem CRITICAL/HIGH
 abertos (1 CRITICAL + 4 HIGH + 4 MEDIUM remediados — token HMAC no `/ck`, tenant
@@ -79,14 +80,42 @@ salt fail-closed, row-policy ClickHouse robusta, SSRF `/vast`, allowlist de logs
 `make verify` (TX-1/TX-2) + `go test` (incl. `tests/parity`) + typecheck/build de
 web/bff **verdes**. CI: [buf](.github/workflows/buf.yml) · [no-float](.github/workflows/no-float.yml) · [go](.github/workflows/go.yml).
 
+### 🧪 Rodar localmente (I5 — sem cloud)
+
+O incremento **I5** ([deploy/local/](deploy/local/), [internal/configload/](internal/configload/))
+transforma 3 dos pendentes de infra em artefatos **rodáveis localmente**:
+
+```bash
+# Caminho A — Postgres local (sem Docker), VERIFICADO:
+make dev-db-setup      # cria adserver_dev, aplica migrations + roles + seed demo
+make dev-it            # teste de integração: loader Postgres→snapshot (papel BYPASSRLS)
+make dev-decision-run  # sobe o decision; em outro shell:
+make dev-smoke         # E2E: BR→CONTRACT, US→REMNANT (regra de geo), zona desconhecida→BLANK
+
+# Caminho B — stack completo via Docker Compose:
+make dev-up            # core: postgres + redis + decision + collector
+make dev-up-streaming  # + redpanda + clickhouse (produtor emite JSONEachRow → ClickHouse)
+make dev-validate      # valida compose/scripts sem Docker
+```
+
+O **loader de config** (`internal/configload`) fecha o wiring I1↔I0: o decision
+service agora monta o snapshot a partir de `db/config` (Postgres) e **serve
+anúncios reais** (antes era sempre BLANK com `EmptySnapshot`). O snapshot é
+global cross-tenant via papel **`adserver_loader` (BYPASSRLS)**; CA-1 é imposto
+na cascata (zona→tenant), não na leitura. O **produtor↔ClickHouse** ganhou
+`TELEMETRY_WIRE_FORMAT=json` (`internal/telemetry/wire.go`) cujos nomes de campo
+casam exatamente com as colunas da kafka-engine (incl. `user_agent` = classe
+coarse → `user_agent_class` na MV); Protobuf segue como padrão de produção.
+
 ### ⏭️ Pendente de ambiente (não-código) para fechar a Fase 1
 
-Cutover só após **infra real**: aplicar [platform/](platform/) em cloud; subir
-Postgres/Redis/Redpanda/ClickHouse; conectar o produtor↔ClickHouse (formato
-Protobuf); MaxMind `.mmdb`; e rodar **shadow-traffic + dual-run contábil** contra
-o Revive legado dentro da tolerância (`parity-shadow`/`parity-dual-run`). CA-3/CA-9
-operacionais (upload de criativo, MaxMind auto-update, Mailer/SMTP) dependem desse
-ambiente. Ver matriz CA-1…CA-9→status em [tests/parity/](tests/parity/).
+Cutover só após **infra real**: aplicar [platform/](platform/) em cloud; rodar o
+stack [deploy/local/](deploy/local/) (ou equivalente gerenciado) com
+Postgres/Redis/Redpanda/ClickHouse; MaxMind `.mmdb`; e rodar **shadow-traffic +
+dual-run contábil** contra o Revive legado dentro da tolerância
+(`parity-shadow`/`parity-dual-run`). CA-3/CA-9 operacionais (upload de criativo,
+MaxMind auto-update, Mailer/SMTP) dependem desse ambiente. Ver matriz
+CA-1…CA-9→status em [tests/parity/](tests/parity/).
 
 ---
 

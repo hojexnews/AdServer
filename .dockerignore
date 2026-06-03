@@ -1,0 +1,10 @@
+# Keep the Docker build context small and hermetic (gen/ IS included — it is
+# versioned generated code, ADR-0002 §C).
+.git
+**/node_modules
+.bin
+**/*.wal
+web/console/.next
+bff/dist
+tmp
+*.log

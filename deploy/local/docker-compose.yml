@@ -1,0 +1,182 @@
+# deploy/local/docker-compose.yml — local integration stack for the AdServer.
+#
+# Brings up the dependencies the Phase-1 cutover work needs (Postgres, Redis,
+# Redpanda, ClickHouse) plus the two Go hot-path services, so the producer→
+# ClickHouse pipeline and the config snapshot loader can be exercised end-to-end
+# WITHOUT cloud.  This is the local counterpart of platform/ (which targets EKS).
+#
+# Profiles:
+#   (default)   postgres + redis + decision + collector — the core hot path.
+#   streaming   adds redpanda + clickhouse + their init jobs (telemetry pipeline).
+#
+# Usage (see ../../make/dev.mk for wrappers):
+#   docker compose -f deploy/local/docker-compose.yml up -d
+#   docker compose -f deploy/local/docker-compose.yml --profile streaming up -d
+#
+# SECRETS: the values below are DEV-ONLY defaults.  Production secrets come
+# from OpenBao (platform/secrets/openbao); never reuse these.
+#
+# NOTE: this stack was authored as code and validated statically (YAML/Dockerfile/
+# shell). It requires a working Docker engine to boot, which was not available in
+# the authoring environment — verify `up` locally before relying on it.
+
+name: adserver-local
+
+x-ck-env: &ck-secret "dev-ck-hmac-secret-change-me"
+x-cap-salt: &cap-salt "dev-capping-salt-change-me"
+
+services:
+  # ---------------------------------------------------------------------------
+  # Postgres — config + ledger schema. Init applies migrations + roles + seed.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: adserver
+    ports:
+      - "5432:5432"
+    volumes:
+      - ../../db:/repo/db:ro
+      - ./postgres/10-init.sh:/docker-entrypoint-initdb.d/10-init.sh:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d adserver"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # ---------------------------------------------------------------------------
+  # Redis — frequency capping state (best-effort + fail-safe DA-6).
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # ---------------------------------------------------------------------------
+  # Redpanda — Kafka-API event bus (single node, dev). [profile: streaming]
+  # ---------------------------------------------------------------------------
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    profiles: ["streaming"]
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --overprovisioned
+      - --node-id=0
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:9092
+      - --mode=dev-container
+    ports:
+      - "9092:9092"
+      - "9644:9644"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Topic creation (partitions mirror data/redpanda/topics.yaml; RF=1 for dev).
+  redpanda-init:
+    image: redpandadata/redpanda:v24.2.7
+    profiles: ["streaming"]
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "/init/topics.sh"]
+    volumes:
+      - ./redpanda/topics.sh:/init/topics.sh:ro
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # ClickHouse — ingestion + StatsHourly + live view. [profile: streaming]
+  # Init renders the data/clickhouse DDL for single-node dev (strips
+  # ON CLUSTER, substitutes the broker host) and applies it.
+  # ---------------------------------------------------------------------------
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    profiles: ["streaming"]
+    depends_on:
+      redpanda-init:
+        condition: service_completed_successfully
+    environment:
+      CLICKHOUSE_DB: adserver
+      REDPANDA_BROKERS: redpanda:9092
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    volumes:
+      - ../../data/clickhouse/migrations:/repo/ch:ro
+      - ./clickhouse/10-ddl.sh:/docker-entrypoint-initdb.d/10-ddl.sh:ro
+      - chdata:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ---------------------------------------------------------------------------
+  # decision — hot-path ad selection service (cascade + capping).
+  # ---------------------------------------------------------------------------
+  decision:
+    build:
+      context: ../..
+      dockerfile: deploy/local/Dockerfile
+      args:
+        SERVICE: decision
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DECISION_ADDR: ":8080"
+      DATABASE_URL: "postgres://adserver_loader:loader_dev_only@postgres:5432/adserver?sslmode=disable"
+      REDIS_ADDR: "redis:6379"
+      CAPPING_SALT: *cap-salt
+      CK_HMAC_SECRET: *ck-secret
+      SNAPSHOT_REFRESH_INTERVAL: "15s"
+      # Streaming: set REDPANDA_BROKERS + TELEMETRY_WIRE_FORMAT to emit events.
+      REDPANDA_BROKERS: "${REDPANDA_BROKERS:-}"
+      TELEMETRY_WIRE_FORMAT: "${TELEMETRY_WIRE_FORMAT:-}"
+      TELEMETRY_WAL_PATH: "/tmp/decision.wal"
+    ports:
+      - "8080:8080"
+
+  # ---------------------------------------------------------------------------
+  # collector — measurement endpoints (asyncjs/lg/ck/ct/vast).
+  # ---------------------------------------------------------------------------
+  collector:
+    build:
+      context: ../..
+      dockerfile: deploy/local/Dockerfile
+      args:
+        SERVICE: collector
+    depends_on:
+      - decision
+    environment:
+      COLLECTOR_ADDR: ":8081"
+      COLLECTOR_BASE_URL: "http://localhost:8081"
+      DECISION_BASE_URL: "http://decision:8080"
+      CK_HMAC_SECRET: *ck-secret
+      TRUSTED_PROXY_DEPTH: "1"
+      REDPANDA_BROKERS: "${REDPANDA_BROKERS:-}"
+      TELEMETRY_WIRE_FORMAT: "${TELEMETRY_WIRE_FORMAT:-}"
+      TELEMETRY_WAL_PATH: "/tmp/collector.wal"
+    ports:
+      - "8081:8081"
+
+volumes:
+  pgdata:
+  chdata:

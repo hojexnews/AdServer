@@ -35,9 +35,10 @@ import (
 
 	commonv1 "github.com/hojex/adserver/gen/go/adserver/common/v1"
 	decisionv1 "github.com/hojex/adserver/gen/go/adserver/decision/v1"
-	"github.com/hojex/adserver/internal/cascade"
 	"github.com/hojex/adserver/internal/capping"
+	"github.com/hojex/adserver/internal/cascade"
 	"github.com/hojex/adserver/internal/clicktoken"
+	"github.com/hojex/adserver/internal/configload"
 	"github.com/hojex/adserver/internal/geo"
 	"github.com/hojex/adserver/internal/rules"
 	"github.com/hojex/adserver/internal/snapshot"
@@ -346,10 +347,36 @@ func main() {
 	}
 
 	// ---------------------------------------------------------------------------
-	// Snapshot store — I1 will wire the real Loader from db/config/.
+	// Snapshot store — config is pulled from db/config (Postgres) via the
+	// configload PostgresLoader when DATABASE_URL is set, and refreshed
+	// periodically (SNAPSHOT_REFRESH_INTERVAL, default 30s).  Without
+	// DATABASE_URL the service serves an EMPTY snapshot: every decision is
+	// BLANK (safe default — no real ads until config is wired).
+	//
+	// Tenancy: the loader reads config cross-tenant (the in-memory snapshot is
+	// global; CA-1 isolation is enforced in the cascade from the zone's
+	// server-derived tenant).  The DSN must use the read-only BYPASSRLS role
+	// (adserver_loader) — see internal/configload package doc.
 	// ---------------------------------------------------------------------------
-	snap := snapshot.EmptySnapshot()
-	store := snapshot.NewStore(snap)
+	store := snapshot.NewStore(snapshot.EmptySnapshot())
+	var cfgLoader *configload.PostgresLoader
+	if dsn := os.Getenv("DATABASE_URL"); dsn != "" {
+		cl, err := configload.NewPostgresLoader(context.Background(), dsn, logger)
+		if err != nil {
+			logger.Error("config loader init failed; serving EMPTY snapshot (all BLANK)", "err", err)
+		} else {
+			cfgLoader = cl
+			defer cl.Close()
+			if loaded, err := cl.Load(context.Background()); err != nil {
+				logger.Error("initial snapshot load failed; serving EMPTY until refresh", "err", err)
+			} else {
+				store.Replace(loaded)
+			}
+		}
+	} else {
+		logger.Warn("DATABASE_URL not set; serving EMPTY snapshot (every decision is BLANK). " +
+			"Set DATABASE_URL to load ad config from db/config.")
+	}
 
 	// ---------------------------------------------------------------------------
 	// Geo resolver (I2): MaxMind GeoLite2 in memory.
@@ -402,6 +429,7 @@ func main() {
 			WALSync:    envOr("TELEMETRY_WAL_SYNC", "") == "true",
 			QueueDepth: 8192,
 			Logger:     logger,
+			WireFormat: telemetry.ParseWireFormat(envOr("TELEMETRY_WIRE_FORMAT", "")),
 		})
 		if err != nil {
 			logger.Warn("telemetry: producer init failed; using StdoutSink", "err", err)
@@ -452,6 +480,14 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Start the periodic config refresher (no-op when DATABASE_URL is unset).
+	if cfgLoader != nil {
+		interval := snapshotRefreshInterval()
+		refresher := snapshot.NewRefresher(cfgLoader, store, interval)
+		go refresher.Start(ctx)
+		logger.Info("config snapshot refresher started", "interval", interval.String())
+	}
+
 	go func() {
 		logger.Info("decision service listening", "addr", addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -479,4 +515,19 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// snapshotRefreshInterval reads SNAPSHOT_REFRESH_INTERVAL (a Go duration like
+// "30s") and falls back to 30s on absence or parse error.
+func snapshotRefreshInterval() time.Duration {
+	const def = 30 * time.Second
+	v := os.Getenv("SNAPSHOT_REFRESH_INTERVAL")
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return def
+	}
+	return d
 }

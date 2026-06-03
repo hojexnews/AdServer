@@ -97,8 +97,8 @@ type noopSink struct{}
 
 func (noopSink) EmitImpression(_, _, _, _ string, _ commonv1.ServedTier, _, _ bool, _, _ string) {
 }
-func (noopSink) EmitClick(_, _, _, _, _, _, _ string)                {}
-func (noopSink) EmitConversion(_, _, _, _, _, _ string)              {}
+func (noopSink) EmitClick(_, _, _, _, _, _, _ string)   {}
+func (noopSink) EmitConversion(_, _, _, _, _, _ string) {}
 func (noopSink) EmitAdRequest(_, _, _ string, _ *commonv1.Geo, _, _, _ string, _ map[string]string, _ string) {
 }
 
@@ -327,8 +327,8 @@ func (h *collectorHandler) handleImpression(w http.ResponseWriter, r *http.Reque
 // transparentGIF is the minimal 1×1 transparent GIF pixel (43 bytes).
 var transparentGIF = []byte{
 	0x47, 0x49, 0x46, 0x38, 0x39, 0x61, // GIF89a
-	0x01, 0x00, 0x01, 0x00,             // 1×1
-	0x80, 0x00, 0x00,                    // global color table flag, etc.
+	0x01, 0x00, 0x01, 0x00, // 1×1
+	0x80, 0x00, 0x00, // global color table flag, etc.
 	0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, // color table: white, black
 	0x21, 0xF9, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, // graphic control
 	0x2C, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, // image descriptor
@@ -847,17 +847,17 @@ func (h *collectorHandler) resolveAndDiscardIP(r *http.Request) *commonv1.Geo {
 //
 // Security (security #8 — trusted proxies):
 //
-//   X-Forwarded-For is honoured ONLY when the request arrives through the
-//   configured number of trusted proxy hops (h.trustedDepth).
-//   The Cilium/ingress layer is the boundary of trust; IPs injected by the
-//   client in the XFF chain are ignored.
+//	X-Forwarded-For is honoured ONLY when the request arrives through the
+//	configured number of trusted proxy hops (h.trustedDepth).
+//	The Cilium/ingress layer is the boundary of trust; IPs injected by the
+//	client in the XFF chain are ignored.
 //
-//   With trustedDepth=1 (default): the ingress proxy appends one entry to XFF.
-//   The rightmost entry is the most-recently-added (by the trusted proxy) and
-//   is taken as the client IP.  The leftmost entry (claimed by the client) is
-//   NOT used when trustedDepth=1 and len(parts)>1.
+//	With trustedDepth=1 (default): the ingress proxy appends one entry to XFF.
+//	The rightmost entry is the most-recently-added (by the trusted proxy) and
+//	is taken as the client IP.  The leftmost entry (claimed by the client) is
+//	NOT used when trustedDepth=1 and len(parts)>1.
 //
-//   With trustedDepth=0: XFF is ignored entirely; RemoteAddr is used.
+//	With trustedDepth=0: XFF is ignored entirely; RemoteAddr is used.
 //
 // The returned string is transient: callers must NOT persist it.
 func (h *collectorHandler) extractClientIP(r *http.Request) string {
@@ -1009,6 +1009,7 @@ func main() {
 			WALSync:    envOr("TELEMETRY_WAL_SYNC", "") == "true",
 			QueueDepth: 8192,
 			Logger:     logger,
+			WireFormat: telemetry.ParseWireFormat(envOr("TELEMETRY_WIRE_FORMAT", "")),
 		})
 		if err != nil {
 			logger.Warn("telemetry: producer init failed; using no-op sink", "err", err)
