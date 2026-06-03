@@ -104,6 +104,128 @@ if "ROW POLICY" not in ddl_text.upper():
     fail = 1
 
 # ---------------------------------------------------------------------------
+# Verifica que row-policies NAO usam replaceAll() para extracao de tenant
+# (MEDIUM #5: replaceAll remove todas as ocorrencias, vulnerabilidade cross-tenant)
+# ---------------------------------------------------------------------------
+for line in ddl_text.splitlines():
+    stripped = line.strip()
+    if stripped.startswith("--"):
+        continue
+    # Detectar uso de replaceAll em contexto de row policy (USING clause)
+    if re.search(r"\breplaceAll\s*\(\s*currentUser\(\)", stripped, re.I):
+        print(
+            f"ERRO: row-policy usa replaceAll(currentUser(),...) — vulnerabilidade "
+            f"cross-tenant (MEDIUM #5). Usar substring()+match(UUID) com fail-closed. "
+            f"Linha: {stripped}",
+            file=sys.stderr
+        )
+        fail = 1
+
+# ---------------------------------------------------------------------------
+# Verifica que row-policies usam o padrao correto: substring + match UUID
+# (fail-closed: sufixo invalido retorna NULL, nao casa nenhuma linha)
+# ---------------------------------------------------------------------------
+has_substring_uuid = (
+    "startsWith(currentUser(), 'tenant_')" in ddl_text
+    and "match(" in ddl_text
+    and "[0-9a-f]{8}-[0-9a-f]{4}" in ddl_text
+    and "substring(currentUser()," in ddl_text
+)
+if "ROW POLICY" in ddl_text.upper() and not has_substring_uuid:
+    print(
+        "ERRO: row-policies existem mas nao usam o padrao fail-closed "
+        "(startsWith + match UUID + substring). Risco de extracao incorreta "
+        "de tenant_id em nomes de usuario nao-canonicos.",
+        file=sys.stderr
+    )
+    fail = 1
+
+# ---------------------------------------------------------------------------
+# Invariantes de UA: contrato produtor Go <-> ingestao ClickHouse (HIGH privacy, TX-5)
+#
+# Campo proto `user_agent` (no 5, wire-locked BACKWARD, TX-1) carrega a CLASSE coarse.
+# Regras:
+#   (A) 002_raw_tables.sql NAO pode ter coluna `user_agent` sem `_class`
+#       (garantia de que o UA bruto nunca persiste na raw).
+#   (B) 001_kafka_engines.sql DEVE ter coluna `user_agent` (sem `_class`)
+#       para casar o campo proto no mapeamento Protobuf->ClickHouse por nome.
+#   (C) 003_kafka_to_raw_mvs.sql DEVE projetar `user_agent AS user_agent_class`
+#       (a MV e o ponto de traducao nome-proto -> nome-semantico).
+# ---------------------------------------------------------------------------
+
+# (A) raw_tables (002): sem coluna `user_agent` crua
+raw_tables_ddl = ""
+raw_file = CH_DDL_DIR / "002_raw_tables.sql"
+if raw_file.exists():
+    raw_tables_ddl = raw_file.read_text()
+
+for line in raw_tables_ddl.splitlines():
+    stripped = line.strip()
+    if stripped.startswith("--"):
+        continue
+    # Definicao de coluna: "user_agent  String" ou "user_agent   LowCardinality"
+    # mas NAO "user_agent_class ..."
+    if re.match(r"user_agent\s+(String|LowCardinality)", stripped, re.I):
+        print(
+            f"ERRO (A) UA: coluna 'user_agent' (UA bruto) encontrada em 002_raw_tables.sql "
+            f"— a raw deve usar 'user_agent_class' (classe coarse, sem PII, TX-5). "
+            f"Linha: {stripped}",
+            file=sys.stderr
+        )
+        fail = 1
+
+# (B) kafka_engines (001): DEVE ter coluna `user_agent` (casa o campo proto no 5)
+kafka_engines_ddl = ""
+kafka_file = CH_DDL_DIR / "001_kafka_engines.sql"
+if kafka_file.exists():
+    kafka_engines_ddl = kafka_file.read_text()
+    # Procura linha de definicao de coluna `user_agent` (sem _class) na kafka_ad_request
+    found_proto_col = False
+    for line in kafka_engines_ddl.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("--"):
+            continue
+        if re.match(r"user_agent\s+(String|LowCardinality)", stripped, re.I):
+            found_proto_col = True
+            break
+    if not found_proto_col:
+        print(
+            "ERRO (B) UA: 001_kafka_engines.sql nao tem coluna 'user_agent' na kafka-engine. "
+            "O mapeamento Protobuf->ClickHouse por nome exige que a coluna de ingestao "
+            "se chame 'user_agent' (campo proto no 5, wire-locked, TX-1). "
+            "Sem essa coluna a ingestao Protobuf resulta em coluna VAZIA.",
+            file=sys.stderr
+        )
+        fail = 1
+else:
+    print("AVISO: 001_kafka_engines.sql nao encontrado em data/clickhouse/migrations/.")
+
+# (C) kafka_to_raw_mvs (003): DEVE projetar `user_agent AS user_agent_class`
+mvs_ddl = ""
+mvs_file = CH_DDL_DIR / "003_kafka_to_raw_mvs.sql"
+if mvs_file.exists():
+    mvs_ddl = mvs_file.read_text()
+    # Procura a projecao de traducao (ignora comentarios)
+    found_projection = False
+    for line in mvs_ddl.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("--"):
+            continue
+        if re.search(r"\buser_agent\s+AS\s+user_agent_class\b", stripped, re.I):
+            found_projection = True
+            break
+    if not found_projection:
+        print(
+            "ERRO (C) UA: 003_kafka_to_raw_mvs.sql nao projeta 'user_agent AS user_agent_class'. "
+            "A MV de ingestao deve traduzir o nome do campo proto para o nome semantico da raw. "
+            "Sem essa projecao, a coluna user_agent_class em raw_ad_request ficaria VAZIA.",
+            file=sys.stderr
+        )
+        fail = 1
+else:
+    print("AVISO: 003_kafka_to_raw_mvs.sql nao encontrado em data/clickhouse/migrations/.")
+
+# ---------------------------------------------------------------------------
 # Verifica que ReplacingMergeTree e usado para dedupe (TX-1)
 # ---------------------------------------------------------------------------
 if "ReplacingMergeTree" not in ddl_text:

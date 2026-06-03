@@ -13,17 +13,22 @@
 // for each scope is resolved at call time from the Banner first, then the
 // Campaign.
 //
-// # Privacy (TX-5)
+// # Privacy model (canonical — DA-6 / TX-5)
 //
-// Capping keys are NEVER plain user identifiers.  The key is:
+// The stable user identifier (cookie/session id) enters the server in the
+// DecideRequest.UserID field and is confined EXCLUSIVELY to this package.
+// The flow is:
 //
-//	SHA-256( stableID + ":" + salt ) — truncated to 32 hex chars.
+//  1. The raw id reaches Allowed() as the userID parameter.
+//  2. capKey() hashes it immediately: SHA-256(userID + ":" + salt)[:32 hex chars].
+//  3. The raw id is never stored in any struct field, log record, telemetry
+//     event, or forwarded to any other component.  It exists only on the
+//     stack of capKey() for the duration of the hash computation.
+//  4. The salt is a rotating secret (CAPPING_SALT from OpenBao).  The salt
+//     MUST be non-empty; New() returns an error on an empty salt (fail-closed).
 //
-// The salt is a rotating string that MUST be changed on a schedule (e.g.
-// daily) so that keys cannot be correlated across rotation boundaries.  The
-// salt is provided externally at construction time and updated via SetSalt.
-// Keys are ephemeral Redis strings with short TTLs — they never appear in
-// events or telemetry.
+// Capping keys are ephemeral Redis strings with short TTLs — they NEVER appear
+// in events, telemetry, decision logs, or any persistent store.
 //
 // # Fail-safe (DA-6)
 //
@@ -83,10 +88,19 @@ type Capper struct {
 }
 
 // New creates a Capper backed by the given RedisClient with the initial salt.
-// salt MUST be non-empty; rotate it on a schedule to prevent key correlation.
+//
+// salt MUST be non-empty — fail-closed: if empty, New panics to prevent the
+// service from silently using a predictable/empty salt that would allow
+// cross-user key correlation.  The caller (main) validates CAPPING_SALT from
+// the environment before constructing a Capper and exits the process if absent.
+//
+// Rotate the salt on a schedule (e.g. daily) to limit the correlation window.
+// Rotation is applied via SetSalt; old in-flight Redis keys expire naturally.
 func New(client RedisClient, salt string) *Capper {
 	if salt == "" {
-		salt = "default-salt-rotate-me"
+		// Fail-closed: an empty salt is a security defect.  The caller is
+		// expected to have validated CAPPING_SALT before calling New.
+		panic("capping.New: salt must not be empty (CAPPING_SALT missing — fail-closed)")
 	}
 	return &Capper{client: client, salt: salt}
 }

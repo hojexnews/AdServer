@@ -58,6 +58,26 @@ tables:
       Tabela de verdade de AdRequests (oportunidades de impressao). Fonte para
       calculo de fill rate e escassez de inventario. Sem PII (TX-5).
       Particionado por (tenant_id, year, month, day) para pruning eficiente.
+
+      PRIVACIDADE (HIGH — alinhado com produtor Go):
+        - user_agent_class: NAO persiste no Iceberg. A classe coarse
+          (ex. "mobile/chrome") e usada apenas para IVT no ClickHouse
+          (raw_ad_request) e descartada antes do sink para o lakehouse.
+          Nao e necessaria para billing, treino ou atribuicao.
+        - referer_url: NAO persiste no Iceberg. O referer sanitizado
+          (scheme+host+path, sem querystring) e relevante apenas para
+          sinais de contexto no ClickHouse. Excluido do lakehouse para
+          minimizacao de dados (TX-5).
+        - Nenhuma coluna de IP, fingerprint ou identificador de sessao.
+
+      Nome canônico do campo proto (wire-locked, no 5, TX-1): "user_agent".
+      O produtor classifica o UA bruto internamente e emite apenas a classe
+      coarse DENTRO do campo proto `user_agent`; o UA bruto NUNCA sai do
+      servidor nem aparece no topico Redpanda. A coluna de ingestao na
+      kafka-engine (001) se chama `user_agent` para casar o mapeamento
+      Protobuf->ClickHouse por nome; a MV (003) projeta para `user_agent_class`
+      na tabela raw (002). O Iceberg NAO persiste `user_agent` nem
+      `user_agent_class` — descartados antes do sink (ver abaixo).
     schema:
       fields:
         - name: event_id

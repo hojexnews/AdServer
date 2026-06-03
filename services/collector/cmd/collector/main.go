@@ -14,12 +14,20 @@
 // the IP is never stored, forwarded, logged, or emitted in any event.
 // See resolveAndDiscardIP() for the enforcement point.
 //
-// # Click safety (SSRF/open-redirect guard)
+// The raw User-Agent string is reduced to a coarse class (e.g. "chrome-desktop")
+// via useragent.Classify() before any event is emitted.  The raw UA NEVER
+// leaves this process in any event, log line, or forwarded field.
 //
-// The dest_url for click redirects is read exclusively from the signed
-// token in the query parameter (encoded at decision time from banner config).
-// Arbitrary URLs from client input are NEVER redirected without validation.
-// See validateClickToken() and the /ck handler.
+// # Click safety (SSRF/open-redirect guard — security #1)
+//
+// /ck does NOT accept a dest_url in clear-text query parameters.
+// The decision service embeds the dest_url inside an HMAC-SHA256-signed
+// token ("tok") at ad-serve time.  The collector validates the HMAC and
+// derives the redirect target from the signed payload.  Unsigned or expired
+// tokens are rejected with 400.
+//
+// Secret: CK_HMAC_SECRET environment variable (OpenBao in production).
+// Fail-closed: absent at boot → /ck returns 503 on every request.
 //
 // # Impression accounting (CA-6)
 //
@@ -31,24 +39,36 @@
 //
 // The /vast endpoint generates a minimal VAST 4.0 inline document for video
 // creatives.  VPAID is not supported (DA-5: no third-party JS in VAST).
+// The XML is built with encoding/xml marshalling — no Sprintf injection.
+//
+// # Trusted proxies (security #8)
+//
+// extractClientIP honours X-Forwarded-For only from the configured count
+// of trusted proxy hops (TRUSTED_PROXY_DEPTH env; default 1).  Headers from
+// untrusted positions in the XFF chain are ignored.
 package main
 
 import (
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	commonv1 "github.com/hojex/adserver/gen/go/adserver/common/v1"
+	"github.com/hojex/adserver/internal/clicktoken"
 	"github.com/hojex/adserver/internal/geo"
 	"github.com/hojex/adserver/internal/telemetry"
+	"github.com/hojex/adserver/internal/useragent"
 )
 
 // ---------------------------------------------------------------------------
@@ -66,8 +86,9 @@ type EventSink interface {
 		decisionID, modelVersion string)
 	EmitConversion(tenantID, campaignID, bannerID, attributionDecisionID,
 		decisionID, modelVersion string)
+	// uaClass is the coarse device/browser class — NOT the raw UA string.
 	EmitAdRequest(tenantID, zoneID, siteID string, geo *commonv1.Geo,
-		userAgent, refererURL, cachebuster string,
+		uaClass, refererURL, cachebuster string,
 		customVars map[string]string, decisionID string)
 }
 
@@ -97,8 +118,9 @@ func (a *producerAdapter) EmitClick(tenantID, campaignID, bannerID, zoneID, dest
 func (a *producerAdapter) EmitConversion(tenantID, campaignID, bannerID, attributionDecisionID, decisionID, modelVersion string) {
 	a.p.EmitConversion(tenantID, campaignID, bannerID, attributionDecisionID, decisionID, modelVersion)
 }
-func (a *producerAdapter) EmitAdRequest(tenantID, zoneID, siteID string, g *commonv1.Geo, userAgent, refererURL, cachebuster string, customVars map[string]string, decisionID string) {
-	a.p.EmitAdRequest(tenantID, zoneID, siteID, g, userAgent, refererURL, cachebuster, customVars, decisionID)
+func (a *producerAdapter) EmitAdRequest(tenantID, zoneID, siteID string, g *commonv1.Geo, uaClass, refererURL, cachebuster string, customVars map[string]string, decisionID string) {
+	// uaClass is already the coarse class — never the raw UA.
+	a.p.EmitAdRequest(tenantID, zoneID, siteID, g, uaClass, refererURL, cachebuster, customVars, decisionID)
 }
 
 // ---------------------------------------------------------------------------
@@ -106,10 +128,12 @@ func (a *producerAdapter) EmitAdRequest(tenantID, zoneID, siteID string, g *comm
 // ---------------------------------------------------------------------------
 
 type collectorHandler struct {
-	geoResolver geo.Resolver
-	sink        EventSink
-	decisionURL string // base URL of the decision service for asyncjs
-	logger      *slog.Logger
+	geoResolver  geo.Resolver
+	sink         EventSink
+	decisionURL  string // base URL of the decision service for asyncjs
+	logger       *slog.Logger
+	clickSigner  *clicktoken.Signer // nil → /ck disabled (fail-closed)
+	trustedDepth int                // number of trusted XFF proxy hops
 }
 
 // ---------------------------------------------------------------------------
@@ -155,13 +179,22 @@ func (h *collectorHandler) handleAsyncJS(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
+	// PRIVACY (TX-5/DA-11): reduce raw UA to coarse class HERE.
+	// The raw UA string is consumed and never forwarded.
+	uaClass := useragent.Classify(r.Header.Get("User-Agent"))
+
+	// PRIVACY: sanitize referer — strip query string and fragment to avoid
+	// leaking session tokens or identifiers embedded in URLs.
+	refererURL := sanitizeReferer(r.Referer())
+
 	// Record the ad-request event (top-of-funnel).
 	// IP is already discarded above; derivedGeo carries only country+city.
+	// uaClass is the coarse class, not the raw UA.
 	h.sink.EmitAdRequest(
 		tenantID, zoneID, "", // siteID resolved server-side from zone config
 		derivedGeo,
-		r.Header.Get("User-Agent"),
-		r.Referer(),
+		uaClass,
+		refererURL,
 		cachebuster,
 		customVars,
 		decisionID,
@@ -188,6 +221,7 @@ func (h *collectorHandler) handleAsyncJS(w http.ResponseWriter, r *http.Request)
 // The snippet is injected by publishers via a <script async> tag.
 //
 // Design: async/await, no blocking, impressions counted only via lg pixel.
+// The click link uses the signed "tok" parameter — no plain dest_url in query.
 func buildAdTagJS(decisionBase, lgBase, zoneID, tenantID, cachebuster, decisionID string) string {
 	return fmt.Sprintf(`(async function(){
   "use strict";
@@ -196,7 +230,6 @@ func buildAdTagJS(decisionBase, lgBase, zoneID, tenantID, cachebuster, decisionI
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({
-        tenant_id: %q,
         zone_id:   %q,
         user_agent: navigator.userAgent,
         site_url:   location.href
@@ -210,7 +243,9 @@ func buildAdTagJS(decisionBase, lgBase, zoneID, tenantID, cachebuster, decisionI
     // Render creative.
     if (d.image_url) {
       const a = document.createElement("a");
-      a.href = %q + "/ck?did=" + encodeURIComponent(d.decision_id) +
+      // Use the signed click token from the decision response (no plain dest_url).
+      a.href = %q + "/ck?tok=" + encodeURIComponent(d.click_tok || "") +
+               "&did=" + encodeURIComponent(d.decision_id) +
                "&bid=" + encodeURIComponent(d.banner_id) +
                "&cid=" + encodeURIComponent(d.campaign_id) +
                "&zid=" + encodeURIComponent(d.zone_id) +
@@ -245,7 +280,6 @@ func buildAdTagJS(decisionBase, lgBase, zoneID, tenantID, cachebuster, decisionI
 })();
 `,
 		decisionBase+"/v1/decide",
-		tenantID,
 		zoneID,
 		lgBase,
 		lgBase,
@@ -303,51 +337,92 @@ var transparentGIF = []byte{
 }
 
 // ---------------------------------------------------------------------------
-// /ck — Click redirect (CA-6: server-side 302; SSRF guard)
+// /ck — Click redirect (CA-6: server-side 302; HMAC-validated token)
 //
-// Security:
-//   dest_url is read from the signed token parameter "tok" which was
-//   embedded by the decision service at ad-serve time.  The raw dest_url is
-//   from the banner config (server-side), never from arbitrary user input.
-//   We validate that the resolved URL has an allowed scheme (https/http) and
-//   that it does not point to a private/localhost address.
+// Security (security #1 — open-redirect fix):
+//
+//   The dest_url is NEVER read from a plain query parameter.
+//   The "tok" parameter carries an HMAC-SHA256-signed payload produced by the
+//   decision service at ad-serve time.  The payload encodes decision_id,
+//   banner_id, dest_url (from banner config), and an expiry timestamp.
+//
+//   Validation: HMAC checked → expiry checked → validateDestURL (defence-in-depth).
+//   Any failure → 400 Bad Request (no redirect).
+//
+//   Fail-closed: if CK_HMAC_SECRET was absent at boot, clickSigner is nil
+//   and every /ck request returns 503 Service Unavailable.
 // ---------------------------------------------------------------------------
 
 func (h *collectorHandler) handleClick(w http.ResponseWriter, r *http.Request) {
+	// Fail-closed: if the HMAC secret was absent at boot, refuse all clicks.
+	if h.clickSigner == nil {
+		if h.logger != nil {
+			h.logger.Error("click: CK_HMAC_SECRET not configured — refusing click (fail-closed)")
+		}
+		http.Error(w, "click service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
 	q := r.URL.Query()
+	tok := q.Get("tok")
 	decisionID := q.Get("did")
 	bannerID := q.Get("bid")
 	campaignID := q.Get("cid")
 	zoneID := q.Get("zid")
 	tenantID := q.Get("tid")
 
-	// dest_url comes from the signed click token embedded by the decision
-	// service — NOT from an arbitrary user-supplied query parameter.
-	// In I2 we use the "tok" parameter which carries a signed URL.
-	// For the MVP, the click URL is read from "dest" which must be validated.
-	// SECURITY: never redirect to a URL provided directly and unsanitised.
-	destURL := q.Get("dest")
-	if destURL == "" {
-		http.Error(w, "missing dest", http.StatusBadRequest)
+	if tok == "" {
+		http.Error(w, "missing click token", http.StatusBadRequest)
 		return
 	}
 
-	// SSRF/open-redirect guard: validate the destination URL.
-	// It must be https (or http for legacy), must not be a private address,
-	// and must have come from a server-side lookup (not raw user input).
-	// → full implementation will use HMAC-signed tokens; for MVP we validate
-	// scheme and host.
+	// Validate the HMAC token and extract the signed dest_url.
+	signedDecisionID, signedBannerID, destURL, err := h.clickSigner.Validate(tok, time.Now())
+	if err != nil {
+		if h.logger != nil {
+			h.logger.Warn("click: invalid or expired token rejected",
+				"reason", err,
+				"decision_id", decisionID)
+		}
+		http.Error(w, "invalid or expired click token", http.StatusBadRequest)
+		return
+	}
+
+	// Consistency check: token fields must match the query params supplied
+	// by the JS tag (defence-in-depth against token reuse across banners).
+	if decisionID != "" && signedDecisionID != decisionID {
+		if h.logger != nil {
+			h.logger.Warn("click: token decision_id mismatch",
+				"token_did", signedDecisionID, "query_did", decisionID)
+		}
+		http.Error(w, "click token mismatch", http.StatusBadRequest)
+		return
+	}
+	if bannerID != "" && signedBannerID != bannerID {
+		if h.logger != nil {
+			h.logger.Warn("click: token banner_id mismatch",
+				"token_bid", signedBannerID, "query_bid", bannerID)
+		}
+		http.Error(w, "click token mismatch", http.StatusBadRequest)
+		return
+	}
+
+	// Defence-in-depth: validate the URL extracted from the signed payload.
+	// This guards against misconfigured banners in the config store.
 	if err := validateDestURL(destURL); err != nil {
 		if h.logger != nil {
-			h.logger.Warn("click: invalid dest_url rejected",
-				"reason", err, "decision_id", decisionID)
+			h.logger.Warn("click: signed dest_url failed validation (misconfigured banner)",
+				"reason", err, "decision_id", signedDecisionID)
 		}
 		http.Error(w, "invalid destination", http.StatusBadRequest)
 		return
 	}
 
+	// Use the validated decision_id from the token as the authoritative one.
+	effectiveDecisionID := signedDecisionID
+
 	// Record the click event (fire-and-forget).
-	h.sink.EmitClick(tenantID, campaignID, bannerID, zoneID, destURL, decisionID, "")
+	h.sink.EmitClick(tenantID, campaignID, bannerID, zoneID, destURL, effectiveDecisionID, "")
 
 	// Server-side 302 redirect to the advertiser landing page (CA-6).
 	http.Redirect(w, r, destURL, http.StatusFound)
@@ -355,15 +430,13 @@ func (h *collectorHandler) handleClick(w http.ResponseWriter, r *http.Request) {
 
 // validateDestURL ensures the destination URL is safe to redirect to.
 //
-// Security invariants (SSRF/open-redirect guard):
+// Security invariants (SSRF/open-redirect guard — defence-in-depth):
 //  1. Scheme must be "https" or "http" — no file://, ftp://, etc.
 //  2. Host must not be a private IP range or loopback.
 //  3. Host must not be empty.
 //
-// NOTE: The production implementation uses HMAC-signed tokens; the URL in the
-// "dest" parameter is pre-signed by the decision service from the banner's
-// ClickURL field (server-side config — never from user input).
-// The validation below is a defence-in-depth guard against misconfigured banners.
+// This is a defence-in-depth check against misconfigured banners.
+// The primary open-redirect protection is the HMAC-signed click token.
 func validateDestURL(raw string) error {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -442,6 +515,12 @@ func (h *collectorHandler) handleConversion(w http.ResponseWriter, r *http.Reque
 
 // ---------------------------------------------------------------------------
 // /vast — VAST 4.x XML for video creatives (no VPAID)
+//
+// Security (security #3 — CDATA/XML injection fix):
+//
+//   The VAST document is generated using encoding/xml struct marshalling.
+//   No Sprintf with user-controlled values is used in the XML body.
+//   All string values are XML-escaped by the marshaller.
 // ---------------------------------------------------------------------------
 
 func (h *collectorHandler) handleVAST(w http.ResponseWriter, r *http.Request) {
@@ -453,8 +532,8 @@ func (h *collectorHandler) handleVAST(w http.ResponseWriter, r *http.Request) {
 	tenantID := q.Get("tid")
 	zoneID := q.Get("zid")
 	clickURL := q.Get("dest")
-	width := q.Get("w")
-	height := q.Get("h")
+	widthStr := q.Get("w")
+	heightStr := q.Get("h")
 
 	if videoURL == "" {
 		http.Error(w, "missing src", http.StatusBadRequest)
@@ -471,62 +550,198 @@ func (h *collectorHandler) handleVAST(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// clickURL in VAST is also validated (may be empty for non-clickable video).
+	if clickURL != "" {
+		if err := validateDestURL(clickURL); err != nil {
+			if h.logger != nil {
+				h.logger.Warn("vast: invalid click dest rejected", "err", err)
+			}
+			http.Error(w, "invalid dest", http.StatusBadRequest)
+			return
+		}
+	}
+
 	lgBase := envOr("COLLECTOR_BASE_URL", "http://localhost:8081")
 	impressionURL := fmt.Sprintf(
 		"%s/lg?did=%s&bid=%s&cid=%s&zid=%s&tid=%s&tier=SERVED_TIER_UNSPECIFIED",
-		lgBase, decisionID, bannerID, campaignID, zoneID, tenantID,
+		lgBase,
+		url.QueryEscape(decisionID),
+		url.QueryEscape(bannerID),
+		url.QueryEscape(campaignID),
+		url.QueryEscape(zoneID),
+		url.QueryEscape(tenantID),
 	)
 
-	xml := buildVAST4(videoURL, clickURL, impressionURL, decisionID, width, height)
+	var width, height int
+	if widthStr != "" {
+		width, _ = strconv.Atoi(widthStr)
+	}
+	if heightStr != "" {
+		height, _ = strconv.Atoi(heightStr)
+	}
+
+	xmlBytes, err := buildVAST4(videoURL, clickURL, impressionURL, decisionID, width, height)
+	if err != nil {
+		if h.logger != nil {
+			h.logger.Error("vast: failed to marshal VAST XML", "err", err)
+		}
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	fmt.Fprint(w, xml)
+	_, _ = w.Write([]byte(xml.Header))
+	_, _ = w.Write(xmlBytes)
 }
 
-// buildVAST4 generates a minimal VAST 4.0 Inline document.
+// ---------------------------------------------------------------------------
+// VAST 4.x XML structs — generated via encoding/xml (security #3 fix)
 //
-// No VPAID: only <MediaFile> (mp4) and tracking events are included.
-// The <Impression> pixel is the /lg endpoint so impressions are counted at
-// player load (CA-6), not at ad-request time.
-func buildVAST4(videoURL, clickURL, impressionURL, decisionID, w, h string) string {
-	mediaAttrs := ""
-	if w != "" && h != "" {
-		mediaAttrs = fmt.Sprintf(` width="%s" height="%s"`, w, h)
+// All string values are XML-escaped by the marshaller.
+// No Sprintf/string-concat is used for XML content.
+// CDATA sections use the xmlCDATA type which escapes ]]> correctly.
+// ---------------------------------------------------------------------------
+
+// xmlCDATA wraps a string so that encoding/xml emits it as <![CDATA[...]]>.
+// The standard library does not have a built-in CDATA type, so we implement
+// MarshalXML to emit the CDATA wrapper with proper escaping of "]]>".
+type xmlCDATA struct {
+	Value string
+}
+
+func (c xmlCDATA) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
+	// Escape the ]]> sequence within CDATA by splitting the section.
+	// "]]>" → "]]]]><![CDATA[>" is the standard CDATA escape.
+	escaped := strings.ReplaceAll(c.Value, "]]>", "]]]]><![CDATA[>")
+	type cdataInner struct {
+		Inner string `xml:",innerxml"`
 	}
-	clickThrough := ""
-	if clickURL != "" {
-		clickThrough = fmt.Sprintf(`
-        <VideoClicks>
-          <ClickThrough id="ck-%s"><![CDATA[%s]]></ClickThrough>
-        </VideoClicks>`, decisionID, clickURL)
+	return e.EncodeElement(cdataInner{Inner: "<![CDATA[" + escaped + "]]>"}, start)
+}
+
+// vastRoot is the <VAST> document root.
+type vastRoot struct {
+	XMLName   xml.Name `xml:"VAST"`
+	Version   string   `xml:"version,attr"`
+	Namespace string   `xml:"xmlns:xs,attr"`
+	Ad        vastAd   `xml:"Ad"`
+}
+
+type vastAd struct {
+	ID     string     `xml:"id,attr"`
+	Inline vastInline `xml:"InLine"`
+}
+
+type vastInline struct {
+	AdSystem   vastAdSystem   `xml:"AdSystem"`
+	AdTitle    string         `xml:"AdTitle"`
+	Impression vastImpression `xml:"Impression"`
+	Creatives  vastCreatives  `xml:"Creatives"`
+}
+
+type vastAdSystem struct {
+	Version string `xml:"version,attr"`
+	Name    string `xml:",chardata"`
+}
+
+type vastImpression struct {
+	ID  string   `xml:"id,attr"`
+	URL xmlCDATA `xml:",any"`
+}
+
+type vastCreatives struct {
+	Creative vastCreative `xml:"Creative"`
+}
+
+type vastCreative struct {
+	ID     string     `xml:"id,attr"`
+	Linear vastLinear `xml:"Linear"`
+}
+
+type vastLinear struct {
+	MediaFiles  vastMediaFiles   `xml:"MediaFiles"`
+	VideoClicks *vastVideoClicks `xml:"VideoClicks,omitempty"`
+}
+
+type vastMediaFiles struct {
+	MediaFile vastMediaFile `xml:"MediaFile"`
+}
+
+type vastMediaFile struct {
+	Type     string   `xml:"type,attr"`
+	Delivery string   `xml:"delivery,attr"`
+	Width    string   `xml:"width,attr,omitempty"`
+	Height   string   `xml:"height,attr,omitempty"`
+	URL      xmlCDATA `xml:",any"`
+}
+
+type vastVideoClicks struct {
+	ClickThrough vastClickThrough `xml:"ClickThrough"`
+}
+
+type vastClickThrough struct {
+	ID  string   `xml:"id,attr"`
+	URL xmlCDATA `xml:",any"`
+}
+
+// buildVAST4 generates a minimal VAST 4.0 Inline document using encoding/xml.
+// All values are XML-escaped by the marshaller; no string injection is possible.
+// Returns the marshalled XML bytes (without the <?xml?> header — caller adds it).
+func buildVAST4(videoURL, clickURL, impressionURL, decisionID string, width, height int) ([]byte, error) {
+	widthStr := ""
+	heightStr := ""
+	if width > 0 {
+		widthStr = strconv.Itoa(width)
+	}
+	if height > 0 {
+		heightStr = strconv.Itoa(height)
 	}
 
-	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<VAST version="4.0" xmlns:xs="http://www.w3.org/2001/XMLSchema">
-  <Ad id="%s">
-    <InLine>
-      <AdSystem version="1.0">HojexAdServer</AdSystem>
-      <AdTitle>Ad</AdTitle>
-      <Impression id="imp-%s"><![CDATA[%s]]></Impression>
-      <Creatives>
-        <Creative id="cr-%s">
-          <Linear>
-            <MediaFiles>
-              <MediaFile type="video/mp4" delivery="progressive"%s>
-                <![CDATA[%s]]>
-              </MediaFile>
-            </MediaFiles>%s
-          </Linear>
-        </Creative>
-      </Creatives>
-    </InLine>
-  </Ad>
-</VAST>
-`,
-		decisionID, decisionID, impressionURL,
-		decisionID, mediaAttrs, videoURL, clickThrough,
-	)
+	var videoClicks *vastVideoClicks
+	if clickURL != "" {
+		videoClicks = &vastVideoClicks{
+			ClickThrough: vastClickThrough{
+				ID:  "ck-" + decisionID,
+				URL: xmlCDATA{Value: clickURL},
+			},
+		}
+	}
+
+	doc := vastRoot{
+		Version:   "4.0",
+		Namespace: "http://www.w3.org/2001/XMLSchema",
+		Ad: vastAd{
+			ID: decisionID,
+			Inline: vastInline{
+				AdSystem: vastAdSystem{Version: "1.0", Name: "HojexAdServer"},
+				AdTitle:  "Ad",
+				Impression: vastImpression{
+					ID:  "imp-" + decisionID,
+					URL: xmlCDATA{Value: impressionURL},
+				},
+				Creatives: vastCreatives{
+					Creative: vastCreative{
+						ID: "cr-" + decisionID,
+						Linear: vastLinear{
+							MediaFiles: vastMediaFiles{
+								MediaFile: vastMediaFile{
+									Type:     "video/mp4",
+									Delivery: "progressive",
+									Width:    widthStr,
+									Height:   heightStr,
+									URL:      xmlCDATA{Value: videoURL},
+								},
+							},
+							VideoClicks: videoClicks,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	return xml.MarshalIndent(doc, "", "  ")
 }
 
 // ---------------------------------------------------------------------------
@@ -550,7 +765,7 @@ func buildVAST4(videoURL, clickURL, impressionURL, decisionID, w, h string) stri
 func (h *collectorHandler) resolveAndDiscardIP(r *http.Request) *commonv1.Geo {
 	// Step 1: extract the real client IP (X-Forwarded-For or RemoteAddr).
 	// The IP is stored in a local variable with scope limited to this function.
-	clientIP := extractClientIP(r) // IP consumed here, not propagated further
+	clientIP := h.extractClientIP(r) // IP consumed here, not propagated further
 
 	// Step 2: derive Geo.  The resolver reads the IP and returns only country+city.
 	derivedGeo := h.geoResolver.Resolve(clientIP) // IP is the input, Geo is the output
@@ -562,22 +777,86 @@ func (h *collectorHandler) resolveAndDiscardIP(r *http.Request) *commonv1.Geo {
 }
 
 // extractClientIP extracts the real client IP from the request.
-// It honours X-Forwarded-For (first entry) when present.
+//
+// Security (security #8 — trusted proxies):
+//
+//   X-Forwarded-For is honoured ONLY when the request arrives through the
+//   configured number of trusted proxy hops (h.trustedDepth).
+//   The Cilium/ingress layer is the boundary of trust; IPs injected by the
+//   client in the XFF chain are ignored.
+//
+//   With trustedDepth=1 (default): the ingress proxy appends one entry to XFF.
+//   The rightmost entry is the most-recently-added (by the trusted proxy) and
+//   is taken as the client IP.  The leftmost entry (claimed by the client) is
+//   NOT used when trustedDepth=1 and len(parts)>1.
+//
+//   With trustedDepth=0: XFF is ignored entirely; RemoteAddr is used.
+//
 // The returned string is transient: callers must NOT persist it.
-func extractClientIP(r *http.Request) string {
-	// X-Forwarded-For: client, proxy1, proxy2 — use leftmost (client).
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.SplitN(xff, ",", 2)
-		if ip := strings.TrimSpace(parts[0]); ip != "" {
-			return ip
+func (h *collectorHandler) extractClientIP(r *http.Request) string {
+	depth := h.trustedDepth
+	if depth < 0 {
+		depth = 0
+	}
+
+	if depth > 0 {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			parts := strings.Split(xff, ",")
+			// The trusted proxy appends to the right.  With depth=N, we trust
+			// the Nth-from-right entry (index len-N) as the true client IP.
+			// With depth=1 and a single proxy, that is parts[len-1] (rightmost).
+			// With a direct connection through one proxy, parts[0] is the client.
+			// For depth=1 we take the entry just before the trusted proxy's own
+			// addition, i.e. index max(0, len(parts)-depth).
+			idx := len(parts) - depth
+			if idx < 0 {
+				idx = 0
+			}
+			if ip := strings.TrimSpace(parts[idx]); ip != "" {
+				return ip
+			}
 		}
 	}
+
 	// Fall back to RemoteAddr (strip port).
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
 	}
 	return host
+}
+
+// sanitizeReferer strips the query string and fragment from a referer URL,
+// retaining only scheme + host + path.
+//
+// PRIVACY: query strings and fragments frequently carry session tokens,
+// user identifiers, UTM parameters, and other identifying information.
+// We retain only the structural page location (scheme + host + path).
+//
+// If the URL cannot be parsed, does not have an absolute scheme (http/https),
+// or has no host, the empty string is returned — emit nothing rather than
+// risk leaking a token buried in a malformed value.
+func sanitizeReferer(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	// Require an absolute URL with a recognised scheme and a non-empty host.
+	// Relative URLs, opaque URIs, and anything without http/https are discarded.
+	scheme := strings.ToLower(u.Scheme)
+	if (scheme != "http" && scheme != "https") || u.Host == "" {
+		return ""
+	}
+	// Reconstruct with only scheme + host + path (no query, no fragment).
+	clean := &url.URL{
+		Scheme: u.Scheme,
+		Host:   u.Host,
+		Path:   u.Path,
+	}
+	return clean.String()
 }
 
 // ---------------------------------------------------------------------------
@@ -593,7 +872,7 @@ type decisionResponse struct {
 	ServedTier   string `json:"served_tier"`
 	CampaignID   string `json:"campaign_id,omitempty"`
 	BannerID     string `json:"banner_id,omitempty"`
-	ClickURL     string `json:"click_url,omitempty"`
+	ClickTok     string `json:"click_tok,omitempty"` // signed HMAC token; no plain dest_url
 	ImageURL     string `json:"image_url,omitempty"`
 	HTML         string `json:"html,omitempty"`
 	VideoURL     string `json:"video_url,omitempty"`
@@ -618,6 +897,34 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
+
+	// ---------------------------------------------------------------------------
+	// Click HMAC signer — fail-closed: absent secret → /ck disabled.
+	// Secret: CK_HMAC_SECRET from env/OpenBao (never hardcoded).
+	// ---------------------------------------------------------------------------
+	ckSecret := os.Getenv("CK_HMAC_SECRET")
+	var signer *clicktoken.Signer
+	if ckSecret == "" {
+		// Fail-closed: log a loud error but continue serving other endpoints.
+		// /ck handler checks for nil signer and returns 503.
+		logger.Error("CRITICAL: CK_HMAC_SECRET is not set — /ck endpoint is DISABLED (fail-closed). Set CK_HMAC_SECRET to enable click tracking.")
+	} else {
+		var err error
+		signer, err = clicktoken.New(ckSecret, clicktoken.DefaultTTL)
+		if err != nil {
+			logger.Error("CRITICAL: failed to initialise click signer — /ck disabled", "err", err)
+		} else {
+			logger.Info("click signer: HMAC-SHA256 token validation active")
+		}
+	}
+
+	// Trusted proxy depth for X-Forwarded-For (security #8).
+	trustedDepth := 1 // default: one trusted proxy (ingress/Cilium)
+	if v := os.Getenv("TRUSTED_PROXY_DEPTH"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			trustedDepth = n
+		}
+	}
 
 	// Geo resolver: MaxMind if configured, stub otherwise.
 	geoDBPath := envOr("GEOIP_DB_PATH", "")
@@ -645,10 +952,12 @@ func main() {
 	}
 
 	h := &collectorHandler{
-		geoResolver: geoResolver,
-		sink:        sink,
-		decisionURL: envOr("DECISION_BASE_URL", "http://localhost:8080"),
-		logger:      logger,
+		geoResolver:  geoResolver,
+		sink:         sink,
+		decisionURL:  envOr("DECISION_BASE_URL", "http://localhost:8080"),
+		logger:       logger,
+		clickSigner:  signer, // nil → fail-closed in handleClick
+		trustedDepth: trustedDepth,
 	}
 
 	mux := http.NewServeMux()

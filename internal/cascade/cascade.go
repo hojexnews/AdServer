@@ -190,7 +190,27 @@ type Request struct {
 
 // Decide runs the cascade for a single zone request and returns a Result.
 // It never panics; on any internal error the cascade degrades to BLANK.
+//
+// Security (CA-1): the effective tenant_id is derived from the zone's TenantID
+// in the snapshot.  req.TenantID MUST already be the server-derived value
+// (set by the decision handler from snap.Zones[zoneID].TenantID).  The cascade
+// enforces this by cross-checking: if the zone does not exist in the snapshot
+// or its TenantID does not match req.TenantID, the request is fail-closed to
+// BLANK.  This prevents tenant isolation violations even if req.TenantID is
+// somehow misset by the caller.
 func (e *Engine) Decide(req Request, snap *snapshot.Snapshot) Result {
+	// Fail-closed: the zone MUST exist in the snapshot and its TenantID
+	// must match req.TenantID (which was derived server-side by the handler).
+	zone, zoneOK := snap.Zones[req.ZoneID]
+	if !zoneOK || zone == nil {
+		return Blank() // zone not in snapshot — safe default
+	}
+	if zone.TenantID != req.TenantID {
+		// TenantID mismatch — should never happen if handler is correct,
+		// but we enforce it here as defence-in-depth (CA-1 fail-closed).
+		return Blank()
+	}
+
 	campaignIDs := snap.ZoneCampaigns[req.ZoneID]
 	if len(campaignIDs) == 0 {
 		return Blank()

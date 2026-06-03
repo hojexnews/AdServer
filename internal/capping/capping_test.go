@@ -259,3 +259,16 @@ func TestCapper_SaltRotation(t *testing.T) {
 		t.Fatal("post-rotation: expected allowed (new key window)")
 	}
 }
+
+// Security #4 / privacy: empty salt panics at construction (fail-closed).
+// New() must never silently accept an empty salt.
+func TestNew_EmptySalt_Panics(t *testing.T) {
+	r := newFakeRedis()
+	defer func() {
+		if rec := recover(); rec == nil {
+			t.Error("expected panic for empty salt (fail-closed), got none")
+		}
+	}()
+	// This must panic — not silently use a default salt.
+	_ = capping.New(r, "")
+}

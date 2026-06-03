@@ -7,8 +7,8 @@
 #   - DATABASE_URL exportado: postgres://user:pass@host:5432/adserver?sslmode=require
 #   - scripts/ci/no-float-sql.sh presente (guard TX-2)
 #
-# Não há Postgres rodando em CI durante Fase 1. Os alvos db-migrate-* exigem
-# instância Postgres 16 local com DATABASE_URL configurado.
+# Não há Postgres rodando em CI durante Fase 1. Os alvos db-migrate-* e db-test
+# exigem instância Postgres 16 local com DATABASE_URL configurado.
 
 MIGRATE := $(shell command -v migrate 2>/dev/null || echo migrate)
 
@@ -44,6 +44,23 @@ db-migrate-status: _db-check-url
 	  $(MIGRATE) -database "$(DATABASE_URL)" -path "db/$$schema/migrations" version; \
 	done
 
+## db-test: executa o teste de isolamento RLS (TX-3) contra instância Postgres local.
+##   Requer DATABASE_URL e que as migrations 0001/0002/0003 do schema config
+##   já tenham sido aplicadas (make db-migrate-up).
+##   O role adserver_app deve existir com GRANT SELECT/INSERT/UPDATE/DELETE
+##   em todas as tabelas do schema config (ver db/config/tests/rls_isolation_test.sql).
+##   O teste roda dentro de ROLLBACK — não persiste dados.
+##
+##   Uso:
+##     export DATABASE_URL="postgres://adserver_admin:pass@localhost:5432/adserver?sslmode=disable"
+##     make db-test
+db-test: _db-check-url
+	@echo "== db-test: isolamento RLS por tenant (TX-3) =="
+	@psql "$(DATABASE_URL)" \
+	      -v ON_ERROR_STOP=1 \
+	      -f db/config/tests/rls_isolation_test.sql
+	@echo "== db-test: concluído =="
+
 # Alvo interno: verifica se DATABASE_URL está definido
 _db-check-url:
 	@if [ -z "$(DATABASE_URL)" ]; then \
@@ -52,4 +69,4 @@ _db-check-url:
 	  exit 1; \
 	fi
 
-.PHONY: db-lint db-migrate-up db-migrate-down db-migrate-status _db-check-url
+.PHONY: db-lint db-migrate-up db-migrate-down db-migrate-status db-test _db-check-url

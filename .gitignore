@@ -12,3 +12,7 @@ proto/gen/
 # Segredos
 *.env
 .env
+
+# Python bytecode
+__pycache__/
+*.pyc

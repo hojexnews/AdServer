@@ -47,8 +47,13 @@ SELECT
     site_id,
     geo_country,
     geo_city,
-    user_agent,
-    referer_url,
+    -- Campo proto `user_agent` (no 5, wire-locked) carrega a classe coarse.
+    -- A kafka-engine (001) expoe a coluna como `user_agent` para casar o nome do campo
+    -- proto no mapeamento Protobuf->ClickHouse. Aqui projetamos para `user_agent_class`
+    -- conforme o nome semantico da tabela raw (002). Os dois nomes NUNCA se somam nem
+    -- se confundem: `user_agent` existe so na kafka-engine (ponte transiente, sem storage).
+    user_agent AS user_agent_class,
+    referer_url,       -- sanitizado: scheme+host+path sem querystring
     cachebuster
 FROM adserver.kafka_ad_request;
 

@@ -48,6 +48,10 @@ db/
       0001_config_schema_down.sql
       0002_config_rls_up.sql        — Row-Level Security por tenant_id
       0002_config_rls_down.sql
+      0003_campaign_zones_rls_up.sql  — Defesa-em-profundidade: RLS para campaign_zones
+      0003_campaign_zones_rls_down.sql
+    tests/
+      rls_isolation_test.sql          — Teste de isolamento cross-tenant (TX-3)
   ledger/
     migrations/
       0001_ledger_schema_up.sql     — accounts, journal_entries, postings (particionado),
@@ -79,6 +83,7 @@ Ou use os alvos Make:
 make db-migrate-up    # aplica todos os schemas na ordem acima
 make db-migrate-down  # reverte um passo por schema (use com cuidado)
 make db-lint          # roda scripts/ci/no-float-sql.sh sobre db/
+make db-test          # executa db/config/tests/rls_isolation_test.sql (exige Postgres 16 local)
 ```
 
 ---
@@ -119,19 +124,67 @@ GRANT USAGE ON ALL SEQUENCES IN SCHEMA config TO adserver_app;
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA ledger TO adserver_app;
 ```
 
-### `campaign_zones` — sem policy direta
+### `campaign_zones` — defesa-em-profundidade (migration 0003)
 
-A tabela `config.campaign_zones` não tem `tenant_id` próprio. O isolamento ocorre
-via JOIN obrigatório com `config.campaigns` e `config.zones`, que já têm RLS ativo.
-Qualquer query que leia `campaign_zones` sem filtrar via `campaigns`/`zones` (que têm RLS)
-enxergará linhas de todos os tenants — portanto queries de `campaign_zones` DEVEM passar
-pelo JOIN. O motor Go snapshot inclui sempre o JOIN ao carregar o estado de config.
+A tabela `config.campaign_zones` é uma tabela de junção N:N (`campaign_id`, `zone_id`)
+sem `tenant_id` próprio. O isolamento poderia ser feito apenas por JOIN obrigatório
+com `config.campaigns`/`config.zones` (que têm `FORCE RLS`), mas essa estratégia depende
+de uma invariante de aplicação — não do banco.
+
+**Decisão (TX-3 / §2.6):** adicionar RLS via subquery EXISTS em `campaigns`, sem
+desnormalizar `tenant_id` em `campaign_zones`.
+
+```sql
+CREATE POLICY campaign_zones_tenant_isolation ON config.campaign_zones
+    USING (
+        EXISTS (
+            SELECT 1 FROM config.campaigns c
+            WHERE  c.id = campaign_zones.campaign_id
+        )
+    );
+```
+
+Como `campaigns` tem `FORCE ROW LEVEL SECURITY`, a subquery herda automaticamente a
+filtragem por `config.current_tenant_id()`. Qualquer acesso direto à tabela (DBA,
+ferramenta ad-hoc, query sem JOIN) fica protegido em nível de banco.
+
+Custo: nested lookup por row avaliada pela policy (amortizado pelo índice `campaigns_pk`,
+O(log N)); aceitável para tabela de configuração lida em snapshot batch.
 
 ### Ledger — RLS pendente (I2)
 
 O schema `ledger` não tem RLS nesta migration (I1). O ledger é acessado apenas por jobs
 batch internos (não pelo anunciante diretamente). RLS no ledger será adicionado em I2 quando
 o BFF de relatórios financeiros for definido.
+
+### Teste de isolamento RLS (TX-3)
+
+O arquivo `db/config/tests/rls_isolation_test.sql` prova o isolamento cross-tenant.
+
+**Casos cobertos:**
+
+| Bloco | Caso | Resultado esperado |
+|-------|------|--------------------|
+| 1     | Tenant A lê todas as tabelas com RLS | Vê exatamente 1 linha por tabela (somente as suas) |
+| 1i    | Tenant A lê `campaign_zones` via JOIN | 1 vínculo (camp_a ↔ zone_a), 0 de B |
+| 1j    | Tenant A lê `campaign_zones` direto (sem JOIN) | 1 linha (RLS 0003 via EXISTS filtra) |
+| 2     | Tenant B lê todas as tabelas com RLS | Vê exatamente 1 linha por tabela (somente as suas) |
+| 3     | Tenant A tenta WHERE tenant_id = B | 0 linhas (cross-tenant bloqueado) |
+| 3d    | Tenant A tenta acessar `campaign_zones` de B | 0 linhas (EXISTS em campaigns descarta B) |
+| 4     | Sem `adserver.tenant_id` setado (GUC vazio) | 0 linhas em todas as tabelas (fail-closed) |
+| 4i/4j | `campaign_zones` direto e via JOIN sem tenant_id | 0 linhas (fail-closed) |
+| 5     | Superuser (adserver_admin) lê dados de ambos | 2 linhas (bypass RLS esperado para migrations) |
+
+**Como rodar:**
+
+```bash
+# Pré-requisito: migrations aplicadas e role adserver_app criada
+make db-migrate-up
+make db-test
+```
+
+O teste roda dentro de `BEGIN ... ROLLBACK` — não persiste dados. Saída esperada na última
+linha: `== RLS ISOLATION: ALL TESTS PASSED ==`.
 
 ---
 

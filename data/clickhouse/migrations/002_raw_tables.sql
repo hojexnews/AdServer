@@ -28,8 +28,12 @@
 --   e para diagnosticar lag de ingestao.
 --
 -- PRIVACIDADE (TX-5/DA-11): nenhuma coluna armazena IP bruto nem PII.
---   Geo e derivado (country/city). user_agent armazenado para IVT (TX-6)
---   e descartado do analytics consolidado (StatsHourly nao o carrega).
+--   Geo e derivado (country/city).
+--   user_agent_class: CLASSE de dispositivo/browser (ex.: "mobile/chrome"),
+--     NAO o UA bruto reidentificavel. Usada para sinais IVT (TX-6) e para
+--     segmentacao coarse. Descartada do StatsHourly (nao entra em billing).
+--   referer_url: sanitizado pelo produtor Go (scheme+host+path; sem querystring).
+--     Sem dados de sessao ou parametros rastreadores. Sem PII (TX-5).
 
 -- =============================================================================
 -- raw_ad_request
@@ -51,7 +55,12 @@ CREATE TABLE IF NOT EXISTS adserver.raw_ad_request ON CLUSTER '{cluster}'
     site_id         String,
     geo_country     LowCardinality(String),
     geo_city        String,
-    user_agent      String,
+    -- PRIVACIDADE (HIGH): classe de dispositivo/browser emitida pelo produtor Go,
+    -- NAO o UA bruto. Ex.: "mobile/chrome", "desktop/safari", "bot/crawler".
+    -- Usado como sinal de IVT (TX-6). Nunca reidentificavel individualmente.
+    user_agent_class LowCardinality(String),
+    -- referer_url sanitizado: scheme+host+path sem querystring (produtor Go).
+    -- Sem parametros de rastreamento ou dados de sessao. Sem PII (TX-5).
     referer_url     String,
     cachebuster     String
 )
@@ -63,7 +72,9 @@ SETTINGS index_granularity = 8192;
 
 COMMENT ON TABLE adserver.raw_ad_request IS
     'Eventos AdRequest deduplicados por event_id (ReplacingMergeTree). '
-    'Fonte para StatsHourly (requests). Sem PII (TX-5).';
+    'Fonte para StatsHourly (requests). Sem PII (TX-5). '
+    'user_agent_class: classe coarse device/browser (nao UA bruto). '
+    'referer_url: sanitizado scheme+host+path (sem querystring).';
 
 -- =============================================================================
 -- raw_impression

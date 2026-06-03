@@ -53,8 +53,19 @@ CREATE TABLE IF NOT EXISTS adserver.kafka_ad_request ON CLUSTER '{cluster}'
     site_id         String,
     geo_country     String,          -- Geo.country (ISO 3166-1 alpha-2)
     geo_city        String,          -- Geo.city (derivado, sem PII, TX-5)
-    user_agent      String,          -- IVT signal (TX-6); nao e PII persistente
-    referer_url     String,          -- pode ser vazio
+    -- PRIVACIDADE (HIGH / TX-5): campo proto `user_agent` (no 5, wire-locked BACKWARD,
+    -- TX-1) carrega a CLASSE coarse de dispositivo/browser (ex.: "mobile/chrome",
+    -- "desktop/firefox"), NAO o UA bruto reidentificavel. O collector classifica o UA
+    -- bruto no servidor e emite apenas a classe dentro do campo proto `user_agent`; o
+    -- UA bruto nunca sai do servidor.
+    -- Mapeamento Protobuf->ClickHouse: kafka_format='Protobuf' mapeia por NOME do campo
+    -- proto; portanto a coluna DEVE se chamar `user_agent` para receber o valor do campo
+    -- no 5. A MV de ingestao (003) projeta `user_agent AS user_agent_class` ao gravar na
+    -- tabela raw (002), onde o nome semantico `user_agent_class` e preservado.
+    user_agent      String,          -- campo proto no 5; valor = classe coarse (nao UA bruto)
+    -- referer_url sanitizado: apenas scheme+host+path (sem query string).
+    -- O produtor Go remove a query string antes de emitir. Sem PII (TX-5).
+    referer_url     String,          -- sanitizado: scheme+host+path somente
     cachebuster     String
     -- custom_vars: mapa opaco; armazenado como String JSON para flexibilidade.
     -- Nao e indexado; consultas sobre custom_vars usam JSONExtract().

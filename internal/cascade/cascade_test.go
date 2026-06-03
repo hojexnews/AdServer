@@ -54,10 +54,26 @@ func makeSnap(campaigns []*snapshot.Campaign, banners []*snapshot.Banner) *snaps
 	for _, b := range banners {
 		s.Banners[b.ID] = b
 	}
-	// Wire ZoneCampaigns index.
+	// Wire ZoneCampaigns index and populate Zones so the cascade's zone-based
+	// tenant derivation (CA-1 fail-closed check) can resolve correctly.
+	// All test campaigns use zone "z1" and tenant "t1".
+	s.Zones["z1"] = &snapshot.Zone{
+		ID:       "z1",
+		TenantID: "t1",
+		Active:   true,
+	}
 	for _, c := range campaigns {
 		for _, z := range c.ZoneIDs {
 			s.ZoneCampaigns[z] = append(s.ZoneCampaigns[z], c.ID)
+			// Ensure each zone in the campaigns has an entry in Zones with the
+			// correct tenant so the cascade doesn't fail-closed on every test.
+			if _, ok := s.Zones[z]; !ok {
+				s.Zones[z] = &snapshot.Zone{
+					ID:       z,
+					TenantID: c.TenantID,
+					Active:   true,
+				}
+			}
 		}
 	}
 	return s
@@ -293,6 +309,48 @@ func TestCascade_CandidatesPopulated(t *testing.T) {
 
 	if len(result.Candidates) < 1 {
 		t.Errorf("expected at least 1 candidate in log, got %d", len(result.Candidates))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Security (CA-1): tenant_id derived server-side; zone must exist in snapshot
+// ---------------------------------------------------------------------------
+
+// Test: zone not in snapshot → BLANK (fail-closed, CA-1).
+func TestCascade_UnknownZone_Blank(t *testing.T) {
+	rem := makeCampaign("rm1", snapshot.TierRemnant, 1)
+	ban := makeBanner("ban-rm1", "rm1")
+	snap := makeSnap([]*snapshot.Campaign{rem}, []*snapshot.Banner{ban})
+
+	req := defaultRequest()
+	req.ZoneID = "nonexistent-zone" // not in snapshot
+	req.TenantID = "t1"
+
+	result := newEngine().Decide(req, snap)
+	if result.ServedTier != commonv1.ServedTier_SERVED_TIER_BLANK {
+		t.Errorf("unknown zone: expected BLANK (fail-closed), got %v", result.ServedTier)
+	}
+}
+
+// Test: zone exists but TenantID mismatch → BLANK (CA-1 defence-in-depth).
+func TestCascade_ZoneTenantMismatch_Blank(t *testing.T) {
+	rem := makeCampaign("rm1", snapshot.TierRemnant, 1)
+	ban := makeBanner("ban-rm1", "rm1")
+	snap := makeSnap([]*snapshot.Campaign{rem}, []*snapshot.Banner{ban})
+
+	// Override zone's tenant to differ from request.TenantID.
+	snap.Zones["z1"] = &snapshot.Zone{
+		ID:       "z1",
+		TenantID: "correct-tenant",
+		Active:   true,
+	}
+
+	req := defaultRequest()
+	req.TenantID = "wrong-tenant" // mismatch with zone.TenantID
+
+	result := newEngine().Decide(req, snap)
+	if result.ServedTier != commonv1.ServedTier_SERVED_TIER_BLANK {
+		t.Errorf("tenant mismatch: expected BLANK (fail-closed CA-1), got %v", result.ServedTier)
 	}
 }
 

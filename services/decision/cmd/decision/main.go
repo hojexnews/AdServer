@@ -11,11 +11,14 @@
 //     (best-effort + fail-safe DA-6).
 //   - Every response includes a decision_id and model_version (even blank — TX-1).
 //   - The IP address is resolved to geo and then immediately discarded (TX-5/DA-11).
-//   - tenant_id is propagated through every Decision struct.
+//   - tenant_id is DERIVED SERVER-SIDE from the zone_id via snapshot (CA-1).
+//     Any tenant_id supplied by the client is IGNORED.
 //   - DecisionSink (I2): Redpanda producer with WAL + at-least-once + dedupe.
 //   - Capper (I2): Redis-backed with fail-safe — no id → abort capped campaigns.
 //   - GeoResolver (I2): MaxMind GeoLite2 in memory; degraded to empty on miss.
 //   - Ranker (Fase 2 extension point): DefaultRanker in I0/I2; ML ranker in I4+.
+//   - Click tokens: HMAC-SHA256 signed at serve time (CK_HMAC_SECRET, fail-closed).
+//   - Capping salt: CAPPING_SALT required at boot; fail-closed if absent.
 package main
 
 import (
@@ -34,6 +37,7 @@ import (
 	decisionv1 "github.com/hojex/adserver/gen/go/adserver/decision/v1"
 	"github.com/hojex/adserver/internal/cascade"
 	"github.com/hojex/adserver/internal/capping"
+	"github.com/hojex/adserver/internal/clicktoken"
 	"github.com/hojex/adserver/internal/geo"
 	"github.com/hojex/adserver/internal/rules"
 	"github.com/hojex/adserver/internal/snapshot"
@@ -83,9 +87,9 @@ func (s *producerSink) Emit(ctx context.Context, d *decisionv1.Decision) {
 
 // DecideRequest is the JSON body of POST /v1/decide.
 type DecideRequest struct {
-	// TenantID identifies the tenant owning this zone (server-side isolation).
-	TenantID string `json:"tenant_id"`
 	// ZoneID is the publisher placement requesting an ad.
+	// The tenant_id is derived SERVER-SIDE from this zone_id via the snapshot (CA-1).
+	// Any "tenant_id" field sent by the client is IGNORED.
 	ZoneID string `json:"zone_id"`
 	// Geo fields: pre-derived by the collector before reaching this endpoint.
 	// The collector discards the IP after deriving these (TX-5/DA-11).
@@ -93,16 +97,23 @@ type DecideRequest struct {
 	// the client IP and passes only country+city here.
 	GeoCountry string `json:"geo_country,omitempty"`
 	GeoCity    string `json:"geo_city,omitempty"`
-	// UserAgent of the end-user browser.
+	// UserAgent of the end-user browser (coarse class only — never raw UA).
 	UserAgent string `json:"user_agent,omitempty"`
-	// SiteURL is the referer / page URL.
+	// SiteURL is the referer / page URL (sanitized: scheme+host+path only).
 	SiteURL string `json:"site_url,omitempty"`
 	// SiteVars are first-party custom variables from the ad tag.
 	SiteVars map[string]string `json:"site_vars,omitempty"`
-	// UserID is the hashed+salted stable identifier for frequency capping
-	// (DA-6).  Empty = no stable identifier; all capped campaigns are skipped.
-	// The hashing and salting are done CLIENT-SIDE (in the ad tag or collector);
-	// the decision service only sees the opaque hashed value.
+	// UserID is the stable identifier for frequency capping (DA-6).
+	// It is hashed+salted SERVER-SIDE within the capping subsystem ONLY.
+	// It is NEVER logged, emitted to telemetry, or forwarded to any other
+	// component.  Empty = no stable identifier; all capped campaigns are skipped.
+	//
+	// Privacy model (canonical, single definition):
+	//   The id enters the server and is immediately hashed with a rotating
+	//   salt (CAPPING_SALT, from OpenBao) inside capping.Capper.Allowed().
+	//   The raw id is confined to the hot-path stack frame of Allowed() only.
+	//   It is never stored in any struct field, log record, telemetry event,
+	//   or decision payload.  The Redis key carries only the salted hash.
 	UserID string `json:"user_id,omitempty"`
 }
 
@@ -112,19 +123,22 @@ type DecideResponse struct {
 	// DecisionID must always be present (even for blank impressions — TX-1).
 	DecisionID   string `json:"decision_id"`
 	ModelVersion string `json:"model_version"`
-	TenantID     string `json:"tenant_id"`
-	ZoneID       string `json:"zone_id"`
+	// TenantID is the server-derived tenant (from zone snapshot) — not client-supplied.
+	TenantID string `json:"tenant_id"`
+	ZoneID   string `json:"zone_id"`
 	// ServedTier is OVERRIDE / CONTRACT / REMNANT / BLANK.
 	ServedTier string `json:"served_tier"`
 	// Creative fields — empty on blank.
 	CampaignID string `json:"campaign_id,omitempty"`
 	BannerID   string `json:"banner_id,omitempty"`
-	ClickURL   string `json:"click_url,omitempty"`
-	ImageURL   string `json:"image_url,omitempty"`
-	HTML       string `json:"html,omitempty"`
-	VideoURL   string `json:"video_url,omitempty"`
-	Width      int32  `json:"width,omitempty"`
-	Height     int32  `json:"height,omitempty"`
+	// ClickTok is the HMAC-signed click token.  The collector validates this
+	// token before issuing a redirect.  No plain dest_url is ever returned.
+	ClickTok string `json:"click_tok,omitempty"`
+	ImageURL string `json:"image_url,omitempty"`
+	HTML     string `json:"html,omitempty"`
+	VideoURL string `json:"video_url,omitempty"`
+	Width    int32  `json:"width,omitempty"`
+	Height   int32  `json:"height,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -132,10 +146,11 @@ type DecideResponse struct {
 // ---------------------------------------------------------------------------
 
 type decisionHandler struct {
-	snap    *snapshot.Store
-	cascade *cascade.Engine
-	sink    DecisionSink
-	logger  *slog.Logger
+	snap        *snapshot.Store
+	cascade     *cascade.Engine
+	sink        DecisionSink
+	logger      *slog.Logger
+	clickSigner *clicktoken.Signer // nil → click tokens omitted (degraded)
 }
 
 func (h *decisionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -150,6 +165,26 @@ func (h *decisionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Security (CA-1): derive tenant_id SERVER-SIDE from zone_id.
+	// ANY tenant_id field sent by the client is SILENTLY IGNORED.
+	snap := h.snap.Snapshot()
+
+	zone, zoneExists := snap.Zones[req.ZoneID]
+	if !zoneExists || zone == nil {
+		// Zone unknown in snapshot → fail-closed: BLANK impression.
+		// Do not reveal whether the zone exists (information leak).
+		if h.logger != nil {
+			h.logger.Warn("decide: zone not found in snapshot — returning blank (fail-closed)",
+				"zone_id", req.ZoneID)
+		}
+		decisionID := telemetry.NewULID()
+		writeBlankResponse(w, decisionID, "", req.ZoneID)
+		return
+	}
+
+	// tenantID is authoritative from snapshot — never from client input.
+	tenantID := zone.TenantID
+
 	// Geo is passed in already-derived by the collector (TX-5/DA-11):
 	// no IP is present or needed in this handler.
 	g := &commonv1.Geo{
@@ -163,8 +198,6 @@ func (h *decisionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// including blank (TX-1 invariant).
 	decisionID := telemetry.NewULID()
 
-	snap := h.snap.Snapshot()
-
 	rulesCtx := &rules.Context{
 		Geo:         g,
 		SiteURL:     req.SiteURL,
@@ -175,9 +208,9 @@ func (h *decisionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	cascadeReq := cascade.Request{
 		ZoneID:      req.ZoneID,
-		TenantID:    req.TenantID,
+		TenantID:    tenantID, // server-derived, not from client
 		Rules:       rulesCtx,
-		UserID:      req.UserID,
+		UserID:      req.UserID, // confined to capping subsystem only
 		RequestTime: now,
 	}
 
@@ -187,8 +220,8 @@ func (h *decisionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// model_version is "" for cascata pura (DETERMINISTIC per decision.proto).
 	// decision_id MUST be present on every decision — even blank (TX-1).
 	envelope := &commonv1.Envelope{
-		TenantId:      req.TenantID,
-		EventId:       decisionID, // event_id == decision_id for the root decision event
+		TenantId:      tenantID, // server-derived
+		EventId:       decisionID,
 		DecisionId:    decisionID,
 		ModelVersion:  "", // cascata pura — no ML ranker in I0/I2
 		OccurredAt:    timestamppb.New(now),
@@ -216,13 +249,15 @@ func (h *decisionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Fire-and-forget emission.  The Redpanda producer (I2) is non-blocking.
+	// NOTE: UserID is NOT included in the Decision proto — it never leaves
+	// the capping subsystem (privacy model — DA-6).
 	h.sink.Emit(r.Context(), decision)
 
 	// Build HTTP response.
 	resp := DecideResponse{
 		DecisionID:   decisionID,
 		ModelVersion: "",
-		TenantID:     req.TenantID,
+		TenantID:     tenantID, // server-derived
 		ZoneID:       req.ZoneID,
 		ServedTier:   result.ServedTier.String(),
 	}
@@ -232,12 +267,19 @@ func (h *decisionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if result.Banner != nil {
 		ban := result.Banner
 		resp.BannerID = ban.ID
-		resp.ClickURL = ban.ClickURL
 		resp.ImageURL = ban.ImageURL
 		resp.HTML = ban.HTML
 		resp.VideoURL = ban.VideoURL
 		resp.Width = ban.Width
 		resp.Height = ban.Height
+
+		// Sign a click token embedding the dest_url from banner config.
+		// The plain dest_url is NEVER returned to the client.
+		// The collector validates the HMAC token before redirecting.
+		if ban.ClickURL != "" && h.clickSigner != nil {
+			expiry := now.Add(clicktoken.DefaultTTL)
+			resp.ClickTok = h.clickSigner.Sign(decisionID, ban.ID, ban.ClickURL, expiry)
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -245,6 +287,21 @@ func (h *decisionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		h.logger.Error("encode response", "err", err)
 	}
+}
+
+// writeBlankResponse writes a minimal blank decision response (no creative).
+// Used for fail-closed paths (unknown zone).
+func writeBlankResponse(w http.ResponseWriter, decisionID, tenantID, zoneID string) {
+	resp := DecideResponse{
+		DecisionID:   decisionID,
+		ModelVersion: "",
+		TenantID:     tenantID,
+		ZoneID:       zoneID,
+		ServedTier:   "SERVED_TIER_BLANK",
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Decision-ID", decisionID)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +314,38 @@ func main() {
 	}))
 
 	// ---------------------------------------------------------------------------
+	// Fail-closed guards: critical secrets must be present at boot.
+	// ---------------------------------------------------------------------------
+
+	// CAPPING_SALT: fail-closed (security #4 / privacy).
+	// Remove fallback default — empty salt is predictable and correlatable.
+	cappingSalt := os.Getenv("CAPPING_SALT")
+	if cappingSalt == "" {
+		logger.Error("FATAL: CAPPING_SALT environment variable is not set. " +
+			"Capping requires a non-empty rotating salt (from OpenBao). " +
+			"Refusing to start with a predictable default (fail-closed).")
+		os.Exit(1)
+	}
+
+	// CK_HMAC_SECRET: fail-closed for click signing.
+	// If absent, click tokens are not signed; /ck on the collector is disabled.
+	ckSecret := os.Getenv("CK_HMAC_SECRET")
+	var clickSigner *clicktoken.Signer
+	if ckSecret == "" {
+		logger.Error("CRITICAL: CK_HMAC_SECRET is not set — click signing disabled. " +
+			"The collector's /ck endpoint will refuse all clicks (fail-closed). " +
+			"Set CK_HMAC_SECRET to enable click tracking.")
+	} else {
+		var err error
+		clickSigner, err = clicktoken.New(ckSecret, clicktoken.DefaultTTL)
+		if err != nil {
+			logger.Error("CRITICAL: failed to initialise click signer", "err", err)
+			os.Exit(1)
+		}
+		logger.Info("click signer: HMAC-SHA256 token signing active")
+	}
+
+	// ---------------------------------------------------------------------------
 	// Snapshot store — I1 will wire the real Loader from db/config/.
 	// ---------------------------------------------------------------------------
 	snap := snapshot.EmptySnapshot()
@@ -264,7 +353,6 @@ func main() {
 
 	// ---------------------------------------------------------------------------
 	// Geo resolver (I2): MaxMind GeoLite2 in memory.
-	// Falls back to EmptyResolver if the .mmdb file is absent (DA-9).
 	// NOTE: The decision service itself does NOT see raw IPs — geo is derived
 	// by the collector and passed as pre-resolved fields in the JSON body (TX-5).
 	// The geo resolver is kept here for any future direct-client paths.
@@ -275,6 +363,7 @@ func main() {
 	// ---------------------------------------------------------------------------
 	// Capper (I2): Redis-backed with fail-safe (DA-6).
 	// Falls back to NoOpCapper if Redis is not configured.
+	// CAPPING_SALT is validated above; no default fallback here.
 	// ---------------------------------------------------------------------------
 	var cappingImpl cascade.Capper = cascade.NoOpCapper{}
 	redisAddr := envOr("REDIS_ADDR", "")
@@ -285,7 +374,7 @@ func main() {
 			ReadTimeout:  10 * time.Millisecond,
 			WriteTimeout: 10 * time.Millisecond,
 		})
-		cappingSalt := envOr("CAPPING_SALT", "default-salt-rotate-me")
+		// cappingSalt is already validated non-empty above.
 		cappingImpl = capping.New(rdb, cappingSalt)
 		logger.Info("capping: Redis-backed capper active", "addr", redisAddr)
 	} else {
@@ -340,10 +429,11 @@ func main() {
 	})
 
 	mux.Handle("POST /v1/decide", &decisionHandler{
-		snap:    store,
-		cascade: cascadeEngine,
-		sink:    sink,
-		logger:  logger,
+		snap:        store,
+		cascade:     cascadeEngine,
+		sink:        sink,
+		logger:      logger,
+		clickSigner: clickSigner, // nil → click tokens omitted (degraded mode)
 	})
 
 	addr := envOr("DECISION_ADDR", ":8080")
