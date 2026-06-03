@@ -89,7 +89,7 @@ Estas são as decisões que mantêm o sistema **coerente** entre serviços polig
 - **Apache Iceberg + Parquet** = **fonte de verdade** contábil e de treino (time-travel → reprodutibilidade e atribuição fechada). **Faturamento reconcilia contra o lakehouse, nunca contra o streaming.**
 - **Atribuição dupla**: número **ao vivo** (janela curta, ClickHouse) ≠ número **fechado/faturável** (batch sobre Iceberg, lookback completo). A UI **rotula "consolidado ≤1h" vs "ao vivo"** e **nunca soma** as duas fontes.
 - **Adiar para quando houver volume provado:** Flink stateful (só atribuição longa near-real-time + fraude streaming), Feast online store, camada semântica BI.
-- ⚠️ **Pendência bloqueadora (Fase 0):** confirmar com o dono do produto se **frescor near-real-time (1–5s) é mesmo requisito**, dado que DA-7 (batch horário) e "não-RTB" são normativos. Todo o eixo streaming depende dessa resposta.
+- ✅ **Pendência bloqueadora (Fase 0) — RESOLVIDA em [ADR-0001](adr/0001-near-real-time-nao-e-requisito-v1.md):** near-real-time stateful (Flink, 1–5s) **não é requisito de v1/v2**. O número **"ao vivo"** vem dos rollups incrementais do ClickHouse (segundos–minutos, **sem Flink**); o **faturável** continua batch horário (DA-7), reconciliado contra Iceberg. Flink fica deferido sob **gatilho mensurável** (ver ADR). UI rotula "ao vivo" vs "consolidado ≤1h" e **nunca soma**.
 
 ### 2.3 IA / Deep Learning para otimização
 - **Treino**: PyTorch 2.x disponível, mas o **modelo de produção é GBDT (LightGBM; CatBoost p/ alta cardinalidade)**. Deep é **Fase 2 sob prova de uplift A/B**.
@@ -183,7 +183,7 @@ Estas são as decisões que mantêm o sistema **coerente** entre serviços polig
 | **Reescrita Go divergir da semântica legada** → corromper faturamento | **Golden tests** (CA-2/4/5) + **shadow-traffic** + **dual-run contábil** dentro de tolerância antes de qualquer cutover |
 | **Perda/dupla contagem de eventos** quebra CPM/CPC/CPA | WAL local + at-least-once + **dedupe idempotente por `event_id`** + sinks idempotentes; faturar contra o **lakehouse**, nunca contra streaming |
 | **IA estoura o p99 da decisão** | GBDT in-process + embeddings pré-computados + **timeout duro + fail-open**; INT8; deep só na Fase 3 sob uplift |
-| **Near-real-time vs. DA-7** (batch horário normativo) | Resolver na **Fase 0** com o dono do produto; UI rotula "≤1h" vs "ao vivo" e **nunca soma** |
+| **Near-real-time vs. DA-7** (batch horário normativo) | ✅ **Resolvido** em [ADR-0001](adr/0001-near-real-time-nao-e-requisito-v1.md): Flink **não** é requisito v1/v2; "ao vivo" via ClickHouse (sem Flink), faturável em batch (DA-7); UI rotula "≤1h" vs "ao vivo" e **nunca soma**; Flink só sob gatilho mensurável |
 | **Fail-safe sem cookie** em mundo cookieless derruba fill rate (DA-6) | Avaliar identificadores **first-party/edge** conformes GDPR+LGPD **sem criar PII central** |
 | **Conformidade** (PCI escapar da célula, Travel Rule, EU AI Act Art. 50, residência de dados) | Fronteiras de rede rígidas validadas por QSA; células regionais auditadas; proveniência de criativos como gate |
 | **Precisão decimal por ativo** (bug financeiro clássico) | Centralizar **toda** aritmética em `Money(asset,integer,scale)`; **proibir float em CI**; `scale` autoritativo no Asset Registry |
@@ -197,7 +197,7 @@ Estas são as decisões que mantêm o sistema **coerente** entre serviços polig
 1. **Volume-alvo concreto** (pico de ad requests/s, nº de tenants, campanhas/regras ativas)? → dimensiona Go-vs-Rust, Redis-vs-Aerospike, estado in-process vs remoto.
 2. **Orçamento de latência ponta-a-ponta** (p50/p99/p99.9) e fração reservada à IA? → ML síncrono vs pré-computado.
 3. **Modelo de consistência de capping/pacing** (estrito vs eventual)? Há implicação contratual de sobre-entrega?
-4. **Near-real-time é requisito** (1–5s) ou agregação horária basta? → destrava ou não o eixo Flink/streaming.
+4. ✅ **Near-real-time é requisito** (1–5s) ou agregação horária basta? → **Respondido em [ADR-0001](adr/0001-near-real-time-nao-e-requisito-v1.md):** agregação horária basta (DA-7); "ao vivo" via ClickHouse sem Flink; eixo Flink deferido sob gatilho mensurável.
 5. **Identidade cookieless** permitida sob GDPR+LGPD sem PII central? → impacto real do fail-safe no fill rate.
 6. **BFF é Node/TS** (viabiliza tRPC) ou poliglota (OpenAPI/codegen)?
 7. **Janelas de atribuição** (lookback click→conversion) e modelo (last-click vs multi-touch)?
