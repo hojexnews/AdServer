@@ -1,0 +1,34 @@
+# RBAC baseline (TX-3) — menor privilégio por célula.
+#
+# Esqueleto: um Role read-only por namespace de carga (operadores/SRE veem
+# sem mutar) e um exemplo de binding. Identidades reais (grupos OIDC,
+# ServiceAccounts de app) entram via GitOps na Fase 1. As células pci/aml
+# têm RBAC próprio mais estrito (acesso só do time de compliance).
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: viewer
+  namespace: delivery
+rules:
+  - apiGroups: [""]
+    resources: [pods, services, configmaps, events, endpoints]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [deployments, replicasets, statefulsets]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: viewer-binding
+  namespace: delivery
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: viewer
+subjects:
+  # Substituir pelo grupo OIDC real no apply (ex.: time de SRE).
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: hojex:sre

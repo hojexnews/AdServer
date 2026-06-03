@@ -1,0 +1,60 @@
+# Namespaces por célula (TX-3 / §2.7). Cada um rotulado com a célula e o
+# baseline Pod Security "restricted". PCI e AML são células de escopo
+# mínimo — no alvo, em contas cloud separadas; aqui, namespaces isolados
+# com deny-all de rede (ver netpol/).
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: platform-system
+  labels:
+    adserver.hojex/cell: platform
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: delivery
+  labels:
+    adserver.hojex/cell: delivery
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ml
+  labels:
+    adserver.hojex/cell: ml
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: data
+  labels:
+    adserver.hojex/cell: data
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pci
+  labels:
+    adserver.hojex/cell: pci
+    adserver.hojex/compliance: pci-saq-a
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aml
+  labels:
+    adserver.hojex/cell: aml
+    adserver.hojex/compliance: aml-kyc-travel-rule
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest

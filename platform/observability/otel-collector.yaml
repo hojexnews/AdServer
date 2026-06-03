@@ -1,0 +1,113 @@
+# OpenTelemetry Collector — redação de PII na borda (TX-5).
+#
+# Gate de privacidade da Fase 0: NENHUM dado pessoal sai do collector.
+# O IP bruto é DESCARTADO após derivar geo; chaves de capping são
+# hasheadas; atributos reidentificáveis são removidos ANTES de qualquer
+# export (TX-5/DA-11). Observabilidade do copiloto (Langfuse) é
+# self-hosted; este collector cuida de traces/metrics/logs de infra+app.
+#
+# Validação estrutural: é YAML bem-formado; a validação semântica completa
+# (`otelcol validate --config`) roda no CI de imagem do collector (Fase 1),
+# pois depende da distro/componentes empacotados.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # 1) Proteção do próprio collector contra pressão de memória.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+
+  # 2) REDAÇÃO DE PII (TX-5). Remove atributos que carregam ou derivam
+  #    identidade. O IP bruto nunca deve chegar até aqui (descartado no
+  #    serviço após derivar geo); esta é a barreira em profundidade.
+  transform/redact-pii:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          # IP do cliente em qualquer convenção semântica — DELETAR.
+          - delete_key(attributes, "client.address")
+          - delete_key(attributes, "http.client_ip")
+          - delete_key(attributes, "net.sock.peer.addr")
+          - delete_key(attributes, "net.peer.ip")
+          - delete_key(attributes, "url.full")        # pode conter querystring com PII
+          # Identificadores diretos de pessoa — DELETAR.
+          - delete_key(attributes, "enduser.id")
+          - delete_key(attributes, "user.id")
+          - delete_key(attributes, "user.email")
+          # Chave de capping: efêmera e hasheada (TX-5). Se aparecer, hashear.
+          - set(attributes["capping.key"], SHA256(attributes["capping.key"])) where attributes["capping.key"] != nil
+    log_statements:
+      - context: log
+        statements:
+          - delete_key(attributes, "client.address")
+          - delete_key(attributes, "http.client_ip")
+          - delete_key(attributes, "net.peer.ip")
+          - delete_key(attributes, "enduser.id")
+          - delete_key(attributes, "user.email")
+
+  # 3) Allow-list final: só os atributos abaixo SOBREVIVEM em spans. Qualquer
+  #    chave nova/inesperada é bloqueada por padrão (fail-closed de privacidade).
+  redaction/allowlist:
+    allow_all_keys: false
+    allowed_keys:
+      - service.name
+      - service.namespace
+      - tenant_id          # pseudônimo (TX-3) — nunca PII
+      - decision_id
+      - model_version
+      - zone_id
+      - site_id
+      - served_tier
+      - geo.country        # derivado, mínimo (sem coordenadas)
+      - geo.city
+      - http.request.method
+      - http.response.status_code
+      - otel.status_code
+    # Mascara valores que casem padrões sensíveis, caso passem como valor.
+    blocked_values:
+      - "\\b\\d{1,3}(\\.\\d{1,3}){3}\\b"               # IPv4
+      - "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}" # e-mail
+    summary: debug
+
+  # 4) Lote para eficiência de export.
+  batch:
+    timeout: 5s
+    send_batch_size: 8192
+
+exporters:
+  # Métricas → VictoriaMetrics/Mimir (remote write). Endpoint por env.
+  prometheusremotewrite:
+    endpoint: ${env:METRICS_REMOTE_WRITE_URL}
+  # Traces → Tempo (OTLP/HTTP).
+  otlphttp/tempo:
+    endpoint: ${env:TEMPO_OTLP_URL}
+  # Logs → Loki (via OTLP/HTTP).
+  otlphttp/loki:
+    endpoint: ${env:LOKI_OTLP_URL}
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, transform/redact-pii, redaction/allowlist, batch]
+      exporters: [otlphttp/tempo]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [prometheusremotewrite]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, transform/redact-pii, batch]
+      exporters: [otlphttp/loki]
+  telemetry:
+    metrics:
+      level: detailed

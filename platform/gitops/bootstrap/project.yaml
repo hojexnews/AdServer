@@ -1,0 +1,39 @@
+# Argo CD AppProject — fronteira do que a plataforma pode implantar.
+#
+# Restringe repos de origem, destinos (clusters/namespaces) e tipos de
+# recurso. É o limite de blast-radius do GitOps da plataforma.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: platform
+  namespace: argocd
+spec:
+  description: Plataforma-base do AdServer (infra, rede, observabilidade, segredos).
+  sourceRepos:
+    # Substituir pela URL real do repositório no apply.
+    - "https://github.com/hojex/adserver.git"
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: platform-system
+    - server: https://kubernetes.default.svc
+      namespace: delivery
+    - server: https://kubernetes.default.svc
+      namespace: ml
+    - server: https://kubernetes.default.svc
+      namespace: data
+    - server: https://kubernetes.default.svc
+      namespace: pci
+    - server: https://kubernetes.default.svc
+      namespace: aml
+  clusterResourceWhitelist:
+    - group: "*"
+      kind: Namespace
+    - group: cilium.io
+      kind: CiliumNetworkPolicy
+    - group: kyverno.io
+      kind: ClusterPolicy
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  orphanedResources:
+    warn: true

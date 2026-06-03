@@ -1,0 +1,32 @@
+# App-of-apps — ponto único de entrada do GitOps da plataforma.
+#
+# Este Application aponta para platform/gitops/apps/, onde cada arquivo é
+# um Application filho (namespaces, netpol, kyverno, otel, openbao, ...).
+# Aplicar este manifesto uma vez (após instalar o Argo CD) e o resto
+# converge por GitOps. `syncPolicy.automated` com prune + selfHeal mantém
+# o cluster idêntico ao git.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform-bootstrap
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: platform
+  source:
+    repoURL: "https://github.com/hojex/adserver.git"
+    targetRevision: main
+    path: platform/gitops/apps
+    directory:
+      recurse: true
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=false
+      - ApplyOutOfSyncOnly=true

@@ -1,0 +1,61 @@
+# Cilium deny-all por célula (TX-3: "Cilium deny-all").
+#
+# Uma CiliumNetworkPolicy que seleciona TODOS os endpoints do namespace e
+# declara ingress/egress vazios estabelece o default-deny: nada entra,
+# nada sai, até que uma policy de allow explícito abra um fluxo. Egress de
+# DNS é liberado à parte (allow-dns.yaml) para o cluster funcionar.
+#
+# Replicada nas células de carga (delivery, ml, data) e nas células de
+# compliance (pci, aml). platform-system fica de fora do deny-all base
+# porque hospeda ingress/Argo/OTel que precisam de conectividade ampla
+# (restringir depois, por app).
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: default-deny
+  namespace: delivery
+spec:
+  endpointSelector: {}
+  ingress: []
+  egress: []
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: default-deny
+  namespace: ml
+spec:
+  endpointSelector: {}
+  ingress: []
+  egress: []
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: default-deny
+  namespace: data
+spec:
+  endpointSelector: {}
+  ingress: []
+  egress: []
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: default-deny
+  namespace: pci
+spec:
+  endpointSelector: {}
+  ingress: []
+  egress: []
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: default-deny
+  namespace: aml
+spec:
+  endpointSelector: {}
+  ingress: []
+  egress: []

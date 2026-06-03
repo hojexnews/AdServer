@@ -1,0 +1,24 @@
+# Application filho — namespaces por célula. Prefixo 00 = aplica primeiro
+# (os demais dependem dos namespaces existirem).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: namespaces
+  namespace: argocd
+spec:
+  project: platform
+  source:
+    repoURL: "https://github.com/hojex/adserver.git"
+    targetRevision: main
+    path: platform/k8s
+    directory:
+      include: "namespaces.yaml"
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true

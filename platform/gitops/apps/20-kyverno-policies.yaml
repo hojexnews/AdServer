@@ -1,0 +1,22 @@
+# Application filho — Kyverno baseline (admissão/supply chain). Prefixo 20.
+# Pressupõe Kyverno já instalado no cluster (addon via tofu/Helm).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: kyverno-policies
+  namespace: argocd
+spec:
+  project: platform
+  source:
+    repoURL: "https://github.com/hojex/adserver.git"
+    targetRevision: main
+    path: platform/k8s/policy
+    directory:
+      recurse: true
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
