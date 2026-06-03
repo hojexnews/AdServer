@@ -432,57 +432,124 @@ func (h *collectorHandler) handleClick(w http.ResponseWriter, r *http.Request) {
 //
 // Security invariants (SSRF/open-redirect guard — defence-in-depth):
 //  1. Scheme must be "https" or "http" — no file://, ftp://, etc.
-//  2. Host must not be a private IP range or loopback.
+//  2. Userinfo (user@host) is rejected; it is an SSRF bypass vector.
 //  3. Host must not be empty.
+//  4. Host is extracted via u.Hostname() which correctly handles [::1] and
+//     host:port forms — no manual string splitting.
+//  5. Numeric IP literals in alternate bases (hex 0x7f000001, decimal
+//     2130706433, octal 017700000001) are normalised to canonical IPv4 before
+//     the range check so they cannot bypass the loopback/private test.
+//  6. Private, loopback, link-local, ULA, and unspecified IP ranges are blocked
+//     for both IPv4 and IPv6.
+//  7. Hostnames that are well-known loopback aliases are blocked
+//     (localhost, *.local, *.internal).
 //
 // This is a defence-in-depth check against misconfigured banners.
-// The primary open-redirect protection is the HMAC-signed click token.
+// The primary open-redirect protection is the HMAC-signed click token (/ck).
 func validateDestURL(raw string) error {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return fmt.Errorf("empty URL")
 	}
 
-	// Require an explicit scheme.
-	scheme := ""
-	if i := strings.Index(raw, "://"); i > 0 {
-		scheme = strings.ToLower(raw[:i])
+	// Use net/url.Parse — never manual string splitting.
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("unparseable URL: %w", err)
 	}
+
+	// Require an explicit http/https scheme.
+	scheme := strings.ToLower(u.Scheme)
 	if scheme != "https" && scheme != "http" {
 		return fmt.Errorf("disallowed scheme %q (only https/http)", scheme)
 	}
 
-	// Extract host (strip scheme + path).
-	rest := raw[len(scheme)+3:]
-	host := rest
-	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
-		host = rest[:i]
-	}
-	// Strip port.
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
+	// Reject userinfo (user:pass@host or user@host).
+	// "https://evil.com@127.0.0.1/x" — the effective host becomes 127.0.0.1.
+	if u.User != nil {
+		return fmt.Errorf("userinfo in URL rejected (SSRF bypass vector)")
 	}
 
+	// u.Hostname() strips brackets from [::1] and the port from host:port.
+	host := u.Hostname()
 	if host == "" {
 		return fmt.Errorf("empty host")
 	}
 
+	// Attempt to resolve the host to a canonical net.IP, handling alternate
+	// numeric representations that net.ParseIP does not recognise but that
+	// real HTTP clients and resolvers do accept:
+	//   hex:     0x7f000001   → 127.0.0.1
+	//   decimal: 2130706433   → 127.0.0.1
+	//   octal:   017700000001 → 127.0.0.1
 	ip := net.ParseIP(host)
 	if ip == nil {
-		// Hostname: basic check — reject localhost variants.
-		lc := strings.ToLower(host)
-		if lc == "localhost" || strings.HasSuffix(lc, ".local") || strings.HasSuffix(lc, ".internal") {
-			return fmt.Errorf("private hostname %q rejected", host)
-		}
-		return nil // hostname looks OK
+		ip = parseAlternateNumericIP(host)
 	}
 
-	// Reject private, loopback, link-local, and reserved ranges.
-	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
-		return fmt.Errorf("private/reserved IP %q rejected", ip)
+	if ip != nil {
+		// Normalise to 16-byte form so IPv4-mapped IPv6 addresses are handled.
+		if ip4 := ip.To4(); ip4 != nil {
+			ip = ip4
+		}
+		if isBlockedIP(ip) {
+			return fmt.Errorf("private/reserved IP %q rejected", ip)
+		}
+		return nil
+	}
+
+	// Host is a DNS name — reject well-known loopback aliases.
+	lc := strings.ToLower(host)
+	if lc == "localhost" || strings.HasSuffix(lc, ".local") || strings.HasSuffix(lc, ".internal") {
+		return fmt.Errorf("private hostname %q rejected", host)
 	}
 	return nil
+}
+
+// parseAlternateNumericIP attempts to parse a host string as a 32-bit integer
+// written in hex (0x…), octal (0…), or decimal, and converts it to an IPv4
+// address.  Returns nil when the host is not a recognisable numeric literal.
+//
+// This covers SSRF bypass vectors that net.ParseIP ignores but that browsers
+// and Go's net/http stack resolve correctly:
+//
+//	0x7f000001  → 127.0.0.1
+//	2130706433  → 127.0.0.1
+//	017700000001 → 127.0.0.1
+func parseAlternateNumericIP(host string) net.IP {
+	if host == "" {
+		return nil
+	}
+	// Only attempt numeric parsing when the string could plausibly be a number.
+	// This avoids expensive parsing on ordinary hostnames.
+	first := host[0]
+	if !((first >= '0' && first <= '9') || first == 'x' || first == 'X') {
+		return nil
+	}
+
+	// strconv.ParseUint understands 0x prefix (base 0 auto-detects hex/octal/decimal).
+	n, err := strconv.ParseUint(host, 0, 32)
+	if err != nil {
+		return nil
+	}
+	// Convert 32-bit integer to 4-byte IPv4.
+	return net.IPv4(
+		byte(n>>24),
+		byte(n>>16),
+		byte(n>>8),
+		byte(n),
+	)
+}
+
+// isBlockedIP reports whether ip falls in any range that must not be a redirect
+// destination: loopback, private (RFC 1918 / ULA), link-local, or unspecified.
+// Covers both IPv4 and IPv6.
+func isBlockedIP(ip net.IP) bool {
+	return ip.IsLoopback() ||
+		ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsUnspecified()
 }
 
 // ---------------------------------------------------------------------------

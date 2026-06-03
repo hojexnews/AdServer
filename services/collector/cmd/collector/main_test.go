@@ -685,7 +685,7 @@ func TestResolveAndDiscardIP_NoPIILeaks(t *testing.T) {
 	}
 }
 
-// validateDestURL table tests.
+// validateDestURL table tests — baseline cases.
 func TestValidateDestURL(t *testing.T) {
 	cases := []struct {
 		url  string
@@ -710,6 +710,123 @@ func TestValidateDestURL(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("validateDestURL(%q): got valid=%v, want valid=%v (err=%v)",
 				tc.url, got, tc.want, err)
+		}
+	}
+}
+
+// TestValidateDestURL_SSRFBypasses covers each specific bypass vector identified
+// in the security review.  Every case here MUST be rejected.
+func TestValidateDestURL_SSRFBypasses(t *testing.T) {
+	blocked := []struct {
+		name string
+		url  string
+	}{
+		// Userinfo @ separator: the host is 127.0.0.1 despite the leading evil.com.
+		{"userinfo-at-loopback", "https://evil.com@127.0.0.1/x"},
+		// Userinfo with credentials.
+		{"userinfo-credentials-loopback", "http://user:pass@10.0.0.1/admin"},
+
+		// Hex IPv4 literal — net.ParseIP returns nil but resolves to 127.0.0.1.
+		{"hex-loopback", "https://0x7f000001/"},
+		{"hex-private-10", "http://0x0a000001/"},   // 10.0.0.1
+		{"hex-private-192", "http://0xc0a80101/"}, // 192.168.1.1
+
+		// Decimal IPv4 literal (dword notation).
+		{"decimal-loopback", "https://2130706433/"},    // 127.0.0.1
+		{"decimal-loopback-2", "http://2130706434/x"},  // 127.0.0.2
+		{"decimal-private", "http://3232235777/"},      // 192.168.1.1
+
+		// Octal IPv4 literal.
+		{"octal-loopback", "https://017700000001/"},    // 127.0.0.1
+
+		// IPv6 loopback — u.Hostname() strips brackets; net.ParseIP("::1") works.
+		{"ipv6-loopback-bracketed", "https://[::1]/"},
+		{"ipv6-loopback-bracketed-port", "https://[::1]:8080/x"},
+
+		// Standard loopback and private ranges.
+		{"loopback-127.0.0.1", "http://127.0.0.1/x"},
+		{"loopback-127.0.0.2", "http://127.0.0.2/x"}, // entire 127/8 is loopback
+		{"private-192.168.x.x", "http://192.168.0.1/x"},
+		{"private-172.16.x.x", "http://172.16.0.1/x"},
+		{"private-10.x.x.x", "http://10.255.255.255/x"},
+
+		// IPv6 ULA (private).
+		{"ipv6-ula", "http://[fc00::1]/"},
+		// IPv6 link-local.
+		{"ipv6-link-local", "http://[fe80::1]/"},
+
+		// Hostname loopback aliases.
+		{"localhost", "http://localhost/x"},
+		{"localhost-http", "https://localhost:9000/admin"},
+		{"dotlocal", "http://internal.local/x"},
+		{"dotinternal", "http://metadata.internal/computeMetadata/v1/"},
+	}
+
+	for _, tc := range blocked {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateDestURL(tc.url)
+			if err == nil {
+				t.Errorf("validateDestURL(%q) returned nil error — SSRF bypass NOT blocked", tc.url)
+			}
+		})
+	}
+}
+
+// TestValidateDestURL_ValidCases confirms that legitimate advertiser landing
+// pages are NOT blocked by the validator.
+func TestValidateDestURL_ValidCases(t *testing.T) {
+	valid := []struct {
+		name string
+		url  string
+	}{
+		{"https-no-path", "https://example.com"},
+		{"https-with-path", "https://advertiser.example.com/landing?utm_source=hojex"},
+		{"http-port", "http://example.com:8080/click"},
+		{"https-subdomain", "https://store.brand.co.uk/offers/summer"},
+		{"https-with-query-and-fragment", "https://example.com/page?q=1#section"},
+		{"public-ip", "https://203.0.113.5/landing"},  // TEST-NET-3, not private
+	}
+
+	for _, tc := range valid {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateDestURL(tc.url)
+			if err != nil {
+				t.Errorf("validateDestURL(%q) returned unexpected error: %v", tc.url, err)
+			}
+		})
+	}
+}
+
+// TestParseAlternateNumericIP unit-tests the numeric normaliser in isolation.
+func TestParseAlternateNumericIP(t *testing.T) {
+	cases := []struct {
+		host string
+		want string // canonical string, or "" if nil expected
+	}{
+		{"0x7f000001", "127.0.0.1"},
+		{"2130706433", "127.0.0.1"},
+		{"017700000001", "127.0.0.1"},
+		{"0x0a000001", "10.0.0.1"},
+		{"0xc0a80101", "192.168.1.1"},
+		{"3232235777", "192.168.1.1"},
+		{"example.com", ""},   // hostname — not numeric
+		{"::1", ""},           // IPv6 — net.ParseIP handles it, not this helper
+		{"", ""},
+	}
+	for _, tc := range cases {
+		ip := parseAlternateNumericIP(tc.host)
+		got := ""
+		if ip != nil {
+			if ip4 := ip.To4(); ip4 != nil {
+				got = ip4.String()
+			} else {
+				got = ip.String()
+			}
+		}
+		if got != tc.want {
+			t.Errorf("parseAlternateNumericIP(%q): got %q, want %q", tc.host, got, tc.want)
 		}
 	}
 }

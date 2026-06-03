@@ -48,15 +48,23 @@ processors:
     log_statements:
       - context: log
         statements:
+          # IP do cliente em qualquer convenção semântica — DELETAR.
           - delete_key(attributes, "client.address")
           - delete_key(attributes, "http.client_ip")
+          - delete_key(attributes, "net.sock.peer.addr")
           - delete_key(attributes, "net.peer.ip")
+          - delete_key(attributes, "url.full")        # pode conter querystring com PII
+          # Identificadores diretos de pessoa — DELETAR.
           - delete_key(attributes, "enduser.id")
+          - delete_key(attributes, "user.id")
           - delete_key(attributes, "user.email")
+          # Chave de capping: efêmera e hasheada (TX-5). Se aparecer, hashear.
+          - set(attributes["capping.key"], SHA256(attributes["capping.key"])) where attributes["capping.key"] != nil
 
-  # 3) Allow-list final: só os atributos abaixo SOBREVIVEM em spans. Qualquer
-  #    chave nova/inesperada é bloqueada por padrão (fail-closed de privacidade).
-  redaction/allowlist:
+  # 3a) Allow-list final para TRACES: só os atributos abaixo SOBREVIVEM em
+  #     spans. Qualquer chave nova/inesperada é bloqueada por padrão
+  #     (fail-closed de privacidade).
+  redaction/allowlist-traces:
     allow_all_keys: false
     allowed_keys:
       - service.name
@@ -73,6 +81,51 @@ processors:
       - http.response.status_code
       - otel.status_code
     # Mascara valores que casem padrões sensíveis, caso passem como valor.
+    blocked_values:
+      - "\\b\\d{1,3}(\\.\\d{1,3}){3}\\b"               # IPv4
+      - "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}" # e-mail
+    summary: debug
+
+  # 3b) Allow-list final para LOGS: mesma postura fail-closed dos traces.
+  #     Qualquer chave de log não listada aqui é silenciada antes do export.
+  #     A allowlist é deliberadamente mais restrita que a de traces (logs têm
+  #     body livre; atributos devem ser somente metadados estruturais).
+  #
+  #     Chaves permitidas e justificativa de não-PII:
+  #       service.name / service.namespace — identidade do serviço (não de pessoa)
+  #       severity_text / severity_number  — nível de severidade, sem identidade
+  #       tenant_id     — pseudônimo opaco (TX-3), nunca ligado a pessoa natural
+  #       decision_id   — UUID de decisão de ad-serving, sem ligação a indivíduo
+  #       zone_id / site_id / served_tier / model_version — inventário e ML, sem PII
+  #       geo.country   — granularidade de país (derivado de IP já descartado)
+  #       http.request.method / http.response.status_code — métricas de protocolo
+  #       error.type / exception.type — categorias de erro, sem payload de dados
+  #       code.function / code.namespace — localização do log no código-fonte
+  #       otel.status_code — código de status interno do OTel
+  #       log.file.name  — nome do arquivo de origem do log, sem PII
+  redaction/allowlist-logs:
+    allow_all_keys: false
+    allowed_keys:
+      - service.name
+      - service.namespace
+      - severity_text
+      - severity_number
+      - tenant_id
+      - decision_id
+      - zone_id
+      - site_id
+      - served_tier
+      - model_version
+      - geo.country
+      - http.request.method
+      - http.response.status_code
+      - error.type
+      - exception.type
+      - code.function
+      - code.namespace
+      - otel.status_code
+      - log.file.name
+    # Mesmos bloqueios de valor sensível dos traces (defense-in-depth).
     blocked_values:
       - "\\b\\d{1,3}(\\.\\d{1,3}){3}\\b"               # IPv4
       - "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}" # e-mail
@@ -98,7 +151,7 @@ service:
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [memory_limiter, transform/redact-pii, redaction/allowlist, batch]
+      processors: [memory_limiter, transform/redact-pii, redaction/allowlist-traces, batch]
       exporters: [otlphttp/tempo]
     metrics:
       receivers: [otlp]
@@ -106,7 +159,10 @@ service:
       exporters: [prometheusremotewrite]
     logs:
       receivers: [otlp]
-      processors: [memory_limiter, transform/redact-pii, batch]
+      # transform/redact-pii primeiro: elimina por chave conhecida (rápido).
+      # redaction/allowlist-logs depois: falha-fechado — qualquer chave
+      # residual não listada é descartada antes do export para Loki (TX-5).
+      processors: [memory_limiter, transform/redact-pii, redaction/allowlist-logs, batch]
       exporters: [otlphttp/loki]
   telemetry:
     metrics:
