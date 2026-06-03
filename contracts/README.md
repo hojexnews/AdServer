@@ -1,8 +1,8 @@
 # `contracts/`
 
 Contratos de **Fase 0 (Fundações)** que cruzam todas as fronteiras do ad server. Aqui vivem
-os contratos de **dinheiro** e a **política de lint anti-float** — invariantes que valem para
-o sistema inteiro, antes de qualquer ML ou hot path.
+os contratos de **dinheiro**, o **loop de atribuição/propensão** e a **política de lint
+anti-float** — invariantes que valem para o sistema inteiro, antes de qualquer ML ou hot path.
 
 ## Conteúdo
 
@@ -11,6 +11,7 @@ o sistema inteiro, antes de qualquer ML ou hot path.
 | [`money/money-type.md`](money/money-type.md) | Contrato canônico do tipo **`Money`** (`asset_code` + `amount` inteiro + `scale`) atravessando evento → ledger → BFF → UI. Representação por fronteira, invariantes, arredondamento e mapa de tipos por linguagem (TX-2/DA-10). |
 | [`money/asset-registry.md`](money/asset-registry.md) | **Asset Registry** plugável: schema, DDL Postgres, seed e os campos em aberto de AEV/BND. Fonte autoritativa de `scale`. |
 | [`money/asset-registry.seed.csv`](money/asset-registry.seed.csv) | Seed legível por máquina do Asset Registry (mesmas colunas/enums do DDL). |
+| [`telemetry/propensity-logging.md`](telemetry/propensity-logging.md) | Contrato do **decision log + propensão**: liga decisão ↔ recompensa por `decision_id` e habilita OPE (IPS/SNIPS/DR). Fecha o loop de atribuição (TX-1). |
 | [`lint/no-float.md`](lint/no-float.md) | Política de CI que **proíbe `float` em código monetário** (Go, TS, Python, SQL), com snippets e job de CI. |
 
 ## Relação com `proto/`
