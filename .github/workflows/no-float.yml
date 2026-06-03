@@ -1,0 +1,31 @@
+# no-float (TX-2) — float PROIBIDO em codigo monetario nas 4 linguagens.
+# Escopo restrito a money/ledger/billing/payments/migrations (nao pune
+# floats legitimos de ML/telemetria). Fonte: contracts/lint/no-float.md.
+name: no-float (TX-2)
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  no-float:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Go — sem float em dinheiro
+        run: bash scripts/ci/no-float-go.sh
+      - name: TypeScript — lint financeiro (ESLint, se houver TS)
+        run: |
+          if git ls-files '*money*/*.ts' '*ledger*/*.ts' '*billing*/*.ts' '*payments*/*.ts' | grep -q .; then
+            npx --yes eslint "**/{money,ledger,billing,payments}/**/*.ts"
+          else
+            echo "sem TS financeiro (ok)"
+          fi
+      - name: Python — sem float em dinheiro
+        run: bash scripts/ci/no-float-py.sh
+      - name: SQL/migrations — sem FLOAT/MONEY
+        run: bash scripts/ci/no-float-sql.sh

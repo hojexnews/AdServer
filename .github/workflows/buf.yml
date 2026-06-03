@@ -1,0 +1,42 @@
+# buf (TX-1) — Schema Registry: lint, format-check e breaking-change.
+#
+# Materializa a regra de TX-1: "A CI roda `buf lint` e `buf breaking`
+# para GARANTIR compatibilidade BACKWARD obrigatoria". Um PR que quebre
+# a compat com a `main` (reuso de numero de campo, mudanca de tipo,
+# remocao sem `reserved`) FALHA aqui antes do merge.
+name: buf (TX-1)
+
+on:
+  pull_request:
+    paths:
+      - "proto/**"
+      - ".github/workflows/buf.yml"
+  push:
+    branches: [main]
+    paths:
+      - "proto/**"
+
+permissions:
+  contents: read
+
+jobs:
+  buf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # historico completo: buf breaking compara contra a main.
+          fetch-depth: 0
+      - uses: bufbuild/buf-action@v1
+        with:
+          # raiz do modulo buf neste monorepo.
+          input: proto
+          # lint STANDARD+COMMENTS (buf.yaml).
+          lint: true
+          # falha se algum .proto nao estiver formatado (buf format).
+          format: true
+          # compat BACKWARD obrigatoria vs. main (TX-1). WIRE_JSON (buf.yaml).
+          breaking: true
+          breaking_against: "https://github.com/${{ github.repository }}.git#branch=main,subdir=proto"
+          # nao publicamos no BSR a partir da CI (sem token); so validamos.
+          push: false

@@ -61,12 +61,18 @@ porção da Fase 0 construível agora num repositório greenfield.
 ## Como usar a camada de contratos
 
 ```bash
-# Schema registry (requer buf — https://buf.build)
-cd proto
-buf lint                                  # valida o contrato
-buf breaking --against '.git#branch=main' # rejeita mudanças não-BACKWARD (TX-1)
-buf generate                              # gera gen/go e gen/ts
+# Schema registry (requer buf — https://buf.build; `make tools` instala em .bin/)
+make proto-lint            # buf lint proto (STANDARD + COMMENTS)
+make proto-format-check    # falha se algum .proto não estiver formatado
+make proto-breaking        # rejeita mudanças não-BACKWARD vs. main (TX-1)
+make proto-gen             # gera gen/go e gen/ts (requer rede p/ plugins remotos)
+make verify                # tudo acima + guards anti-float (espelha a CI)
 ```
+
+> A CI roda o equivalente em [.github/workflows/buf.yml](.github/workflows/buf.yml)
+> (lint + format + breaking). A invocação do `buf breaking` é a partir da **raiz**
+> (`buf breaking proto --against '.git#branch=main,subdir=proto'`), pois o `.git`
+> vive na raiz e `proto/` é subdiretório.
 
 O **Asset Registry** ([contracts/money/asset-registry.md](contracts/money/asset-registry.md))
 é a fonte autoritativa de `scale` por ativo — sem ele não há aritmética

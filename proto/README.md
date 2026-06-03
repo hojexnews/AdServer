@@ -56,15 +56,23 @@ publisher (DA-11).
 ## Comandos (rode a partir de `proto/`)
 
 ```bash
-# Lint do contrato
-buf lint
+# A partir da RAIZ do repositorio (o .git fica na raiz, e proto/ e um subdir):
 
-# Gerar codigo (Go no hot path + TS para o front)
-buf generate
+# Lint do contrato (STANDARD + COMMENTS)
+buf lint proto
+
+# Formatacao canonica (-w reescreve; --diff so mostra)
+buf format -w proto
 
 # Checagem de breaking-change contra a main (compat BACKWARD — TX-1)
-buf breaking --against '.git#branch=main'
+buf breaking proto --against '.git#branch=main,subdir=proto'
+
+# Gerar codigo (Go no hot path + TS para o front) — requer rede p/ plugins remotos
+cd proto && buf generate
 ```
+
+> Atalho: `make proto-lint` / `make proto-breaking` / `make proto-gen` na raiz
+> (ver `Makefile`). A CI roda o equivalente em `.github/workflows/buf.yml`.
 
 A geracao (`buf.gen.yaml`) produz Go em `gen/go` (paths=source_relative) e
 TypeScript em `gen/ts`.
