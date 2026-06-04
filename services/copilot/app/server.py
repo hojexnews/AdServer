@@ -19,7 +19,27 @@ ENDPOINTS:
     Body: {"approved": bool, "reason": str}
     Headers: mesmos de /v1/chat
     Resposta: {"status": "resumed", "thread_id": str}
-    Efeito: retoma o grafo pausado no nó hitl_approval_node.
+    Efeito: retoma o grafo pausado no nó hitl_approval_node com Command(resume=...).
+    IMPORTANTE: este endpoint NÃO retorna o stream SSE da continuação.
+    Para obter o stream pós-aprovação, o console DEVE chamar em seguida:
+
+  POST /v1/chat/{thread_id}/resume
+    Body: {} (vazio) ou {"model_tier": str|null}
+    Headers: mesmos de /v1/chat — X-Session-ID deve ser o mesmo thread_id
+    Resposta: SSE stream da continuação do grafo (mesmos eventos de /v1/chat).
+    Contrato de reconexão SSE pós-HITL:
+      1. Console recebe evento {"event": "hitl_required", "data": {"thread_id": T, ...}}
+         e encerra o stream.
+      2. Console exibe UI de aprovação ao usuário.
+      3. Usuário aprova → console chama POST /v1/hitl/{T}/approve.
+      4. Console reabre stream via POST /v1/chat/{T}/resume (sem message — resume-only).
+         O body NÃO precisa de "message"; o grafo retoma de onde parou via
+         Command(resume=...) já enviado pelo /approve.
+      5. O stream de resume emite os mesmos eventos SSE (token, tool_call, done, error).
+    NOTA para o frontend-bff-engineer:
+      - NÃO reenvie o POST /v1/chat com body {message: ""} — isso viola min_length=1
+        e reiniciaria o grafo do START em vez de retomar o interrupt.
+      - Use /v1/chat/{thread_id}/resume para o re-stream pós-aprovação.
 
   POST /v1/hitl/{thread_id}/reject
     Body: {"reason": str}
@@ -53,6 +73,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
 import structlog
@@ -63,7 +84,7 @@ from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
-from app.auth import RequireSession
+from app.auth import RequireSession, check_auth_config_on_startup
 from app.config import get_settings
 from app.model_router import ModelRouter, InMemoryBudgetTracker, ModelTier
 from graph.builder import build_graph
@@ -82,12 +103,37 @@ model_router = ModelRouter(settings, budget_tracker)
 gateway = ToolGateway(settings)
 graph = build_graph(settings, gateway, model_router)
 
+
+# ---------------------------------------------------------------------------
+# Lifespan — startup fail-closed (H1)
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):  # noqa: ARG001
+    """
+    Lifespan do FastAPI: chama check_auth_config_on_startup ANTES de servir requests.
+
+    H1 — fail-closed:
+      Se a configuração for insegura (secret ausente em produção; ou
+      SKIP_AUTH_DEV=true em APP_ENV=production), levanta RuntimeError e o
+      processo aborta — o serviço NUNCA sobe em estado inseguro.
+
+    Padrão moderno FastAPI (asynccontextmanager) substituindo o legado on_event.
+    """
+    # RuntimeError aqui impede o boot — falha visível no log de startup.
+    check_auth_config_on_startup(settings)
+    log.info("server.startup", status="ok", message="Auth config validada — servico pronto")
+    yield
+    log.info("server.shutdown", status="ok")
+
+
 app = FastAPI(
     title="AdServer Copilot Gateway",
     description="Gateway LangGraph do copiloto de IA (J5/Fase 2). Interno — nunca exposto ao front.",
     version="0.1.0",
     docs_url="/docs",
     redoc_url=None,
+    lifespan=lifespan,
 )
 
 # CORS restrito: apenas o BFF interno pode chamar.
@@ -126,6 +172,22 @@ class HitlApproveRequest(BaseModel):
 
 class HitlRejectRequest(BaseModel):
     reason: str = Field(max_length=500)
+
+
+class ResumeRequest(BaseModel):
+    """
+    Body para POST /v1/chat/{thread_id}/resume.
+
+    Não exige 'message' — é um request de retomada de stream pós-HITL,
+    não um novo turno de chat. O grafo já recebeu Command(resume=...) via
+    /v1/hitl/{thread_id}/approve e está pronto para continuar.
+
+    model_tier opcional: se fornecido, sobrescreve o tier para o trecho restante.
+    """
+    model_tier: str | None = Field(
+        default=None,
+        description="Tier de modelo para o trecho pós-aprovação. None = automático.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +320,136 @@ async def chat(
 
     return StreamingResponse(
         event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "X-Thread-ID": thread_id,
+        },
+    )
+
+
+@app.post("/v1/chat/{thread_id}/resume")
+async def chat_resume(
+    thread_id: str,
+    body: ResumeRequest,
+    session: RequireSession,
+) -> StreamingResponse:
+    """
+    Retoma o stream SSE de um thread pausado no interrupt HITL.
+
+    CONTRATO DE RECONEXAO SSE POS-HITL:
+      Este endpoint deve ser chamado pelo console APOS:
+        1. Receber evento hitl_required no stream de /v1/chat.
+        2. O usuario aprovar/rejeitar via POST /v1/hitl/{thread_id}/approve.
+      Nao reenvie POST /v1/chat com body vazio — isso viola min_length=1 e
+      reiniciaria o grafo do START em vez de retomar o interrupt.
+
+    O grafo ja recebeu Command(resume=...) via /v1/hitl/{thread_id}/approve.
+    Este endpoint chama astream_events sobre o thread existente para
+    transmitir a continuacao — nao injeta nova mensagem de usuario.
+
+    SEGURANÇA (C1): verifica posse do thread antes de transmitir.
+    """
+    tenant_id = session.tenant_id
+
+    # C1: verifica posse do thread antes de transmitir
+    config = {"configurable": {"thread_id": thread_id}}
+    correlation_id = str(uuid.uuid4())
+    try:
+        existing_state = await graph.aget_state(config)
+    except Exception as exc:
+        log.error(
+            "chat_resume.get_state_error",
+            tenant_id=tenant_id,
+            thread_id=thread_id,
+            correlation_id=correlation_id,
+            error=str(exc),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro ao verificar estado do thread. ID: {correlation_id}",
+        )
+
+    if existing_state is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Thread '{thread_id}' nao encontrado.",
+        )
+
+    state_values = existing_state.values if hasattr(existing_state, "values") else {}
+    state_tenant_id = state_values.get("tenant_id")
+    if state_tenant_id != tenant_id:
+        log.warning(
+            "chat_resume.tenant_mismatch",
+            session_tenant_id=tenant_id,
+            state_tenant_id=state_tenant_id,
+            thread_id=thread_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Acesso negado: este thread nao pertence ao tenant da sessao.",
+        )
+
+    log.info("chat_resume.start", tenant_id=tenant_id, thread_id=thread_id)
+
+    async def resume_stream() -> AsyncIterator[str]:
+        try:
+            # Retoma o grafo a partir do checkpoint atual (pos-Command(resume=...)).
+            # Nao injeta novo estado inicial — passa None para continuar do checkpoint.
+            async for event in graph.astream_events(None, config, version="v2"):
+                event_name: str = event.get("event", "")
+                event_data: dict = event.get("data", {})
+
+                if event_name == "on_chat_model_stream":
+                    chunk = event_data.get("chunk", {})
+                    content = getattr(chunk, "content", "") or ""
+                    if content:
+                        yield _sse("token", {"text": content})
+
+                elif event_name == "on_tool_end":
+                    yield _sse("tool_call", {
+                        "tool": event_data.get("name", ""),
+                        "status": "done",
+                        "result": event_data.get("output", {}),
+                    })
+
+                elif event_name == "on_interrupt":
+                    interrupt_value = event_data.get("value", {})
+                    if isinstance(interrupt_value, dict) and interrupt_value.get("event") == "hitl_required":
+                        yield _sse("hitl_required", {
+                            "thread_id": thread_id,
+                            "diff": interrupt_value.get("diff", {}),
+                            "message": interrupt_value.get("message", ""),
+                        })
+                        return
+
+                elif event_name == "on_chain_error":
+                    err_id = str(uuid.uuid4())
+                    log.error(
+                        "chat_resume.chain_error",
+                        tenant_id=tenant_id,
+                        thread_id=thread_id,
+                        correlation_id=err_id,
+                        error=str(event_data.get("error", "")),
+                    )
+                    yield _sse("error", {
+                        "message": "Erro interno no processamento. Tente novamente.",
+                        "correlation_id": err_id,
+                    })
+                    return
+
+            yield _sse("done", {
+                "session_id": thread_id,
+                "thread_id": thread_id,
+            })
+
+        except Exception as exc:
+            log.error("chat_resume.error", tenant_id=tenant_id, error=str(exc))
+            yield _sse("error", {"message": "Erro interno ao retomar stream. Tente novamente."})
+
+    return StreamingResponse(
+        resume_stream(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

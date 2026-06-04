@@ -169,8 +169,24 @@ async def get_authorized_session(
     SKIP_AUTH_DEV=true desativa a verificação HMAC APENAS em dev/CI.
     É PROIBIDO em APP_ENV=production (check_auth_config_on_startup).
     A sentinela "dev-skip" é SEMPRE rejeitada independentemente do env.
+
+    DEFENSE-IN-DEPTH (H1 — runtime guard):
+      Mesmo que o boot não tenha falhado (ex.: container antigo, bypass de startup),
+      re-checamos APP_ENV aqui. Se APP_ENV=production, SKIP_AUTH_DEV é IGNORADO —
+      o caminho de request não pode confiar exclusivamente no startup hook.
     """
-    skip_auth = os.getenv("SKIP_AUTH_DEV", "false").lower() == "true"
+    app_env = os.getenv("APP_ENV", "development").lower()
+    skip_auth_raw = os.getenv("SKIP_AUTH_DEV", "false").lower() == "true"
+
+    # H1 — runtime guard: em produção, SKIP_AUTH_DEV é sempre tratado como False,
+    # independentemente do valor da variável de ambiente. O boot já deveria ter
+    # falhado, mas o request-path não pode confiar só no boot (defense-in-depth).
+    if skip_auth_raw and app_env == "production":
+        log.warning(
+            "auth.skip_auth_dev_ignored_in_production",
+            reason="SKIP_AUTH_DEV=true é PROIBIDO em produção; ignorado no request-path",
+        )
+    skip_auth = skip_auth_raw and app_env != "production"
 
     if x_tenant_id is None:
         raise HTTPException(
