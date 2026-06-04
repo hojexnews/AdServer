@@ -218,14 +218,42 @@ DA-10 sem câmbio implícito; AEV/BND disabled com CHECKs). **2 LOW remediados:*
 passou a varrer `internal/chainconnector`; teste de payout negativo. `make verify` +
 `go test ./...` (incl. `tests/parity`) + **89 pytest** (deep + fraude não-superv. + regressão Fase 2) **verdes**.
 
-### ⏭️ Próxima onda da Fase 3 (depende de K0)
+### ✅ Entregue na Fase 3 — 2ª onda (K3 → K4 → K5 → {K6, K7}; gates verdes)
 
-**K3** ledger cripto + reconciliação · **K4** trilho fiat (Stripe SAQ-A + Asaas/PIX,
-célula PCI) · **K5** trilho cripto (Safe multisig + USDC via `ChainConnector`) ·
-**K6** compliance (Sumsub + Chainalysis + Travel Rule, célula AML/KYC) · **K7** BFF +
-UI de pagamentos (status; cripto fora do cliente). **K8** (promoção do deep sob uplift
-A/B + kill-switch) e a habilitação de AEV/BND seguem **gated** por tráfego real e pela
-spec de produto, respectivamente.
+A segunda onda entrega o **eixo cripto/pagamentos** dependente de K0, na ordem de
+dependências. Todo o trilho vive **fora do hot path**; o ledger double-entry da Fase 1
+recebe cripto **sem migração de schema** (AEV/BND seguem `enabled=false` até a spec de
+`scale`); PII/KYC fica isolada na **célula AML/KYC**; a UI consome **só status** (cripto
+fora do cliente).
+
+| Inc | Artefato | Local | Cobre |
+|---|---|---|---|
+| **K3** | Camada Go de acesso ao **ledger cripto** (par de postings idempotente, depósito `pending`→`posted` na finalidade, saldo derivado, câmbio explícito DA-10, estorno auditável) + reconciliação que **abre exceção e nunca autocorrige** (fonte Iceberg) + migração `0002` (`reconciliation_exceptions`, RLS) | [internal/ledger/](internal/ledger/) · [db/ledger/migrations/](db/ledger/migrations/) | TX-2 (int64↔NUMERIC via `math/big`, sem float); DA-10 (sem câmbio implícito); invariantes contábeis Fase 1; AEV/BND travados (CHECK) |
+| **K4** | **Trilho fiat**: Stripe (SAQ-A, cartão nunca no backend) + Asaas/PIX (QR dinâmico, conciliação E2E) + Mercado Pago failover; webhooks com assinatura tempo-constante + anti-replay; **célula PCI** (egress allowlist Stripe, Kyverno exige Vault Agent) | [services/payments/](services/payments/) · [platform/cells/pci/](platform/cells/pci/) | PCI não escapa da célula; par de postings idempotente (K3); SAQ-A; segredos via OpenBao |
+| **K5** | **Trilho cripto** Safe multisig + USDC via `ChainConnector` EVM real (JSON-RPC enxuto, **sem go-ethereum**); `uint256→int64` com checagem de overflow; depósito `pending` até N confirmações via webhook do custodiante; reorg → estorno; **Fireblocks deferido sob AUM** | [internal/chainconnector/](internal/chainconnector/) · [services/payments/internal/crypto/](services/payments/internal/crypto/) | finalidade antes de saldo (E.8); custódia Safe (E.5); cripto fora do hot path; sem câmbio implícito |
+| **K6** | **Compliance** célula AML/KYC: cofre `db/compliance` (PII/KYC pseudônimo, RLS fail-closed) + Sumsub (KYC/KYB) + **Chainalysis screening fail-closed** (sanção/risco bloqueia depósito/payout) + Travel Rule | [db/compliance/](db/compliance/) · [services/payments/internal/{sumsub,chainalysis,travelrule}/](services/payments/internal/) · [platform/cells/aml-kyc/](platform/cells/aml-kyc/) | TX-3 (PII isolada, pseudônimo); TX-5/DA-11 (ledger/telemetria sem PII); E.10 |
+| **K7** | **BFF + UI de pagamentos** (status): router tRPC só-leitura (tenant via ctx, sem IDOR), página self-service de saldo/faturamento; **Money como string DECIMAL** (sem aritmética no cliente); **sem cripto no front** | [bff/src/routers/payments.ts](bff/src/routers/payments.ts) · [web/console/src/app/billing/](web/console/src/app/billing/) | TX-2 (sem aritmética monetária no cliente); TX-3 (BFF injeta tenant, protege segredos); cripto fora do cliente (§2.5/C) |
+
+**Gates verdes (2ª onda):** `money-ledger-guardian` **APROVADO** em K3/K4/K5 (0 float;
+`uint256→int64` com overflow-check; scale do Asset Registry, nunca hardcode; DA-10 sem
+câmbio implícito); `security-reviewer` **APROVADO** em K4/K7 (PCI não escapa da célula;
+webhooks verificados; sem segredo/PII no front; sem IDOR/forja de tenant; sem cripto no
+cliente); `privacy-compliance-auditor` **APROVADO** em K6 (screening fail-closed
+enforçado; 0 PII em ledger/telemetria/logs; RLS canônica `adserver.tenant_id`
+fail-closed; célula isolada). **Achados HIGH/MEDIUM/LOW remediados na mesma janela**
+(path de webhook, injeção form-body, SSRF MercadoPago, scale hardcode, truncamento
+decimal, RLS do K3 corrigida p/ `adserver.tenant_id`). `go build ./...` + **27 pacotes
+Go** + `make verify` (buf TX-1 + no-float TX-2) + BFF/console (typecheck/lint/build) **verdes**.
+
+### ⏭️ Pendente da Fase 3
+
+**K8** (promoção do deep ranking sob **uplift A/B + kill-switch**) segue **gated por
+tráfego real** — o código está pronto desde K1 (flag default-off); a promoção espera o
+número de uplift sobre o GBDT, que depende do cutover de infra da Fase 2. A **habilitação
+de AEV/BND** segue **gated pela spec de produto** (`scale`/classificação/supply — CHECK
+estrutural impede habilitar sem `scale`). **Pré-condições de go-live** dos trilhos vivos:
+chaves reais via OpenBao, cifra KMS-envelope das colunas de PII do Travel Rule antes de
+popular nomes, FQDNs reais das células, e o adapter Postgres real do BFF de pagamentos.
 
 ---
 
