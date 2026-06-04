@@ -23,6 +23,7 @@ decisões-âncora (`DA-n`) e transversais (`TX-n`) que o sustentam.
 |-----|--------|--------|---------|
 | [0001](0001-near-real-time-nao-e-requisito-v1.md) | Near-real-time (1–5s) não é requisito de v1/v2; frescor "ao vivo" vem do ClickHouse, faturável continua batch horário | Aceito | DA-7, TX-1, §2.2, §5 |
 | [0002](0002-fase-1-sequenciamento-e-layout.md) | Layout do monorepo (módulo Go único), perguntas abertas (BFF/latência/capping/atribuição/volume) e sequenciamento da Fase 1 | Aceito | TX-1…5, DA-3/6/7/10, CA-1…7, §2.1/2.2/2.6/4/6 |
+| [0003](0003-fase-2-sequenciamento-ml-copiloto.md) | Sequenciamento da Fase 2 (ML re-ranker dentro da cascata + copiloto), layout (`internal/ranker`/sidecar/`ml/`/`services/copilot`/`db/vector`) e cookieless (§6 q.5) | Aceito | TX-1…5, DA-3/4/6/7/11, CA-1…9, §2.2/2.3/2.4/2.5/4/6 |
 
 ## Como criar um novo ADR
 

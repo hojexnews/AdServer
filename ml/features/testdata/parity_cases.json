@@ -1,0 +1,381 @@
+{
+  "_comment": [
+    "FIXTURES DE PARIDADE TREINO<->SERVING",
+    "",
+    "Cada caso define uma entrada canonica (input) e o vetor de features esperado",
+    "(expected_vector_computed). TANTO a implementacao Go (internal/ranker, J1) QUANTO a",
+    "Python (ml/features, J2) devem produzir o MESMO vetor para cada caso.",
+    "",
+    "TOLERANCIA (da spec feature_spec.yaml, parity_test_tolerance):",
+    "  - float: abs(go_value - py_value) <= 1e-6",
+    "    (o vetor e float32; ruido de cast float32->float64 e ~1.19e-7)",
+    "  - int / bucket: igualdade exata",
+    "",
+    "VALORES GOLD: calculados pelo bootstrap Python (ml/features/python/test_parity_cases.py)",
+    "em 2026-06-04 com feature_spec_version 1.0.0.",
+    "",
+    "HASH CANONICO: murmur3_32(value, seed, unsigned) % num_buckets",
+    "  Python: mmh3.hash(value, seed, signed=False) % num_buckets",
+    "  Go:     murmur3.SeedSum32(uint32(seed), []byte(value)) % uint32(num_buckets)",
+    "",
+    "COMO PLUGAR:",
+    "  Go  (J1): TestParityFromFixtures em internal/ranker/parity_test.go —",
+    "            le este arquivo, chama Featurize(input), compara expected_vector_computed.",
+    "  Python (J2): test_parity_cases.py em ml/features/python/ —",
+    "               le este arquivo, chama featurize(input), compara expected_vector_computed.",
+    "",
+    "ATUALIZACAO DE FIXTURES:",
+    "  Ao alterar a spec (ver politica de versao em feature_spec.yaml), recalcular",
+    "  os expected_vector_computed aqui e incrementar feature_spec_version.",
+    "  Ambos os testes falham com fixture desatualizado — esse e o comportamento correto."
+  ],
+  "feature_spec_version": "1.0.0",
+  "cases": [
+    {
+      "id": "remnant_brl_desktop_br_weekday",
+      "description": "Candidato Remnant, BRL, desktop Chrome, geo BR/Sao Paulo, segunda-feira 10h UTC, banner 300x250 html, eCPM=150 centavos (int64 minor-units, TX-2), 3 candidatos",
+      "input": {
+        "zone": {
+          "width": 300,
+          "height": 250
+        },
+        "request_time_utc": {
+          "hour": 10,
+          "day_of_week": 1
+        },
+        "geo": {
+          "country": "BR",
+          "city": "Sao Paulo"
+        },
+        "device_class": "chrome-desktop",
+        "candidate": {
+          "tier": 3,
+          "priority": 0,
+          "pacing_deficit": 0.0,
+          "ecpm_minor_units": 150,
+          "banner_width": 300,
+          "banner_height": 250,
+          "creative_type": "html"
+        },
+        "candidate_count": 3,
+        "campaign_delivered_impressions": 0,
+        "campaign_goal_impressions": 0,
+        "campaign_delivered_clicks": 0
+      },
+      "expected_vector_computed": {
+        "_notes": [
+          "zone_width_bucket: 300 < 320 (boundary[6]) -> bucket 6",
+          "zone_height_bucket: 250 < 280 (boundary[5]) -> bucket 5",
+          "zone_aspect_ratio_bucket: 300*100//250=120 -> 120 < 133 -> bucket 3",
+          "geo_country_hash: murmur3_32(BR, seed=42) % 512 = 167",
+          "geo_city_hash: murmur3_32(Sao Paulo, seed=43) % 2048 = 850",
+          "device_class_hash: murmur3_32(chrome-desktop, seed=44) % 16 = 3",
+          "ecpm_minor_units_log1p: log1p(150) = 5.017279836814924",
+          "ecpm_tier_bucket: 5.017... < 7.0 -> bucket 4",
+          "banner_size_match: width_bucket(300)=6 == zone_width_bucket=6 AND height_bucket(250)=5 == zone_height_bucket=5 -> 1",
+          "candidate_count_log1p: log1p(3) = 1.3862943611198906"
+        ],
+        "index_0_zone_width_bucket": 6,
+        "index_1_zone_height_bucket": 5,
+        "index_2_zone_aspect_ratio_bucket": 3,
+        "index_3_hour_of_day": 10,
+        "index_4_day_of_week": 1,
+        "index_5_is_weekend": 0,
+        "index_6_geo_country_hash": 167,
+        "index_7_geo_city_hash": 850,
+        "index_8_device_class_hash": 3,
+        "index_9_is_bot": 0,
+        "index_10_candidate_tier": 3,
+        "index_11_campaign_priority": 0,
+        "index_12_pacing_deficit": 0.0,
+        "index_13_pacing_deficit_bucket": 0,
+        "index_14_ecpm_minor_units_log1p": 5.017279836814924,
+        "index_15_ecpm_tier_bucket": 4,
+        "index_16_banner_width_bucket": 6,
+        "index_17_banner_height_bucket": 5,
+        "index_18_banner_size_match": 1,
+        "index_19_creative_type": 2,
+        "index_20_candidate_count_log1p": 1.3862943611198906,
+        "index_21_campaign_ctr_estimate": 0.0,
+        "index_22_campaign_delivery_ratio": 0.0
+      }
+    },
+    {
+      "id": "contract_deficit_mobile_us_weekend",
+      "description": "Candidato Contract com deficit=0.67, mobile Safari, geo US/New York, domingo 2h UTC (fim de semana), banner 320x50 image, eCPM=0, 1 candidato, 600/1000 impressoes entregues, 12 cliques",
+      "input": {
+        "zone": {
+          "width": 320,
+          "height": 50
+        },
+        "request_time_utc": {
+          "hour": 2,
+          "day_of_week": 0
+        },
+        "geo": {
+          "country": "US",
+          "city": "New York"
+        },
+        "device_class": "safari-mobile",
+        "candidate": {
+          "tier": 2,
+          "priority": 50,
+          "pacing_deficit": 0.67,
+          "ecpm_minor_units": 0,
+          "banner_width": 320,
+          "banner_height": 50,
+          "creative_type": "image"
+        },
+        "candidate_count": 1,
+        "campaign_delivered_impressions": 600,
+        "campaign_goal_impressions": 1000,
+        "campaign_delivered_clicks": 12
+      },
+      "expected_vector_computed": {
+        "_notes": [
+          "zone_width_bucket: 320 < 336 -> bucket 7",
+          "zone_height_bucket: 50 < 60 -> bucket 1",
+          "zone_aspect_ratio_bucket: 320*100//50=640 -> 640 < 800 -> bucket 6",
+          "is_weekend: day_of_week=0 (Domingo) -> 1",
+          "geo_country_hash: murmur3_32(US, seed=42) % 512 = 65",
+          "geo_city_hash: murmur3_32(New York, seed=43) % 2048 = 455",
+          "device_class_hash: murmur3_32(safari-mobile, seed=44) % 16 = 7",
+          "pacing_deficit_bucket: 0.67 >= 0.5 e < 0.75 -> bucket 3",
+          "ecpm_minor_units_log1p: log1p(0) = 0.0",
+          "candidate_count_log1p: log1p(1) = 0.6931471805599453",
+          "campaign_ctr_estimate: 12/600 = 0.02",
+          "campaign_delivery_ratio: 600/1000 = 0.6"
+        ],
+        "index_0_zone_width_bucket": 7,
+        "index_1_zone_height_bucket": 1,
+        "index_2_zone_aspect_ratio_bucket": 6,
+        "index_3_hour_of_day": 2,
+        "index_4_day_of_week": 0,
+        "index_5_is_weekend": 1,
+        "index_6_geo_country_hash": 65,
+        "index_7_geo_city_hash": 455,
+        "index_8_device_class_hash": 7,
+        "index_9_is_bot": 0,
+        "index_10_candidate_tier": 2,
+        "index_11_campaign_priority": 50,
+        "index_12_pacing_deficit": 0.67,
+        "index_13_pacing_deficit_bucket": 3,
+        "index_14_ecpm_minor_units_log1p": 0.0,
+        "index_15_ecpm_tier_bucket": 0,
+        "index_16_banner_width_bucket": 7,
+        "index_17_banner_height_bucket": 1,
+        "index_18_banner_size_match": 1,
+        "index_19_creative_type": 1,
+        "index_20_candidate_count_log1p": 0.6931471805599453,
+        "index_21_campaign_ctr_estimate": 0.02,
+        "index_22_campaign_delivery_ratio": 0.6
+      }
+    },
+    {
+      "id": "override_high_priority_video_missing_geo",
+      "description": "Candidato Override prioridade=100, video, geo desconhecido (empty strings), Chrome desktop, sabado 23h UTC, banner 728x90, 2 candidatos",
+      "input": {
+        "zone": {
+          "width": 728,
+          "height": 90
+        },
+        "request_time_utc": {
+          "hour": 23,
+          "day_of_week": 6
+        },
+        "geo": {
+          "country": "",
+          "city": ""
+        },
+        "device_class": "chrome-desktop",
+        "candidate": {
+          "tier": 1,
+          "priority": 100,
+          "pacing_deficit": 0.0,
+          "ecpm_minor_units": 0,
+          "banner_width": 728,
+          "banner_height": 90,
+          "creative_type": "video"
+        },
+        "candidate_count": 2,
+        "campaign_delivered_impressions": 0,
+        "campaign_goal_impressions": 0,
+        "campaign_delivered_clicks": 0
+      },
+      "expected_vector_computed": {
+        "_notes": [
+          "zone_width_bucket: 728 < 970 -> bucket 10",
+          "zone_height_bucket: 90 < 100 -> bucket 3",
+          "zone_aspect_ratio_bucket: 728*100//90=808 -> 808 > 800 -> bucket 7 (len(boundaries))",
+          "is_weekend: day_of_week=6 (Sabado) -> 1",
+          "geo_country_hash: empty string -> missing=0",
+          "geo_city_hash: empty string -> missing=0",
+          "device_class_hash: murmur3_32(chrome-desktop, seed=44) % 16 = 3",
+          "candidate_count_log1p: log1p(2) = 1.0986122886681098"
+        ],
+        "index_0_zone_width_bucket": 10,
+        "index_1_zone_height_bucket": 3,
+        "index_2_zone_aspect_ratio_bucket": 7,
+        "index_3_hour_of_day": 23,
+        "index_4_day_of_week": 6,
+        "index_5_is_weekend": 1,
+        "index_6_geo_country_hash": 0,
+        "index_7_geo_city_hash": 0,
+        "index_8_device_class_hash": 3,
+        "index_9_is_bot": 0,
+        "index_10_candidate_tier": 1,
+        "index_11_campaign_priority": 100,
+        "index_12_pacing_deficit": 0.0,
+        "index_13_pacing_deficit_bucket": 0,
+        "index_14_ecpm_minor_units_log1p": 0.0,
+        "index_15_ecpm_tier_bucket": 0,
+        "index_16_banner_width_bucket": 10,
+        "index_17_banner_height_bucket": 3,
+        "index_18_banner_size_match": 1,
+        "index_19_creative_type": 3,
+        "index_20_candidate_count_log1p": 1.0986122886681098,
+        "index_21_campaign_ctr_estimate": 0.0,
+        "index_22_campaign_delivery_ratio": 0.0
+      }
+    },
+    {
+      "id": "remnant_bot_traffic",
+      "description": "Candidato Remnant trafego bot, is_bot=1, eCPM=9999 centavos (int64), 5 candidatos, 10000 impressoes 500 cliques (CTR=5%), sem goal",
+      "input": {
+        "zone": {
+          "width": 160,
+          "height": 600
+        },
+        "request_time_utc": {
+          "hour": 14,
+          "day_of_week": 3
+        },
+        "geo": {
+          "country": "BR",
+          "city": "Curitiba"
+        },
+        "device_class": "bot",
+        "candidate": {
+          "tier": 3,
+          "priority": 0,
+          "pacing_deficit": 0.0,
+          "ecpm_minor_units": 9999,
+          "banner_width": 160,
+          "banner_height": 600,
+          "creative_type": "html"
+        },
+        "candidate_count": 5,
+        "campaign_delivered_impressions": 10000,
+        "campaign_goal_impressions": 0,
+        "campaign_delivered_clicks": 500
+      },
+      "expected_vector_computed": {
+        "_notes": [
+          "zone_width_bucket: 160 < 200 -> bucket 2",
+          "zone_height_bucket: 600 < 1024 -> bucket 7",
+          "zone_aspect_ratio_bucket: 160*100//600=26 -> 26 < 50 -> bucket 0",
+          "device_class=bot -> is_bot=1, device_class_hash: murmur3_32(bot, seed=44) % 16 = 5",
+          "geo_country_hash: murmur3_32(BR, seed=42) % 512 = 167",
+          "geo_city_hash: murmur3_32(Curitiba, seed=43) % 2048 = 628",
+          "ecpm_minor_units_log1p: log1p(9999) = 9.210340371976183",
+          "ecpm_tier_bucket: 9.21... >= 9.0 e < 11.0 -> bucket 6",
+          "candidate_count_log1p: log1p(5) = 1.791759469228327",
+          "campaign_ctr_estimate: 500/10000 = 0.05",
+          "campaign_delivery_ratio: goal=0 -> 0.0"
+        ],
+        "index_0_zone_width_bucket": 2,
+        "index_1_zone_height_bucket": 7,
+        "index_2_zone_aspect_ratio_bucket": 0,
+        "index_3_hour_of_day": 14,
+        "index_4_day_of_week": 3,
+        "index_5_is_weekend": 0,
+        "index_6_geo_country_hash": 167,
+        "index_7_geo_city_hash": 628,
+        "index_8_device_class_hash": 5,
+        "index_9_is_bot": 1,
+        "index_10_candidate_tier": 3,
+        "index_11_campaign_priority": 0,
+        "index_12_pacing_deficit": 0.0,
+        "index_13_pacing_deficit_bucket": 0,
+        "index_14_ecpm_minor_units_log1p": 9.210340371976183,
+        "index_15_ecpm_tier_bucket": 6,
+        "index_16_banner_width_bucket": 2,
+        "index_17_banner_height_bucket": 7,
+        "index_18_banner_size_match": 1,
+        "index_19_creative_type": 2,
+        "index_20_candidate_count_log1p": 1.791759469228327,
+        "index_21_campaign_ctr_estimate": 0.05,
+        "index_22_campaign_delivery_ratio": 0.0
+      }
+    },
+    {
+      "id": "contract_full_delivery_no_deficit",
+      "description": "Candidato Contract entrega completa (deficit=0), delivery_ratio=1.0, PT/Lisboa, Firefox desktop, terca 9h UTC, banner 300x600 image, 7 candidatos",
+      "input": {
+        "zone": {
+          "width": 300,
+          "height": 600
+        },
+        "request_time_utc": {
+          "hour": 9,
+          "day_of_week": 2
+        },
+        "geo": {
+          "country": "PT",
+          "city": "Lisboa"
+        },
+        "device_class": "firefox-desktop",
+        "candidate": {
+          "tier": 2,
+          "priority": 30,
+          "pacing_deficit": 0.0,
+          "ecpm_minor_units": 0,
+          "banner_width": 300,
+          "banner_height": 600,
+          "creative_type": "image"
+        },
+        "candidate_count": 7,
+        "campaign_delivered_impressions": 1000,
+        "campaign_goal_impressions": 1000,
+        "campaign_delivered_clicks": 30
+      },
+      "expected_vector_computed": {
+        "_notes": [
+          "zone_width_bucket: 300 < 320 -> bucket 6",
+          "zone_height_bucket: 600 < 1024 -> bucket 7",
+          "zone_aspect_ratio_bucket: 300*100//600=50 -> 50 < 80 -> bucket 1",
+          "geo_country_hash: murmur3_32(PT, seed=42) % 512 = 258",
+          "geo_city_hash: murmur3_32(Lisboa, seed=43) % 2048 = 660",
+          "device_class_hash: murmur3_32(firefox-desktop, seed=44) % 16 = 15",
+          "ecpm_minor_units_log1p: log1p(0) = 0.0",
+          "candidate_count_log1p: log1p(7) = 2.0794415416798357",
+          "campaign_ctr_estimate: 30/1000 = 0.03",
+          "campaign_delivery_ratio: 1000/1000 = 1.0"
+        ],
+        "index_0_zone_width_bucket": 6,
+        "index_1_zone_height_bucket": 7,
+        "index_2_zone_aspect_ratio_bucket": 1,
+        "index_3_hour_of_day": 9,
+        "index_4_day_of_week": 2,
+        "index_5_is_weekend": 0,
+        "index_6_geo_country_hash": 258,
+        "index_7_geo_city_hash": 660,
+        "index_8_device_class_hash": 15,
+        "index_9_is_bot": 0,
+        "index_10_candidate_tier": 2,
+        "index_11_campaign_priority": 30,
+        "index_12_pacing_deficit": 0.0,
+        "index_13_pacing_deficit_bucket": 0,
+        "index_14_ecpm_minor_units_log1p": 0.0,
+        "index_15_ecpm_tier_bucket": 0,
+        "index_16_banner_width_bucket": 6,
+        "index_17_banner_height_bucket": 7,
+        "index_18_banner_size_match": 1,
+        "index_19_creative_type": 1,
+        "index_20_candidate_count_log1p": 2.0794415416798357,
+        "index_21_campaign_ctr_estimate": 0.03,
+        "index_22_campaign_delivery_ratio": 1.0
+      }
+    }
+  ]
+}

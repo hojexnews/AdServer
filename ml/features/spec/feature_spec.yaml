@@ -1,0 +1,704 @@
+# ml/features/spec/feature_spec.yaml
+#
+# SPEC DECLARATIVA E VERSIONADA DE FEATURIZACAO — pCTR (Fase 2, J2)
+#
+# REGRAS DE OURO:
+#   - Toda feature de SERVING deve ser computavel no hot path SEM ida a rede
+#     e dentro do budget TX-4 (5-8 ms p99 total, incluindo sidecar).
+#   - NENHUMA feature pode ser ou derivar de PII / IP bruto / ID cross-site
+#     (TX-5/DA-11). Cada feature documenta explicitamente sua conformidade.
+#   - Valores monetarios em minor-units inteiros (int64), NUNCA float (TX-2).
+#   - Comparacoes de eCPM sao validas somente dentro do mesmo asset_code/tenant
+#     (DA-10). Features monetarias sao normalizadas por tenant.
+#   - Esta spec e a UNICA fonte de verdade. Tanto o codigo Go (internal/ranker)
+#     quanto o Python (ml/training) derivam de cá — nunca ao contrario.
+#
+# POLITICA DE EVOLUCAO:
+#   - Incrementos PATCH (ex.: 1.0.0 -> 1.0.1): correncao de documentacao,
+#     ajuste de bucket sem alterar fronteiras (sem impacto no vetor produzido).
+#     Modelos promovidos CONTINUAM validos.
+#   - Incrementos MINOR (ex.: 1.0.0 -> 1.1.0): adicao de features novas
+#     ao final do vetor (append-only). Modelos existentes sao re-treinados
+#     antes da proxima promocao; modelos antigos continuam servindo na versao
+#     anterior ate re-treinamento confirmado (feature_spec_version no Decision
+#     permite detectar o desfasamento).
+#   - Incrementos MAJOR (ex.: 1.0.0 -> 2.0.0): remocao, renomeacao ou reordenacao
+#     de features existentes. EXIGE re-treinamento obrigatorio e nova campanha
+#     de A/B (J4) antes de qualquer promocao em producao. Modelos treinados na
+#     versao anterior NAO podem ser promovidos com a spec nova.
+#   - O campo `feature_spec_version` e gravado no Decision (via model_version
+#     que o sidecar informa) e no Iceberg (coluna `feature_spec_version` na
+#     tabela de treino). J3/J4 detectam desfasamento comparando o campo no
+#     registro de decisao com a versao da spec que treinou o modelo.
+#
+# TOLERANCIA NUMERICA (teste de paridade):
+#   - Floats: abs(go_value - py_value) <= 1e-6
+#     Justificativa: o vetor de serving e float32 (dtype do ONNX/Treelite).
+#     Ao comparar em float64, o ruido de quantizacao float32 e ~1.19e-7.
+#     A tolerancia 1e-6 captura divergencias de implementacao (log1p errado,
+#     seed errado, bucket trocado) mas absorve o ruido de cast float32<->float64.
+#   - Inteiros / buckets: igualdade exata (diff == 0 mesmo como float32)
+#   - Strings (one-hot / hashes): igualdade exata de string
+#
+# FORMATO DO VETOR DE SERVING:
+#   O vetor final de serving e uma lista de float32 ordenada por `serving_index`.
+#   Features categoricas sao expandidas via one-hot ou hash embedding conforme
+#   documentado. A ordem e imutavel dentro de uma versao MAJOR da spec.
+
+feature_spec_version: "1.0.0"
+
+# ---------------------------------------------------------------------------
+# GRUPO 1 — CONTEXTO DE ZONA/INVENTARIO
+# Fonte: snapshot.Zone (in-memory, zero rede)
+# ---------------------------------------------------------------------------
+
+features:
+
+  - name: zone_width_bucket
+    serving_index: 0
+    type: int
+    availability: online
+    source: snapshot.Zone.Width
+    description: >
+      Largura da zona em pixels, bucketizada em classes padrao IAB.
+    transformation:
+      kind: bucketize
+      # Buckets IAB padrao: 120, 160, 200, 234, 250, 300, 320, 336, 468, 728, 970, inf
+      boundaries: [120, 160, 200, 234, 250, 300, 320, 336, 468, 728, 970]
+      # Resultado: inteiro em [0, 11] — 0=< 120px, 11=> 970px
+      output_type: int
+    missing: 0
+    pii_free: true
+    pii_note: >
+      Dimensao de placement. Sem identificador de usuario. PII-free.
+    money_note: n/a
+
+  - name: zone_height_bucket
+    serving_index: 1
+    type: int
+    availability: online
+    source: snapshot.Zone.Height
+    description: >
+      Altura da zona em pixels, bucketizada analogamente a largura.
+    transformation:
+      kind: bucketize
+      boundaries: [50, 60, 90, 100, 250, 280, 600, 1024]
+      output_type: int
+    missing: 0
+    pii_free: true
+    pii_note: Dimensao de placement. PII-free.
+    money_note: n/a
+
+  - name: zone_aspect_ratio_bucket
+    serving_index: 2
+    type: int
+    availability: online
+    source: derived — snapshot.Zone.Width / snapshot.Zone.Height (integer ratio * 100)
+    description: >
+      Razao de aspecto da zona (width*100/height), bucketizada.
+      Ex.: 300x250 -> 120; 728x90 -> 809. Captura leaderboard vs. rectangle
+      vs. skyscraper sem revelar tamanho exato.
+    transformation:
+      kind: bucketize
+      boundaries: [50, 80, 100, 133, 200, 400, 800]
+      output_type: int
+    missing: 3
+    pii_free: true
+    pii_note: Razao de dimensoes de placement. PII-free.
+    money_note: n/a
+
+# ---------------------------------------------------------------------------
+# GRUPO 2 — CONTEXTO TEMPORAL
+# Fonte: cascade.Request.RequestTime (in-memory, zero rede)
+# ---------------------------------------------------------------------------
+
+  - name: hour_of_day
+    serving_index: 3
+    type: int
+    availability: online
+    source: cascade.Request.RequestTime — UTC hour [0, 23]
+    description: Hora UTC do request. Captura sazonalidade intradiaria de CTR.
+    transformation:
+      kind: passthrough
+      output_type: int
+    missing: 12
+    pii_free: true
+    pii_note: >
+      Hora UTC do servidor, nao do usuario. Nao identifica o individuo.
+      PII-free.
+    money_note: n/a
+
+  - name: day_of_week
+    serving_index: 4
+    type: int
+    availability: online
+    source: >
+      cascade.Request.RequestTime — Weekday() conforme snapshot.VectorTimeDayOfWeek
+      (0=Domingo ... 6=Sabado)
+    description: Dia da semana UTC. Captura sazonalidade semanal de CTR.
+    transformation:
+      kind: passthrough
+      output_type: int
+    missing: 0
+    pii_free: true
+    pii_note: Dia da semana do servidor. PII-free.
+    money_note: n/a
+
+  - name: is_weekend
+    serving_index: 5
+    type: int
+    availability: online
+    source: derived — day_of_week in {0, 6} -> 1, else 0
+    description: Flag binaria fim-de-semana (0/1).
+    transformation:
+      kind: binary_flag
+      output_type: int
+    missing: 0
+    pii_free: true
+    pii_note: Derivado da hora do servidor. PII-free.
+    money_note: n/a
+
+# ---------------------------------------------------------------------------
+# GRUPO 3 — CONTEXTO GEO
+# Fonte: commonv1.Geo — derivado do IP pelo geo.Resolver ANTES de chegar
+# ao ranker. O IP bruto NUNCA entra no vetor (TX-5/DA-11/DA-9).
+# Geo e sempre pais + cidade no nivel minimo derivado.
+# ---------------------------------------------------------------------------
+
+  - name: geo_country_hash
+    serving_index: 6
+    type: int
+    availability: online
+    source: commonv1.Geo.Country (ISO 3166-1 alpha-2, ex. "BR")
+    description: >
+      Hash inteiro do codigo de pais. Alta cardinalidade (~250 paises) tratada
+      via feature hashing (MurmurHash3 mod 512 — mesmo seed em Go e Python).
+      Nao e PII: e um derivado de regiao, nao identificador de individuo.
+    transformation:
+      kind: feature_hash
+      hash_fn: murmur3_32
+      seed: 42
+      num_buckets: 512
+      output_type: int
+    missing: 0
+    pii_free: true
+    pii_note: >
+      ISO 3166-1 alpha-2 e informacao de regiao, nao de individuo. O IP bruto
+      foi descartado pelo geo.Resolver (TX-5). PII-free conforme DA-9.
+    money_note: n/a
+
+  - name: geo_city_hash
+    serving_index: 7
+    type: int
+    availability: online
+    source: commonv1.Geo.City (nome de cidade derivado por GeoLite2)
+    description: >
+      Hash inteiro do nome de cidade. Alta cardinalidade tratada via feature
+      hashing (MurmurHash3 mod 2048). Granularidade maxima permitida pela
+      spec de privacidade (DA-9): nivel de cidade, sem CEP ou coordenada.
+    transformation:
+      kind: feature_hash
+      hash_fn: murmur3_32
+      seed: 43
+      num_buckets: 2048
+      output_type: int
+    missing: 0
+    pii_free: true
+    pii_note: >
+      Cidade derivada de IP via GeoLite2, nao vinculada a individuo. IP descartado
+      (TX-5). Granularidade maxima = cidade (DA-9). PII-free.
+    money_note: n/a
+
+# ---------------------------------------------------------------------------
+# GRUPO 4 — CONTEXTO DE DISPOSITIVO / BROWSER
+# Fonte: useragent.Classify() — ja executado antes do ranker (hot path).
+# O UA bruto NUNCA entra no vetor (TX-5/DA-11).
+# ---------------------------------------------------------------------------
+
+  - name: device_class_hash
+    serving_index: 8
+    type: int
+    availability: online
+    source: >
+      useragent.Classify(raw_ua) — retorna uma das classes coarsas documentadas
+      no package useragent (ex.: "chrome-mobile", "bot", "other").
+      O UA bruto e descartado apos Classify().
+    description: >
+      Hash da classe de dispositivo/browser (9 classes possiveis). Cardinalidade
+      baixa — hashing nao e estritamente necessario mas mantemos o padrao uniforme.
+      Buckets: murmur3_32 mod 16.
+    transformation:
+      kind: feature_hash
+      hash_fn: murmur3_32
+      seed: 44
+      num_buckets: 16
+      output_type: int
+    missing: 0
+    pii_free: true
+    pii_note: >
+      Classe coarsa derivada do UA. UA bruto descartado (TX-5/DA-11). A classe
+      "chrome-mobile" nao identifica o individuo. PII-free.
+    money_note: n/a
+
+  - name: is_bot
+    serving_index: 9
+    type: int
+    availability: online
+    source: derived — device_class == "bot" -> 1, else 0
+    description: >
+      Flag binaria indicando trafego de bot (IVT grosso). Sinal de qualidade
+      de trafego. Candidatos com is_bot=1 nao devem ser servidos (o ranker
+      pode usar isso como signal de exclusao, mas a cascata ja filtra via
+      capping/rules; este campo e usado no treino como feature de contexto).
+    transformation:
+      kind: binary_flag
+      output_type: int
+    missing: 0
+    pii_free: true
+    pii_note: Derivado de classe de UA. PII-free.
+    money_note: n/a
+
+# ---------------------------------------------------------------------------
+# GRUPO 5 — CANDIDATO: TIER E PRIORIDADE
+# Fonte: cascade.Candidate.Tier, snapshot.Campaign.Priority (in-memory)
+# ---------------------------------------------------------------------------
+
+  - name: candidate_tier
+    serving_index: 10
+    type: int
+    availability: online
+    source: "cascade.Candidate.Tier (snapshot.Tier int8: Override=1, Contract=2, Remnant=3)"
+    description: >
+      Estrato da cascata do candidato. O ranker re-ordena DENTRO do mesmo estrato
+      (DA-3), entao todos os candidatos no vetor de serving tem o mesmo valor de tier.
+      Incluido para que o modelo reconheca o tipo de inventario.
+    transformation:
+      kind: passthrough
+      output_type: int
+    missing: 0
+    pii_free: true
+    pii_note: Tipo de inventario, sem dados de usuario. PII-free.
+    money_note: n/a
+
+  - name: campaign_priority
+    serving_index: 11
+    type: int
+    availability: online
+    source: snapshot.Campaign.Priority (int32)
+    description: >
+      Prioridade da campanha dentro do estrato. Relevante para Override (ordena
+      por priority desc). Para Contract/Remnant é secundario mas captura intenção
+      do anunciante.
+    transformation:
+      kind: clip
+      min: 0
+      max: 100
+      output_type: int
+    missing: 0
+    pii_free: true
+    pii_note: Configuracao de campanha, sem dados de usuario. PII-free.
+    money_note: n/a
+
+# ---------------------------------------------------------------------------
+# GRUPO 6 — CANDIDATO: PACING (Contract tier)
+# Fonte: cascade.Candidate.PacingDeficit (float64 in [0,1]) — in-memory
+# ---------------------------------------------------------------------------
+
+  - name: pacing_deficit
+    serving_index: 12
+    type: float
+    availability: online
+    source: cascade.Candidate.PacingDeficit (float64 in [0,1])
+    description: >
+      Deficit de entrega normalizado [0,1] do candidato Contract (DA-4).
+      0 = no-pace ou acima do pace; 1 = totalmente nao-entregue. Para nao-Contract
+      (Override/Remnant) o valor e 0.0. Sinal forte de urgencia de pacing.
+    transformation:
+      kind: passthrough
+      output_type: float32
+    missing: 0.0
+    pii_free: true
+    pii_note: Metrica de entrega de campanha. Sem dados de usuario. PII-free.
+    money_note: >
+      PacingDeficit e um ratio adimensional (deliveredImpressions / GoalImpressions),
+      nao um valor monetario. Nao sujeito a TX-2.
+
+  - name: pacing_deficit_bucket
+    serving_index: 13
+    type: int
+    availability: online
+    source: derived — pacing_deficit bucketizado
+    description: >
+      Versao bucketizada de pacing_deficit para o GBDT usar como feature categorica.
+      Buckets: [0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0] -> 6 buckets.
+    transformation:
+      kind: bucketize
+      boundaries: [0.1, 0.25, 0.5, 0.75, 0.9]
+      output_type: int
+    missing: 0
+    pii_free: true
+    pii_note: Derivado de pacing_deficit. PII-free.
+    money_note: n/a
+
+# ---------------------------------------------------------------------------
+# GRUPO 7 — CANDIDATO: eCPM (Remnant tier)
+# TX-2: eCPM vem de snapshot.Campaign.ECPM (Money, minor-units int64).
+# NUNCA float para o valor monetario; a normalizacao produce float32 apenas
+# para o vetor de ML — devidamente documentada abaixo.
+# DA-10: normalizacao e valida apenas dentro do mesmo asset_code/tenant.
+# ---------------------------------------------------------------------------
+
+  - name: ecpm_minor_units_log1p
+    serving_index: 14
+    type: float
+    availability: online
+    source: >
+      cascade.Candidate.ECPMMinorUnits (int64, minor-units do asset_code do tenant).
+      TX-2: o valor original e int64 minor-units (NUNCA float). A transformacao
+      log1p produz float32 APENAS para o vetor de ML — o valor monetario original
+      nao e alterado, apenas representado como feature adimensional.
+    description: >
+      log1p(ecpm_minor_units) — comprime a cauda longa de eCPM sem perder
+      discriminacao em valores baixos. Para nao-Remnant (Override/Contract) o valor
+      ECPMMinorUnits e 0, e log1p(0) = 0.0.
+      IMPORTANTE: a comparacao de eCPM para selecao de vencedor SEMPRE usa
+      int64 minor-units via money.CompareECPM (DA-10/TX-2). Esta feature e
+      apenas para o ranker ML, nao para decisoes financeiras.
+    transformation:
+      kind: log1p
+      input_type: int64  # minor-units (TX-2 compliant)
+      output_type: float32
+    missing: 0.0
+    pii_free: true
+    pii_note: eCPM de campanha, sem dados de usuario. PII-free.
+    money_note: >
+      Valor monetario de entrada em minor-units int64 (TX-2). A transformacao
+      log1p e adimensional e nao viola TX-2 pois nao usa o float como
+      representacao monetaria — e apenas uma feature de ML. O vencedor
+      financeiro e sempre determinado via money.CompareECPM (int64). DA-10:
+      normalizacao valida somente dentro do mesmo asset_code/tenant; o modelo
+      e treinado por tenant ou com asset_code como feature adicional.
+
+  - name: ecpm_tier_bucket
+    serving_index: 15
+    type: int
+    availability: online
+    source: >
+      derived — log1p(ecpm_minor_units) bucketizado em 8 faixas para uso como
+      feature categorica pelo GBDT.
+    description: >
+      Bucket de eCPM para captura de efeitos de limiar. Os limites sao em
+      escala log1p de minor-units — calibrados para BRL centavos (scale=2).
+      Revisao necessaria se asset_code mudar.
+    transformation:
+      kind: bucketize
+      boundaries: [1.0, 2.0, 3.5, 5.0, 7.0, 9.0, 11.0]
+      # Aplicado sobre log1p(ecpm_minor_units)
+      input_is_transformed: true
+      output_type: int
+    missing: 0
+    pii_free: true
+    pii_note: Derivado de eCPM. PII-free.
+    money_note: >
+      Derivado de minor-units via log1p. Nao e valor monetario; e feature
+      categorica de ML. TX-2 cumprido (valor original e int64).
+
+# ---------------------------------------------------------------------------
+# GRUPO 8 — CANDIDATO: CREATIVE (dimensoes do banner)
+# Fonte: snapshot.Banner (in-memory)
+# ---------------------------------------------------------------------------
+
+  - name: banner_width_bucket
+    serving_index: 16
+    type: int
+    availability: online
+    source: snapshot.Banner.Width (int32)
+    description: >
+      Largura do banner (criativo), bucketizada identicamente a zone_width_bucket.
+      Match de dimensoes banner/zona e sinal de qualidade de fit.
+    transformation:
+      kind: bucketize
+      boundaries: [120, 160, 200, 234, 250, 300, 320, 336, 468, 728, 970]
+      output_type: int
+    missing: 0
+    pii_free: true
+    pii_note: Dimensao de criativo. PII-free.
+    money_note: n/a
+
+  - name: banner_height_bucket
+    serving_index: 17
+    type: int
+    availability: online
+    source: snapshot.Banner.Height (int32)
+    description: Altura do banner, bucketizada identicamente a zone_height_bucket.
+    transformation:
+      kind: bucketize
+      boundaries: [50, 60, 90, 100, 250, 280, 600, 1024]
+      output_type: int
+    missing: 0
+    pii_free: true
+    pii_note: Dimensao de criativo. PII-free.
+    money_note: n/a
+
+  - name: banner_size_match
+    serving_index: 18
+    type: int
+    availability: online
+    source: >
+      derived — (banner_width_bucket == zone_width_bucket AND
+                 banner_height_bucket == zone_height_bucket) -> 1, else 0
+    description: >
+      Flag de match exato de tamanho entre banner e zona. Forte sinal de
+      compatibilidade visual (banner oversized/undersized degrada CTR).
+    transformation:
+      kind: binary_flag
+      output_type: int
+    missing: 0
+    pii_free: true
+    pii_note: Dimensao comparada de criativo e zona. PII-free.
+    money_note: n/a
+
+  - name: creative_type
+    serving_index: 19
+    type: int
+    availability: online
+    source: >
+      derived — snapshot.Banner: image=1, html=2, video=3 (baseado em qual
+      campo nao-vazio: ImageURL, HTML, VideoURL)
+    description: >
+      Tipo de criativo (enum). Captura diferenca de CTR por formato.
+      Cardinalidade baixa (3 valores), sem hashing.
+    transformation:
+      kind: enum_int
+      mapping:
+        image: 1
+        html: 2
+        video: 3
+        unknown: 0
+      output_type: int
+    missing: 0
+    pii_free: true
+    pii_note: Tipo de formato de criativo. PII-free.
+    money_note: n/a
+
+# ---------------------------------------------------------------------------
+# GRUPO 9 — CANDIDATO: COMPETICAO / DENSIDADE DE INVENTARIO
+# Fonte: cascade.Result.Candidates (tamanho do conjunto elegivel) — in-memory
+# ---------------------------------------------------------------------------
+
+  - name: candidate_count_log1p
+    serving_index: 20
+    type: float
+    availability: online
+    source: >
+      Decision.candidate_count (uint32) — tamanho real do conjunto elegivel no
+      estrato. Disponivel no hot path apos construcao de protoCandidates
+      (cascade.makeProtoCandidates).
+    description: >
+      log1p(candidate_count). Captura densidade de competicao no estrato.
+      Poucos candidatos = inventario escasso = diferenca de posicao mais
+      decisiva. Muitos candidatos = mercado competitivo.
+    transformation:
+      kind: log1p
+      input_type: uint32
+      output_type: float32
+    missing: 0.0
+    pii_free: true
+    pii_note: Contagem de candidatos no leilao. PII-free.
+    money_note: n/a
+
+# ---------------------------------------------------------------------------
+# GRUPO 10 — CAMPANHA: HISTORICO AGREGADO (online via snapshot)
+# Fonte: snapshot.Campaign — campos DeliveredImpressions/DeliveredClicks
+# carregados do stats store no momento do refresh do snapshot.
+# NOTA: estes sao contadores APROXIMADOS (nao o ledger autoritativo).
+# Usados apenas como features de ML, nunca para faturamento.
+# ---------------------------------------------------------------------------
+
+  - name: campaign_ctr_estimate
+    serving_index: 21
+    type: float
+    availability: online
+    source: >
+      derived — snapshot.Campaign.DeliveredClicks / snapshot.Campaign.DeliveredImpressions.
+      Divisao inteira segura: se DeliveredImpressions == 0, retorna 0.0.
+      Resultado em float32 [0, 1].
+    description: >
+      Estimativa de CTR historico da campanha baseada nos contadores aproximados
+      do snapshot. Sinal de qualidade historica do criativo. Atualizado a cada
+      refresh do snapshot (nao em tempo-real — ADR-0001).
+    transformation:
+      kind: ratio
+      numerator: DeliveredClicks
+      denominator: DeliveredImpressions
+      output_type: float32
+      clip: [0.0, 1.0]
+    missing: 0.0
+    pii_free: true
+    pii_note: CTR agregado da campanha. Nao vinculado a usuario. PII-free.
+    money_note: n/a
+
+  - name: campaign_delivery_ratio
+    serving_index: 22
+    type: float
+    availability: online
+    source: >
+      derived — snapshot.Campaign.DeliveredImpressions / snapshot.Campaign.GoalImpressions.
+      Para nao-Contract (GoalImpressions == 0), retorna 0.0.
+    description: >
+      Fracao de entrega da campanha (0.0 = nenhuma impressao; 1.0 = meta atingida).
+      Complementar a pacing_deficit: deficit = 1 - delivery_ratio para Contract.
+      Para Override/Remnant, valor e 0.0 (sem goal).
+    transformation:
+      kind: ratio
+      numerator: DeliveredImpressions
+      denominator: GoalImpressions
+      output_type: float32
+      clip: [0.0, 2.0]
+    missing: 0.0
+    pii_free: true
+    pii_note: Ratio de entrega de campanha. PII-free.
+    money_note: n/a
+
+# ---------------------------------------------------------------------------
+# FEATURES OFFLINE-ONLY (TREINO APENAS — NAO ONLINE-SAFE)
+# Estas features NAO entram no vetor de serving. Documentadas aqui para
+# que o pipeline de treino (J2) as inclua no dataset Iceberg mas o
+# internal/ranker (J1) nao precise carrega-las.
+# ---------------------------------------------------------------------------
+
+offline_features:
+
+  - name: label_click
+    availability: offline
+    source: >
+      JOIN Decision.decision_id com Click.envelope.decision_id no Iceberg.
+      Label binaria: 1 se houve clique atribuido a esta decisao, 0 caso contrario.
+    description: Label de CTR para treinamento do modelo pCTR.
+    offline_reason: >
+      O clique ocorre APOS a decisao (evento assincrono). Nao disponivel no
+      hot path no momento da decisao. Requer JOIN no Iceberg (batch/streaming).
+    pii_free: true
+    pii_note: Indicador binario de clique, sem PII de usuario. PII-free.
+
+  - name: propensity_logged
+    availability: offline
+    source: >
+      Decision.propensity — propensidade da acao servida sob a politica de
+      logging. Disponivel no registro de decisao no Iceberg.
+    description: >
+      Propensidade logada usada como denominador de peso em OPE (IPS/DR).
+      NUNCA deve ser 0 (violaria positividade — contrato propensity-logging.md).
+      Filtrar Decision.ml_fail_open=true antes de usar como peso de OPE.
+    offline_reason: >
+      E um campo do registro de decisao, nao do contexto de serving futuro.
+      No treino e usada para pesos de IPS; no serving o ranker produz sua
+      propria propensao a partir da politica de bandit atual.
+    pii_free: true
+    pii_note: Probabilidade de politica, sem PII. PII-free.
+
+  - name: model_version_at_decision
+    availability: offline
+    source: Decision.envelope.model_version
+    description: >
+      Versao do modelo que produziu a decisao. Necessaria para estratificacao
+      de OPE e para detectar desfasamento de feature_spec_version no dataset.
+    offline_reason: Metadado de auditoria de decisao passada. Nao e feature de contexto.
+    pii_free: true
+    pii_note: Versao de modelo. PII-free.
+
+  - name: feature_spec_version_at_decision
+    availability: offline
+    source: >
+      Gravado junto com model_version no registro de decisao (campo a adicionar
+      ao Decision proto ou como coluna do Iceberg via sidecar).
+    description: >
+      Versao da spec de features que foi usada para produzir o vetor de serving.
+      Permite ao pipeline de treino filtrar decisoes produzidas com versoes
+      incompativeis da spec.
+    offline_reason: Metadado de auditoria. Nao e feature de contexto de serving.
+    pii_free: true
+    pii_note: Versao de spec. PII-free.
+
+  - name: raw_site_url
+    availability: offline
+    source: telemetry.AdRequest.referer_url
+    description: >
+      URL da pagina hospedeira. Alta cardinalidade; nao pode ser carregada
+      in-process sem infra de lookup. No treino pode ser transformada em
+      domain_hash (murmur3 do dominio extraido da URL).
+    offline_reason: >
+      URL completa e alta cardinalidade e nao esta no snapshot in-memory.
+      O snapshot tem apenas Zone.SiteID; a URL bruta vem do evento de telemetria.
+      Exigiria lookup adicional no hot path (viola TX-4/online-safe).
+    pii_free: true
+    pii_note: >
+      URL de pagina publica do publisher (nao do usuario). Nao e PII per se,
+      mas pode conter parametros de sessao — usar apenas o dominio/path no treino.
+
+  - name: site_id_hash
+    availability: offline
+    source: telemetry.AdRequest.site_id (JOIN com Zone.SiteID no Iceberg)
+    description: >
+      Hash do site_id do publisher. Sinal de contexto editorial forte.
+      No snapshot apenas o zone_id esta disponivel (sem site_id direto).
+    offline_reason: >
+      site_id nao esta exposto diretamente no hot path de decisao (acesso e
+      via Zone.SiteID no snapshot, que esta disponivel — REVISAR: se Zone.SiteID
+      for adicionado ao lookup do hot path, esta feature pode ser promovida a online
+      numa versao MINOR futura). Por ora: offline-only.
+    pii_free: true
+    pii_note: Identificador de site do publisher. PII-free.
+
+  - name: custom_vars_json
+    availability: offline
+    source: telemetry.AdRequest.custom_vars (map<string,string>)
+    description: >
+      Variaveis first-party injetadas pelo publisher. Alta cardinalidade e
+      esquema variavel por publisher. Processamento offline via feature
+      engineering especifico por tenant.
+    offline_reason: >
+      O mapa custom_vars nao esta no snapshot in-memory (e passado no request
+      de ad tag, nao carregado do db de config). Exigiria transmissao do mapa
+      completo para o ranker, o que viola TX-4 (latencia) e a premissa de
+      zero-rede.
+    pii_free: true
+    pii_note: >
+      Dados first-party do publisher (ex.: gender=male). Tratar como potencialmente
+      sensiveis: anonimizar ou agregar antes de usar no treino. Nunca usar valores
+      brutos que possam ser PII. Revisar com privacy-compliance-auditor por tenant.
+
+# ---------------------------------------------------------------------------
+# METADADOS DA SPEC
+# ---------------------------------------------------------------------------
+
+metadata:
+  created_at: "2026-06-04"
+  authors: ["ml-optimization-engineer"]
+  objective: pCTR
+  model_family: GBDT (LightGBM / CatBoost)
+  serving_runtime: Treelite / ONNX Runtime (CPU, sidecar via Unix socket)
+  vector_length_online: 23   # indices 0..22
+  vector_dtype_serving: float32
+  hash_fn_canonical: murmur3_32
+  hash_seed_note: >
+    Seeds documentadas por feature (ver campo seed em cada feature_hash).
+    O seed DEVE ser identico em Go (internal/ranker) e Python (ml/features).
+    Usar mmh3 (Python) e github.com/spaolacci/murmur3 (Go) com seed uint32.
+  currency_note: >
+    Features monetarias usam minor-units int64 (TX-2) como entrada.
+    A transformacao para float32 e apenas para o vetor de ML.
+    Comparacoes financeiras usam sempre money.CompareECPM (int64, DA-10).
+  privacy_gate: >
+    Gate do privacy-compliance-auditor: NENHUMA feature pode derivar de PII /
+    IP bruto / identificador cross-site. O IP e descartado pelo geo.Resolver
+    antes de chegar ao ranker. Todos os campos pii_free: true acima foram
+    revisados neste documento. Features offline com custom_vars requerem
+    revisao adicional por tenant antes de uso em treino.
+  parity_test_tolerance:
+    float_abs: 1.0e-6
+    float_rationale: >
+      O vetor e float32 (ONNX/Treelite). Ruido de cast float32->float64 e ~1.19e-7.
+      1e-6 captura bugs reais (log1p errado, seed errado) e absorve ruido de cast.
+    int_exact: true
+    string_exact: true
