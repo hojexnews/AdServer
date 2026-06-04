@@ -1,0 +1,50 @@
+# Egress do servico payments para o OpenBao/Vault Agent na celula PCI (ADR-0004 §F / K4).
+#
+# O Vault Agent (sidecar) roda no mesmo Pod que o container payments.
+# Ele busca segredos do OpenBao (STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET)
+# via loopback (127.0.0.1) — portanto nao requer policy de rede
+# separada entre pods.
+#
+# Esta policy cobre o caso em que o servico payments precisa de renovacao
+# de token ou lease direto contra o OpenBao server fora do Pod (ex.:
+# renovacao de token de autenticacao Kubernetes, revogacao de lease).
+# O OpenBao server roda no namespace platform-system.
+#
+# Porta 8200: porta padrao do OpenBao/Vault.
+# Porta 8201: porta de cluster do OpenBao (replication/HA) — incluida
+#             para cobrir topologias de HA sem necessidade de nova policy.
+#
+# O Vault Agent injeta os segredos como arquivos em /vault/secrets/
+# dentro do Pod. O container payments le do filesystem — nunca de
+# variaveis de ambiente estaticas nem de Kubernetes Secrets (K8s Secret
+# estatico = dado em etcd, fora do controle do OpenBao).
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-egress-openbao
+  namespace: pci
+  labels:
+    adserver.hojex/cell: pci
+    adserver.hojex/compliance: pci-saq-a
+    adserver.hojex/phase: fase-3-k4
+    adserver.hojex/owner: platform-infra-engineer
+    adserver.hojex/audit: qsa-validavel
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: payments
+      adserver.hojex/cell: pci
+
+  egress:
+    # Egress para OpenBao server no namespace platform-system.
+    - toEndpoints:
+        - matchLabels:
+            io.kubernetes.pod.namespace: platform-system
+            app.kubernetes.io/name: openbao
+      toPorts:
+        - ports:
+            - port: "8200"
+              protocol: TCP
+            - port: "8201"
+              protocol: TCP

@@ -1,0 +1,85 @@
+# Egress allowlist Stripe para a celula PCI (ADR-0004 §F / K4).
+#
+# Destinos liberados (minimo SAQ-A):
+#
+#   1. api.stripe.com:443
+#      Motivo: Payment Intents API, Billing, Tax — operacoes de backend
+#      do servico payments dentro desta celula. O cartao NUNCA transita
+#      aqui (tokenizacao e client-side via Elements/Checkout); o backend
+#      recebe apenas PaymentIntent IDs e tokens de cartao (pm_*).
+#
+#   2. hooks.stripe.com:443
+#      Motivo: endpoint de entrega de webhooks do Stripe (Stripe conecta
+#      para ca — ver allow-ingress-stripe-webhook.yaml para o ingress
+#      correspondente). Alem de receber, o servico pode confirmar
+#      entrega via HTTPS de retorno (alguns SDKs e designs fazem
+#      verificacao de payload por chamada de volta).
+#      Nota: o trafico de entrada de webhooks e tratado no ingress;
+#      este FQDN e listado aqui por precaucao de SDK (verificacao de
+#      assinatura por callback). Se o SDK nao usar, esta regra pode ser
+#      removida sem impacto funcional — listada explicitamente para o QSA.
+#
+#   3. files.stripe.com:443
+#      Motivo: Stripe Tax e Billing geram PDFs/boletos/recibos via esse
+#      endpoint. O servico de pagamentos pode precisar buscar PDFs para
+#      enviar ao anunciante (ex.: NF eletronica de pagamento de campanha).
+#
+# Destinos NAO liberados (justificativa para o QSA):
+#   - Qualquer outro FQDN da internet: BLOQUEADO. Nao ha egress generico.
+#   - Namespaces delivery, ml, data, aml-kyc: BLOQUEADO (deny-all base).
+#     O hot path de delivery nunca chama a celula PCI.
+#   - dashboard.stripe.com: nao e acessado pelo backend; acesso humano
+#     e fora do cluster (navegador do operador).
+#
+# Implementacao: CiliumNetworkPolicy com toFQDNs — requer Cilium DNS proxy
+# ativo (--enable-l7-proxy=true, padrao no Cilium >=1.14). O DNS ja e
+# resolvido pela regra allow-dns.yaml (K0). O Cilium verifica identidade
+# do FQDN em runtime via SNI/TLS.
+#
+# Seletores: aplica-se apenas ao ServiceAccount payments (label
+# app.kubernetes.io/name: payments) para escopo minimo. Se a celula PCI
+# eventualmente hospedar mais de um workload, criar policies separadas
+# por selector — nunca usar endpointSelector vazio (que aplicaria a todos
+# os endpoints) nesta policy de egress externo.
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-egress-stripe
+  namespace: pci
+  labels:
+    adserver.hojex/cell: pci
+    adserver.hojex/compliance: pci-saq-a
+    adserver.hojex/phase: fase-3-k4
+    adserver.hojex/owner: platform-infra-engineer
+    adserver.hojex/audit: qsa-validavel
+spec:
+  # Aplica somente ao workload de payments dentro da celula PCI.
+  # Usar label explicitico, nao endpointSelector vazio, para escopo minimo.
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: payments
+      adserver.hojex/cell: pci
+
+  egress:
+    # --- 1. api.stripe.com:443 (Payment Intents / Billing / Tax) ----------
+    - toFQDNs:
+        - matchName: "api.stripe.com"
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+    # --- 2. hooks.stripe.com:443 (callback/verificacao de webhook SDK) ----
+    - toFQDNs:
+        - matchName: "hooks.stripe.com"
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+    # --- 3. files.stripe.com:443 (Stripe Tax / Billing PDFs) --------------
+    - toFQDNs:
+        - matchName: "files.stripe.com"
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP

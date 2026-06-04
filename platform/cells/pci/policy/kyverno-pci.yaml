@@ -1,0 +1,158 @@
+# Kyverno — policies especificas da celula PCI (ADR-0004 §F / K4).
+#
+# Complementam o ClusterPolicy baseline (platform/k8s/policy/kyverno-baseline.yaml)
+# com controles adicionais exigidos pelo escopo PCI SAQ-A:
+#
+#   1. proibir-secret-estatico-pci: nenhum Pod no namespace pci pode
+#      montar um Kubernetes Secret via envFrom[].secretRef ou
+#      env[].valueFrom.secretKeyRef. Segredos entram SOMENTE via
+#      Vault Agent (/vault/secrets/). Gate estrutural que impede
+#      o engenheiro de services/payments de acidentalmente usar K8s Secret.
+#
+#   2. exigir-vault-agent-pci: todo Pod no namespace pci DEVE ter a
+#      anotacao vault.hashicorp.com/agent-inject="true". Sem essa
+#      anotacao, o Pod nao tem como obter STRIPE_SECRET_KEY/WEBHOOK_SECRET
+#      de forma auditavel — e deve ser rejeitado.
+#
+#   3. proibir-rotas-hot-path-pci: garante que nenhum Pod do namespace
+#      pci tem labels que o identificariam como parte do hot path
+#      (adserver.hojex/cell: delivery). Linha de defesa contra
+#      misconfiguracao de label que criaria rota implicita.
+#
+# Escopo: namespace pci (Policy, nao ClusterPolicy) para isolamento.
+# validationFailureAction: Enforce — rejeita no admission, nao apenas
+# audita. Em conformidade com PCI DSS req. 7/8 (controle de acesso).
+---
+apiVersion: kyverno.io/v1
+kind: Policy
+metadata:
+  name: proibir-secret-estatico-pci
+  namespace: pci
+  labels:
+    adserver.hojex/cell: pci
+    adserver.hojex/compliance: pci-saq-a
+    adserver.hojex/phase: fase-3-k4
+    adserver.hojex/owner: platform-infra-engineer
+  annotations:
+    policies.kyverno.io/title: "PCI: proibir Kubernetes Secret estatico"
+    policies.kyverno.io/description: >
+      Na celula PCI, segredos (STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET) entram
+      somente via Vault Agent (/vault/secrets/). Montar K8s Secret via envFrom
+      ou env[].valueFrom.secretKeyRef e proibido — violaria o controle de
+      auditoria do OpenBao e exporia o segredo no etcd do cluster.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: proibir-envfrom-secretref
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [pci]
+      validate:
+        message: >
+          [PCI SAQ-A] Proibido envFrom[].secretRef na celula pci.
+          Use Vault Agent (/vault/secrets/) para STRIPE_SECRET_KEY e STRIPE_WEBHOOK_SECRET.
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.spec.containers[].envFrom[].secretRef | length(@) }}"
+                operator: GreaterThan
+                value: "0"
+              - key: "{{ request.object.spec.initContainers[].envFrom[].secretRef | length(@) }}"
+                operator: GreaterThan
+                value: "0"
+
+    - name: proibir-env-secretkeyref
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [pci]
+      validate:
+        message: >
+          [PCI SAQ-A] Proibido env[].valueFrom.secretKeyRef na celula pci.
+          Use Vault Agent (/vault/secrets/) para STRIPE_SECRET_KEY e STRIPE_WEBHOOK_SECRET.
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.spec.containers[].env[].valueFrom.secretKeyRef | length(@) }}"
+                operator: GreaterThan
+                value: "0"
+---
+apiVersion: kyverno.io/v1
+kind: Policy
+metadata:
+  name: exigir-vault-agent-pci
+  namespace: pci
+  labels:
+    adserver.hojex/cell: pci
+    adserver.hojex/compliance: pci-saq-a
+    adserver.hojex/phase: fase-3-k4
+    adserver.hojex/owner: platform-infra-engineer
+  annotations:
+    policies.kyverno.io/title: "PCI: exigir anotacao Vault Agent"
+    policies.kyverno.io/description: >
+      Todo Pod na celula pci deve ter vault.hashicorp.com/agent-inject="true".
+      Sem essa anotacao, o Pod nao tem como buscar segredos do OpenBao e seria
+      necessario um K8s Secret — o que e proibido pela policy acima.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: exigir-vault-agent-inject
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [pci]
+      validate:
+        message: >
+          [PCI SAQ-A] Todo Pod na celula pci deve ter a anotacao
+          vault.hashicorp.com/agent-inject: "true". Segredos entram
+          exclusivamente via Vault Agent (/vault/secrets/).
+        pattern:
+          metadata:
+            annotations:
+              vault.hashicorp.com/agent-inject: "true"
+              vault.hashicorp.com/role: "pci-payments"
+---
+apiVersion: kyverno.io/v1
+kind: Policy
+metadata:
+  name: proibir-label-delivery-em-pci
+  namespace: pci
+  labels:
+    adserver.hojex/cell: pci
+    adserver.hojex/compliance: pci-saq-a
+    adserver.hojex/phase: fase-3-k4
+    adserver.hojex/owner: platform-infra-engineer
+  annotations:
+    policies.kyverno.io/title: "PCI: proibir label de hot-path na celula PCI"
+    policies.kyverno.io/description: >
+      Nenhum Pod na celula pci pode ter adserver.hojex/cell=delivery. Impede
+      misconfiguracao de label que criaria rota implicita entre o hot path e
+      a celula PCI (invariante ADR-0004 §F: hot path intocado).
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: proibir-cell-delivery
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [pci]
+      validate:
+        message: >
+          [PCI SAQ-A] Pod na celula pci nao pode ter label
+          adserver.hojex/cell=delivery. O hot path (delivery) nao tem
+          acesso a celula PCI — misconfiguracao de label seria uma violacao
+          de fronteira de conformidade.
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.metadata.labels.\"adserver.hojex/cell\" }}"
+                operator: Equals
+                value: "delivery"

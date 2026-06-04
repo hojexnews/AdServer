@@ -1,0 +1,70 @@
+# Gateway API — HTTPRoute para o endpoint de webhook do Stripe (ADR-0004 §F / K4).
+#
+# Restricoes de roteamento (SAQ-A / QSA):
+#   - Path exato: /webhooks/stripe — nenhuma outra rota exposta publicamente
+#     para a celula PCI.
+#   - Metodo: POST (webhooks do Stripe sao sempre POST).
+#   - O header Stripe-Signature deve estar presente (validacao feita no
+#     servico payments apos o roteamento; o Envoy nao valida HMAC).
+#   - TLS termina no Envoy Gateway / Cloudflare. O backend recebe HTTP
+#     simples na porta 8080 (comunicacao intra-cluster).
+#
+# Por que Gateway API e nao Ingress:
+#   O ADR-0004 §2.7 adota Gateway API (Envoy Gateway). O HTTPRoute e o
+#   objeto nativo de roteamento L7 no Gateway API v1 (GA desde Kubernetes
+#   1.28). Nao usamos Ingress do tipo kubernetes.io/ingress-class.
+#
+# GatewayClass / Gateway: referencia o Gateway 'platform-gateway' no
+# namespace platform-system (criado pelo Helm do Envoy Gateway via Tofu).
+# O parentRef abaixo e o unico ponto de entrada HTTP/HTTPS para esta celula.
+#
+# IMPORTANTE: nenhuma outra rota deve apontar de/para o namespace pci
+# exceto esta. O security-reviewer valida ausencia de outras rotas.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: stripe-webhook
+  namespace: pci
+  labels:
+    adserver.hojex/cell: pci
+    adserver.hojex/compliance: pci-saq-a
+    adserver.hojex/phase: fase-3-k4
+    adserver.hojex/owner: platform-infra-engineer
+    adserver.hojex/audit: qsa-validavel
+  annotations:
+    adserver.hojex/scope: >
+      Unica rota exposta para a celula PCI. Apenas POST /webhooks/stripe.
+      Assinatura validada pelo servico (STRIPE_WEBHOOK_SECRET via OpenBao).
+spec:
+  parentRefs:
+    # Referencia o Gateway compartilhado da plataforma (Envoy Gateway,
+    # namespace platform-system). O 'sectionName' restringe a porta HTTPS.
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: platform-gateway
+      namespace: platform-system
+      sectionName: https
+
+  # Hostname publico para esta celula. Substituir pelo DNS real no apply.
+  # Ex.: payments.hojexnews.com.br ou stripe-hooks.hojexnews.com.br.
+  hostnames:
+    - "payments.hojexnews.com.br"  # PLACEHOLDER: substituir no apply
+
+  rules:
+    - matches:
+        - path:
+            type: Exact
+            value: /webhooks/stripe
+          method: POST
+      backendRefs:
+        - name: payments
+          namespace: pci
+          port: 8080
+      filters:
+        # Timeout: webhooks do Stripe tem timeout de 30s na entrega.
+        # Processar em async (enfileirar internamente) para responder 200
+        # antes do timeout do Stripe.
+        - type: RequestTimeout
+          requestTimeout:
+            request: 25s

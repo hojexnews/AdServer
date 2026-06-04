@@ -26,11 +26,17 @@ type response struct {
 	Rails []string `json:"rails,omitempty"`
 }
 
+// RailChecker e uma funcao que verifica se um trilho esta saudavel.
+// Retorna nil se o trilho esta operacional.
+type RailChecker func() error
+
 // Handler retorna um http.Handler para o endpoint /healthz.
 //
-// Recebe a Config para refletir o estado real do servico.
-// Nao faz chamadas de rede — resposta puramente em memoria (K0).
-func Handler(cfg config.Config) http.Handler {
+// railCheckers e um mapa opcional de nome-do-trilho -> funcao de health check.
+// K4 injeta: "stripe" -> stripe.Healthy, "asaas_pix" -> asaas.Healthy,
+// "mercadopago" -> mp.Healthy (todos no formato func() error).
+// Se railCheckers for nil (K0 scaffolding), a resposta indica servico sem trilhos.
+func Handler(cfg config.Config, railCheckers map[string]RailChecker) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		resp := response{
 			Enabled:   cfg.Enabled,
@@ -46,8 +52,13 @@ func Handler(cfg config.Config) http.Handler {
 			return
 		}
 
-		// K0: scaffolding — nenhum trilho ativo ainda.
-		// K4 adiciona "stripe", "asaas_pix"; K5 adiciona "safe_multisig".
+		// Verifica trilhos registrados (K4+).
+		for name, check := range railCheckers {
+			if check() == nil {
+				resp.Rails = append(resp.Rails, name)
+			}
+		}
+
 		resp.Status = "ok"
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)

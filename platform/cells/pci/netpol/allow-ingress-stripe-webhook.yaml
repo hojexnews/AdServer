@@ -1,0 +1,61 @@
+# Ingress para o endpoint de webhook do Stripe (ADR-0004 §F / K4).
+#
+# Modelo de entrada: o Stripe envia eventos (payment_intent.succeeded,
+# charge.refunded, etc.) para o endpoint /webhooks/stripe do servico
+# payments. Este ingress e restrito ao necessario para SAQ-A:
+#
+#   Origem aceita: trafego que chega via Gateway API (Envoy Gateway) no
+#   namespace platform-system. O Stripe envia para o hostname publico;
+#   o Cloudflare (CDN/TLS termination) entrega ao Envoy Gateway, que
+#   roteia para o servico payments na celula PCI.
+#
+#   Porta: 8080 (HTTP interno; TLS termina no Envoy/Cloudflare).
+#
+#   Path esperado pelo servico: /webhooks/stripe (o HTTPRoute abaixo
+#   restringe; o Cilium nao faz matching de path L7 nesta policy, mas
+#   o Envoy Gateway faz antes de entregar).
+#
+# O que NAO e permitido:
+#   - Ingress direto de qualquer outro namespace (delivery, ml, data,
+#     aml-kyc): BLOQUEADO. O hot path nunca chama a celula PCI.
+#   - Ingress da internet direta (sem passar pelo Envoy/Cloudflare):
+#     BLOQUEADO — o Cloudflare e o unico ponto de entrada TLS.
+#   - Ingress de outros pods dentro do namespace pci (exceto o proprio
+#     Gateway, que entra por este seletor): controlado pelo default-deny.
+#
+# Verificacao de assinatura do webhook:
+#   O servico payments DEVE validar o header Stripe-Signature usando
+#   STRIPE_WEBHOOK_SECRET (referenciado via OpenBao — ver secrets/).
+#   Nenhum evento e processado sem validacao de assinatura HMAC-SHA256.
+#   Isso e controle de aplicacao, nao de rede; documentado aqui para
+#   o QSA saber onde encontrar o controle.
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-ingress-stripe-webhook
+  namespace: pci
+  labels:
+    adserver.hojex/cell: pci
+    adserver.hojex/compliance: pci-saq-a
+    adserver.hojex/phase: fase-3-k4
+    adserver.hojex/owner: platform-infra-engineer
+    adserver.hojex/audit: qsa-validavel
+spec:
+  # Aplica somente ao workload de payments dentro da celula PCI.
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: payments
+      adserver.hojex/cell: pci
+
+  ingress:
+    # Permite entrada apenas do Envoy Gateway (namespace platform-system).
+    # O Envoy Gateway e o unico intermediario entre a internet e este pod.
+    - fromEndpoints:
+        - matchLabels:
+            io.kubernetes.pod.namespace: platform-system
+            app.kubernetes.io/name: envoy-gateway
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
