@@ -270,9 +270,11 @@ PostgreSQL → `set_config` parametrizado em transação — **+ HIGH-1** (valid
 tráfego real** — o código está pronto desde K1 (flag default-off); a promoção espera o
 número de uplift sobre o GBDT, que depende do cutover de infra da Fase 2. A **habilitação
 de AEV/BND** segue **gated pela spec de produto** (`scale`/classificação/supply — CHECK
-estrutural impede habilitar sem `scale`). **Pré-condições de go-live** dos trilhos vivos:
-chaves reais via OpenBao, cifra KMS-envelope das colunas de PII do Travel Rule antes de
-popular nomes, FQDNs reais das células, e o adapter Postgres real do BFF de pagamentos.
+estrutural impede habilitar sem `scale`). **Pré-condições de go-live** restantes são
+**só de infra/spec viva** (a camada de código está pronta — ver hardening acima): chaves
+reais via OpenBao, **KMS/HSM real** para a chave do envelope de PII (a cifra e seu
+versionamento já existem), FQDNs reais das células, e Triton/GPU + Fireblocks sob seus
+gatilhos mensuráveis.
 
 ---
 
