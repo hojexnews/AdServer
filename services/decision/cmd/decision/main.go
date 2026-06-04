@@ -175,12 +175,73 @@ type decisionHandler struct {
 	//
 	//  3. RANKER_ENABLED=true, ranker scored successfully (even with dummy model):
 	//     Decision.MlFailOpen = false
-	//     Decision.ExplorationPolicy = EPSILON_GREEDY (or the active bandit; DETERMINISTIC for J1 stub)
+	//     Decision.ExplorationPolicy = EPSILON_GREEDY (or the active bandit)
 	//     Decision.Envelope.ModelVersion = "stub-j1" (or the real version from J2)
 	//     Per-candidate scores filled in Candidates[].Score.
 	//     Semantics: "ranker active, order may differ from cascade pure order".
 	//     With the J1 dummy model, all scores = 0 and order is preserved (no net change).
+	// Used in the legacy RANKER_ENABLED single-arm path (no A/B).
+	// In J4 A/B mode, banditRanker is used for treatment instead.
 	mlRanker *mlranker.MLRanker
+
+	// shadowRanker is the shadow ranker (Fase 2 / J3, SHADOW_ENABLED).
+	// nil when SHADOW_ENABLED=false (default — no shadow overhead).
+	//
+	// When non-nil, shadowRanker wraps an MLRanker. The served order is ALWAYS
+	// the deterministic cascade order (DA-3 invariant). The shadow ranker runs
+	// the ML ranker on a copy of the candidates and logs what it WOULD have served
+	// without altering the actual served order (TX-4: fire-and-forget, non-blocking).
+	//
+	// SetRequestContext must be called once per request (before cascade.Decide)
+	// to attach decision_id and zone_id to the shadow record (PII-free: TX-5/DA-11).
+	//
+	// SHADOW_ENABLED=true and RANKER_ENABLED=false is the nominal J3 mode:
+	//   - Served: cascade pure order (deterministic).
+	//   - Logged: what ML would have served (for OPE training data).
+	//
+	// RANKER_ENABLED=true takes precedence (J4+): ML serves; shadow is redundant
+	// but harmless if both flags are set simultaneously (uncommon in practice).
+	shadowRanker *mlranker.ShadowRanker
+
+	// --- J4: A/B routing, revenue guard, bandit exposure ---
+
+	// abRouter manages deterministic A/B assignment by (zone_id, tenant_id).
+	// nil when AB_ENABLED=false (default). When non-nil, every request is
+	// assigned to either control (cascade pure) or treatment (ML re-ranker +
+	// bandit) before the cascade runs. The kill-switch can be activated manually
+	// (AB_KILL_SWITCH env or operator call) or automatically by the revenue guard.
+	//
+	// Treatment path (abDecision.IsControl()==false):
+	//   - banditRanker re-ranks candidates within the winning stratum (DA-3 preserved)
+	//     using ML scores + bandit exploration.
+	//   - propensity and exploration_policy are filled from banditRanker.LastResult().
+	//
+	// Control path (abDecision.IsControl()==true) or AB_ENABLED=false:
+	//   - Pure cascade (DefaultRanker), propensity=1.0, DETERMINISTIC.
+	//   - Bit-identical to the Fase 1 baseline (parity golden tests always green).
+	//
+	// Fail-safe (fail-open): any doubt → cascade pure. The kill-switch forces all
+	// traffic to control; banditRanker fail-open degrades to cascade pure order.
+	abRouter *mlranker.ABRouter
+
+	// banditRanker wraps MLRanker + ExploreRank for the J4 treatment arm.
+	// nil when abRouter is nil (J4 AB disabled). When non-nil:
+	//   - The treatment cascade engine (`cascade`) has banditRanker wired as its Ranker.
+	//   - banditRanker.WithConfig() is called per request with ABDecision.BanditCfg.
+	//   - banditRanker.LastResult() provides propensity / policy / epsilon for the Decision log.
+	// Not used in control path; the control cascade engine (`cascadePure`) uses DefaultRanker.
+	banditRanker *mlranker.BanditRanker
+
+	// revenueGuard monitors eCPM treatment vs control in minor-units (TX-2)
+	// and auto-activates the kill-switch when treatment is materially worse.
+	// nil when abRouter is nil (guard is pointless without A/B).
+	revenueGuard *mlranker.RevenueGuard
+
+	// cascadePure is a second cascade engine with NO ranker (DefaultRanker).
+	// Used by the control arm in A/B mode to guarantee bit-identical output to
+	// the pure cascade regardless of what ranker is wired in the treatment engine.
+	// nil when abRouter is nil (in that case `cascade` is always the pure cascade).
+	cascadePure *cascade.Engine
 }
 
 func (h *decisionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -244,34 +305,117 @@ func (h *decisionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		RequestTime: now,
 	}
 
-	result := h.cascade.Decide(cascadeReq, snap)
+	// Shadow ranker context (J3): must be set BEFORE cascade.Decide so that the
+	// ShadowRanker.Rank call (which runs inside Decide) attaches the correct
+	// decision_id and zone_id to the ShadowRecord.
+	// No-op when SHADOW_ENABLED=false (shadowRanker == nil).
+	// PII-free: only decision_id (ULID pseudonym) and zone_id (placement, not user).
+	if h.shadowRanker != nil {
+		h.shadowRanker.SetRequestContext(decisionID, req.ZoneID)
+	}
 
-	// Determine ML ranker metadata AFTER the cascade result.
+	// J4: A/B assignment — determines whether this request uses control (pure cascade)
+	// or treatment (MLRanker + bandit exploration, wired in banditRanker).
 	//
-	// When RANKER_ENABLED=true, the cascade already ran the ML re-ranker
-	// (via cascade.WithRanker). We now read the RankResult from the ranker
-	// to propagate ml_fail_open, model_version, and per-candidate scores.
+	// Fail-safe: kill-switch or nil abRouter → always control.
+	var abAssignment *mlranker.ABDecision
+	if h.abRouter != nil {
+		d := h.abRouter.Assign(req.ZoneID, tenantID)
+		abAssignment = &d
+	}
+
+	// Choose cascade engine and update the bandit config for this request.
+	//   - treatment: `cascade` engine (banditRanker wired); update bandit config.
+	//   - control / AB disabled: `cascadePure` engine (DefaultRanker) OR `cascade`
+	//     when cascadePure is nil (legacy RANKER_ENABLED path without A/B).
+	activeCascade := h.cascade
+	inTreatment := false
+	if h.abRouter != nil {
+		if abAssignment != nil && !abAssignment.IsControl() {
+			inTreatment = true
+			// Update the bandit config per request (epsilon may change over time).
+			if h.banditRanker != nil {
+				h.banditRanker.WithConfig(abAssignment.BanditCfg)
+			}
+			activeCascade = h.cascade // treatment: banditRanker wired in
+		} else {
+			// Control: pure cascade (DefaultRanker), no ML.
+			if h.cascadePure != nil {
+				activeCascade = h.cascadePure
+			}
+		}
+	}
+
+	result := activeCascade.Decide(cascadeReq, snap)
+
+	// Determine ML/bandit metadata from the ranker that ran during this Decide call.
 	//
-	// States (documented in the mlRanker field comment):
-	//  - mlRanker == nil (RANKER_ENABLED=false): pure cascade, MlFailOpen=false.
-	//  - mlRanker != nil, FailOpen=true: ranker attempted, timed out / IPC error.
-	//  - mlRanker != nil, FailOpen=false: ranker scored successfully.
-	//    With J1 dummy model: scores=0, order unchanged, but MlFailOpen=false.
+	// Four operating modes:
+	//  A. Legacy RANKER_ENABLED (no A/B): read from h.mlRanker.LastResult().
+	//  B. J4 A/B treatment: read from h.banditRanker.LastResult()
+	//     (which includes both ML scores and bandit exploration result).
+	//  C. J4 A/B control: no ML ran; deterministic defaults.
+	//  D. RANKER_ENABLED=false AND A/B disabled: deterministic defaults.
 	mlFailOpen := false
 	mlModelVersion := ""
-	if h.mlRanker != nil {
+	propensity := 1.0                                                                    //nolint:forbidigo // default deterministic
+	explorationPolicy := decisionv1.ExplorationPolicy_EXPLORATION_POLICY_DETERMINISTIC
+	epsilonLogged := float64(0) //nolint:forbidigo // ML hyperparameter, not money
+
+	switch {
+	case h.abRouter != nil && inTreatment && h.banditRanker != nil:
+		// J4 treatment arm: read from BanditRanker (ML scores + bandit exploration).
+		br := h.banditRanker.LastResult()
+		mlFailOpen = br.RankResult.FailOpen
+		mlModelVersion = br.RankResult.ModelVersion
+		if !br.RankResult.FailOpen {
+			// Bandit ran successfully.
+			propensity = br.ExploreResult.Propensity //nolint:forbidigo // ML probability
+			epsilonLogged = br.ExploreResult.Epsilon //nolint:forbidigo // ML hyperparameter
+			// Fill per-candidate scores.
+			if len(br.RankResult.Scores) == len(result.Candidates) {
+				for i, pc := range result.Candidates {
+					pc.Score = float64(br.RankResult.Scores[i]) //nolint:forbidigo // ML signal, not money
+				}
+			}
+			// Set exploration policy based on bandit config.
+			if abAssignment != nil && abAssignment.BanditCfg.BanditEnabled {
+				switch abAssignment.BanditCfg.Policy {
+				case mlranker.BanditPolicyThompson:
+					explorationPolicy = decisionv1.ExplorationPolicy_EXPLORATION_POLICY_THOMPSON
+				default:
+					explorationPolicy = decisionv1.ExplorationPolicy_EXPLORATION_POLICY_EPSILON_GREEDY
+				}
+			}
+		}
+		// If fail-open: propensity stays 1.0, policy stays DETERMINISTIC (already set).
+
+	case h.mlRanker != nil && h.abRouter == nil:
+		// Legacy RANKER_ENABLED path (no A/B): read from bare MLRanker.
 		rankRes := h.mlRanker.LastResult()
 		mlFailOpen = rankRes.FailOpen
 		mlModelVersion = rankRes.ModelVersion
-
-		// Overwrite per-candidate Score with ML score (even if 0 for dummy model).
-		// The score field in Candidates[] is the ML signal, not the deterministic key.
-		// With the dummy model all scores are 0; with the real model (J2) they are pCTR.
 		if !rankRes.FailOpen && len(rankRes.Scores) == len(result.Candidates) {
 			for i, pc := range result.Candidates {
-				pc.Score = float64(rankRes.Scores[i]) //nolint:forbidigo // ML ranking signal, not money
+				pc.Score = float64(rankRes.Scores[i]) //nolint:forbidigo // ML signal, not money
 			}
 		}
+		// Legacy path: DETERMINISTIC policy (J1 stub had no bandit; J3 shadow-only).
+		// Propensity = 1.0. If fail-open: propensity stays 1.0 (already set above).
+	}
+
+	// J4: Observe eCPM in revenue guard (fire-and-forget, non-blocking).
+	// TX-2: eCPM is int64 minor-units; never float for money.
+	if h.revenueGuard != nil && abAssignment != nil {
+		ecpmMinorUnits := int64(0)
+		if result.Campaign != nil && result.Campaign.ECPM != nil {
+			ecpmMinorUnits = result.Campaign.ECPM.Amount
+		}
+		arm := mlranker.ABArmControl
+		if inTreatment {
+			arm = mlranker.ABArmTreatment
+		}
+		h.revenueGuard.Observe(arm, ecpmMinorUnits)
 	}
 
 	// Build the Decision log entry (TX-1).
@@ -287,40 +431,21 @@ func (h *decisionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Source:        "delivery-decision",
 	}
 
-	// Exploration policy:
-	//  - RANKER_ENABLED=false OR fail-open: DETERMINISTIC (cascade pure order).
-	//  - RANKER_ENABLED=true, scored: DETERMINISTIC for J1 stub (epsilon=0).
-	//    J3+ will set EPSILON_GREEDY / THOMPSON / LINUCB and fill Epsilon.
-	explorationPolicy := decisionv1.ExplorationPolicy_EXPLORATION_POLICY_DETERMINISTIC
-	if h.mlRanker != nil && !mlFailOpen {
-		// Ranker scored successfully. In J1 the stub always uses DETERMINISTIC
-		// (no exploration — dummy scores are all equal, no real bandit yet).
-		// J3 will change this to EPSILON_GREEDY / THOMPSON based on config.
-		explorationPolicy = decisionv1.ExplorationPolicy_EXPLORATION_POLICY_DETERMINISTIC
-	}
-
 	decision := &decisionv1.Decision{
-		Envelope:   envelope,
-		ZoneId:     req.ZoneID,
-		ServedTier: result.ServedTier,
-		// Propensity = 1.0 under DETERMINISTIC policy (both pure cascade and J1 stub).
-		// The cascade (or the dummy ranker with all-zero scores + stable sort)
-		// deterministically selects the top-ranked eligible candidate, so
-		// P(action | context, policy) = 1.0. Correct OPE baseline for J3.
-		// J3+ will replace this with the bandit propensity when exploration is active.
-		Propensity:        1.0,
+		Envelope:          envelope,
+		ZoneId:            req.ZoneID,
+		ServedTier:        result.ServedTier,
+		Propensity:        propensity,        //nolint:forbidigo // ML probability ∈ (0,1]
 		ExplorationPolicy: explorationPolicy,
-		Epsilon:           0, // no random exploration in J1
+		Epsilon:           epsilonLogged,     //nolint:forbidigo // ML hyperparameter
 		Candidates:        result.Candidates,
-		// CandidateCount carries the true set size for density/competition signals
-		// even if the Candidates slice is truncated in future increments.
+		// CandidateCount carries the true set size for density/competition signals.
 		CandidateCount: uint32(len(result.Candidates)),
 		// MlFailOpen:
-		//  false when RANKER_ENABLED=false (state 1 — ranker not attempted).
-		//  true  when RANKER_ENABLED=true but timed out / IPC error (state 2).
-		//  false when RANKER_ENABLED=true and scored OK (state 3 — even dummy model).
-		// OPE consumers MUST filter out ml_fail_open=true decisions (propensity is
-		// meaningless when the ranker fell back to cascade order without scoring).
+		//  false when ranker not attempted (control, AB disabled, RANKER_ENABLED=false).
+		//  true  when ranker tried but timed out / IPC error (treatment fail-open).
+		//  false when ranker scored OK (treatment arm with valid scores).
+		// OPE consumers MUST filter out ml_fail_open=true decisions.
 		MlFailOpen: mlFailOpen,
 	}
 
@@ -541,7 +666,217 @@ func main() {
 		logger.Info("ML ranker: DISABLED (RANKER_ENABLED not set or false); using cascade DefaultRanker")
 	}
 
+	// ---------------------------------------------------------------------------
+	// Shadow ranker (Fase 2 / J3): SHADOW_ENABLED controls whether the
+	// ShadowRanker is active.  Default: false (DISABLED, zero overhead).
+	//
+	// When SHADOW_ENABLED=true:
+	//   - A fresh MLRanker is instantiated to score candidates (SHADOW_SOCKET_PATH,
+	//     SHADOW_BUDGET_MS, SHADOW_MODEL_VERSION — independent of the RANKER_*
+	//     counterparts so both can be tuned separately).
+	//   - The ShadowRanker wraps that MLRanker: it runs ML scoring on a COPY of the
+	//     candidate slice, records the result to a ChannelSink (non-blocking, buffered
+	//     4096 entries), and returns the ORIGINAL unmodified cascade order to the
+	//     cascade engine (DA-3 invariant: served order is NEVER changed by shadow).
+	//   - A background goroutine drains the ChannelSink and emits each ShadowRecord
+	//     as a structured slog line (PII-free: only decision_id, zone_id, campaign IDs,
+	//     model_version, scores — TX-5/DA-11).  The drain runs until ctx is cancelled.
+	//   - Sink overflow (channel full) drops the record silently — the hot path is
+	//     NEVER blocked (TX-4).  Drain failure never affects the served decision.
+	//
+	// When SHADOW_ENABLED=false (default):
+	//   - activeShadowRanker is nil.  The decisionHandler skips SetRequestContext.
+	//   - No MLRanker is instantiated, no goroutine is started, no memory overhead.
+	//   - The cascade engine uses DefaultRanker (or the ML ranker if RANKER_ENABLED).
+	//   - All golden tests remain green (cascata pura, invariant DA-3 preserved).
+	//
+	// Interaction with RANKER_ENABLED:
+	//   - (a) both OFF  → pure cascade (production default).
+	//   - (b) SHADOW=true, RANKER=false → served=cascade, shadow logs ML order.
+	//   - (c) RANKER=true → ML serves; SHADOW_ENABLED is independent and additive.
+	//   Note: when RANKER_ENABLED=true, the cascade.WithRanker call above already
+	//   wires the ML ranker for serving.  Adding SHADOW_ENABLED=true simultaneously
+	//   would wrap a second independent MLRanker in ShadowRanker — unusual but safe.
+	//   The recommended J3 mode is (b): RANKER=false, SHADOW=true.
+	// ---------------------------------------------------------------------------
+	var activeShadowRanker *mlranker.ShadowRanker
+	// shadowChannelSink is non-nil only when SHADOW_ENABLED=true.  It is declared
+	// at this scope so the drain goroutine (started after ctx is ready) can read it.
+	var shadowChannelSink *mlranker.ChannelSink
+
+	shadowEnabled := os.Getenv("SHADOW_ENABLED") == "true"
+	if shadowEnabled {
+		shadowSocket := envOr("SHADOW_SOCKET_PATH", "/tmp/ranker.sock")
+		shadowBudgetMs := envOrInt("SHADOW_BUDGET_MS", 5)
+		shadowBudget := time.Duration(shadowBudgetMs) * time.Millisecond
+		shadowModelVersion := envOr("SHADOW_MODEL_VERSION", "shadow-j3")
+
+		shadowMLRanker := mlranker.New(shadowSocket, shadowBudget, logger)
+		shadowMLRanker.WithModelVersion(shadowModelVersion)
+
+		// ChannelSink: 4096-entry buffer, non-blocking.  Full channel drops
+		// the record silently (hot-path safety — TX-4).  A background drain
+		// goroutine is started below (after ctx is available).
+		shadowChannelSink = mlranker.NewChannelSink(4096, logger)
+
+		activeShadowRanker = mlranker.NewShadowRanker(
+			shadowMLRanker,
+			shadowChannelSink,
+			shadowModelVersion,
+			logger,
+		)
+
+		// Wire the ShadowRanker into the cascade.  The ShadowRanker implements
+		// cascade.Ranker and returns the ORIGINAL slice unmodified (DA-3).
+		// If RANKER_ENABLED is also true the ML ranker is already wired above;
+		// this second WithRanker call replaces it in cascadeOpts — the shadow
+		// ranker wraps its own independent MLRanker instance so scoring happens
+		// independently.  In the recommended J3 mode (RANKER=false, SHADOW=true)
+		// this is the only ranker wired into cascadeOpts.
+		cascadeOpts = append(cascadeOpts, cascade.WithRanker(activeShadowRanker))
+
+		logger.Info("shadow ranker: ENABLED (Fase 2 / J3)",
+			"socket", shadowSocket,
+			"budget_ms", shadowBudgetMs,
+			"model_version", shadowModelVersion,
+			"sink_buffer", 4096)
+	} else {
+		logger.Info("shadow ranker: DISABLED (SHADOW_ENABLED not set or false)")
+	}
+
 	cascadeEngine := cascade.New(rulesEngine, cascadeOpts...)
+
+	// ---------------------------------------------------------------------------
+	// J4: A/B routing + revenue guard + bandit exposure.
+	//
+	// AB_ENABLED=true activates per-zone/tenant A/B routing. When enabled:
+	//   - A BanditRanker (MLRanker + ExploreRank) is built for the TREATMENT engine.
+	//   - A second cascade engine (cascadePureEngine) is built with DefaultRanker
+	//     for the CONTROL arm (bit-identical to pure cascade — parity gate).
+	//   - An ABRouter assigns each (zone, tenant) deterministically to control or
+	//     treatment using a stable FNV-1a hash.
+	//   - A RevenueGuard monitors eCPM (minor-units, TX-2) and auto-activates the
+	//     kill-switch when treatment is materially worse than control.
+	//
+	// Environment variables (all optional):
+	//   AB_ENABLED              = "true" to activate A/B routing (default: false).
+	//   AB_TREATMENT_BUCKETS    = int 0-100 (default: 10 = 10% treatment).
+	//   AB_BANDIT_ENABLED       = "true" to activate bandit exploration in treatment.
+	//   AB_BANDIT_POLICY        = "epsilon_greedy" | "thompson" (default: epsilon_greedy).
+	//   AB_EPSILON              = float [0,1] (default: 0.05).
+	//   AB_KILL_SWITCH          = "true" to force all traffic to control at startup.
+	//   AB_MIN_IMPRESSIONS      = int revenue guard min impressions per arm (default: 1000).
+	//   AB_MATERIAL_THRESHOLD   = float [0,1] drop ratio that triggers kill (default: 0.05).
+	//   RANKER_SOCKET_PATH, RANKER_BUDGET_MS, RANKER_MODEL_VERSION:
+	//     Shared with RANKER_ENABLED path; used for treatment MLRanker.
+	//
+	// Interaction with RANKER_ENABLED:
+	//   - AB_ENABLED=true + RANKER_ENABLED=false: AB is the primary ML activation path.
+	//     The treatment engine uses its own MLRanker (not cascadeEngine's ranker).
+	//   - AB_ENABLED=true + RANKER_ENABLED=true: both are active; the treatment
+	//     engine uses banditRanker (wired separately from cascadeEngine's ranker).
+	//   - AB_ENABLED=false (default): behaviour is unchanged from J1/J3.
+	//
+	// FAIL-SAFE: if AB_KILL_SWITCH=true at boot, kill-switch is pre-activated.
+	// The revenue guard auto-activates the kill-switch when treatment underperforms.
+	// Both are propagated through ABRouter.EnableKillSwitch() — single revert path.
+	// ---------------------------------------------------------------------------
+	var activeABRouter *mlranker.ABRouter
+	var activeBanditRanker *mlranker.BanditRanker
+	var activeRevenueGuard *mlranker.RevenueGuard
+	var cascadePureEngine *cascade.Engine
+
+	abEnabled := os.Getenv("AB_ENABLED") == "true"
+	if abEnabled && shadowEnabled {
+		// Footgun guard: the treatment/control engines built below REPLACE the
+		// shadow-wired cascadeEngine (the cascade.WithRanker(shadowRanker) wired
+		// into cascadeOpts above is dropped when cascadeEngine is rebuilt for the
+		// treatment arm).  Shadow logging is therefore INACTIVE while AB is on.
+		// Warn loudly so operators are not misled into expecting shadow records.
+		// To observe shadow, run SHADOW_ENABLED=true WITHOUT AB_ENABLED.
+		logger.Warn("shadow ranker is INACTIVE while A/B routing is enabled "+
+			"(AB_ENABLED replaces the shadow-wired cascade engine); "+
+			"run SHADOW_ENABLED without AB_ENABLED to collect shadow logs",
+			"shadow_enabled", true, "ab_enabled", true)
+	}
+	if abEnabled {
+		abTreatmentBuckets := envOrInt("AB_TREATMENT_BUCKETS", 10)
+		if abTreatmentBuckets < 0 {
+			abTreatmentBuckets = 0
+		} else if abTreatmentBuckets > mlranker.NumBuckets {
+			abTreatmentBuckets = mlranker.NumBuckets
+		}
+
+		// Bandit config for treatment.
+		banditEnabled := os.Getenv("AB_BANDIT_ENABLED") == "true"
+		var banditPolicy mlranker.BanditPolicy
+		if os.Getenv("AB_BANDIT_POLICY") == "thompson" {
+			banditPolicy = mlranker.BanditPolicyThompson
+		} else {
+			banditPolicy = mlranker.BanditPolicyEpsilonGreedy
+		}
+		epsilonStr := envOr("AB_EPSILON", "")
+		epsilon := 0.05 //nolint:forbidigo // default ML exploration rate
+		if epsilonStr != "" {
+			epsilon = parseFloat(epsilonStr, 0.05) //nolint:forbidigo // ML hyperparameter
+		}
+
+		banditCfg := mlranker.BanditConfig{
+			BanditEnabled: banditEnabled,
+			Policy:        banditPolicy,
+			Epsilon:       epsilon, //nolint:forbidigo // ML hyperparameter
+			ThompsonBeta:  10.0,   //nolint:forbidigo // ML hyperparameter
+		}
+
+		abCfg := mlranker.ABConfig{
+			TreatmentBuckets:  abTreatmentBuckets,
+			BanditCfg:         banditCfg,
+			KillSwitchEnabled: os.Getenv("AB_KILL_SWITCH") == "true",
+		}
+		activeABRouter = mlranker.NewABRouter(abCfg)
+
+		// Treatment cascade: BanditRanker (MLRanker + ExploreRank).
+		// Uses the same socket/budget/version as the RANKER_ENABLED path (shared config).
+		abSocketPath := envOr("RANKER_SOCKET_PATH", "/tmp/ranker.sock")
+		abBudgetMs := envOrInt("RANKER_BUDGET_MS", 5)
+		abBudget := time.Duration(abBudgetMs) * time.Millisecond
+		abModelVersion := envOr("RANKER_MODEL_VERSION", "stub-j1")
+
+		abMLRanker := mlranker.New(abSocketPath, abBudget, logger)
+		abMLRanker.WithModelVersion(abModelVersion)
+		activeBanditRanker = mlranker.NewBanditRanker(abMLRanker, banditCfg, nil)
+
+		// Treatment cascade engine: BanditRanker wired.
+		treatmentCascadeOpts := []cascade.Option{cascade.WithCapper(cappingImpl), cascade.WithRanker(activeBanditRanker)}
+		cascadeEngine = cascade.New(rulesEngine, treatmentCascadeOpts...)
+
+		// Control cascade engine: DefaultRanker (pure cascade — parity-safe).
+		cascadePureEngine = cascade.New(rulesEngine, cascade.WithCapper(cappingImpl))
+
+		// Revenue guard: monitors eCPM and auto-activates kill-switch.
+		minImpressions := int64(envOrInt("AB_MIN_IMPRESSIONS", 1000))
+		materialThreshold := parseFloat(envOr("AB_MATERIAL_THRESHOLD", ""), 0.05) //nolint:forbidigo // threshold
+		activeRevenueGuard = mlranker.NewRevenueGuard(
+			mlranker.GuardConfig{
+				MinImpressions:    minImpressions,
+				MaterialThreshold: materialThreshold, //nolint:forbidigo // ML threshold
+			},
+			activeABRouter,
+			logger,
+		)
+
+		logger.Info("A/B routing: ENABLED (Fase 2 / J4)",
+			"treatment_buckets", abTreatmentBuckets,
+			"bandit_enabled", banditEnabled,
+			"bandit_policy", os.Getenv("AB_BANDIT_POLICY"),
+			"epsilon", epsilon, //nolint:forbidigo // ML hyperparameter log
+			"kill_switch_initial", abCfg.KillSwitchEnabled,
+			"min_impressions_guard", minImpressions,
+			"material_threshold_pct", materialThreshold*100.0, //nolint:forbidigo // pct log
+		)
+	} else {
+		logger.Info("A/B routing: DISABLED (AB_ENABLED not set or false)")
+	}
 
 	// ---------------------------------------------------------------------------
 	// Decision sink (I2): Redpanda producer with WAL + at-least-once + dedupe.
@@ -585,12 +920,18 @@ func main() {
 	})
 
 	mux.Handle("POST /v1/decide", &decisionHandler{
-		snap:        store,
-		cascade:     cascadeEngine,
-		sink:        sink,
-		logger:      logger,
-		clickSigner: clickSigner, // nil → click tokens omitted (degraded mode)
-		mlRanker:    activeMLRanker, // nil when RANKER_ENABLED=false (default)
+		snap:         store,
+		cascade:      cascadeEngine,
+		sink:         sink,
+		logger:       logger,
+		clickSigner:  clickSigner,        // nil → click tokens omitted (degraded mode)
+		mlRanker:     activeMLRanker,     // nil when RANKER_ENABLED=false (default)
+		shadowRanker: activeShadowRanker, // nil when SHADOW_ENABLED=false (default)
+		// J4 fields (nil when AB_ENABLED=false):
+		abRouter:     activeABRouter,     // nil → no A/B routing
+		banditRanker: activeBanditRanker, // nil → no bandit exploration
+		revenueGuard: activeRevenueGuard, // nil → no revenue guard
+		cascadePure:  cascadePureEngine,  // nil when A/B disabled
 	})
 
 	addr := envOr("DECISION_ADDR", ":8080")
@@ -615,6 +956,73 @@ func main() {
 		refresher := snapshot.NewRefresher(cfgLoader, store, interval)
 		go refresher.Start(ctx)
 		logger.Info("config snapshot refresher started", "interval", interval.String())
+	}
+
+	// Shadow drain goroutine (J3): reads ShadowRecords from the ChannelSink and
+	// emits structured slog entries (INFO level, PII-free).
+	//
+	// Non-blocking contract (TX-4):
+	//   - The hot-path handler NEVER blocks on the sink (ChannelSink.EmitShadow
+	//     drops the record on full channel — never blocks).
+	//   - This drain goroutine runs asynchronously; slowness here only fills the
+	//     buffer, it does NOT slow down ad decisions.
+	//
+	// Fail-safe (DA-3 / decision invariant):
+	//   - Drain failure (e.g., slog write panic) does not affect served decisions.
+	//     The goroutine recovers from panics and continues draining.
+	//
+	// PII-free (TX-5/DA-11):
+	//   - decision_id is a ULID pseudonym (not user-identifying).
+	//   - zone_id, campaign IDs are placement context (not user data).
+	//   - model_version and shadow scores are ML signals, not PII.
+	//   - No raw UA, no IP, no user_id in ShadowRecord (enforced by the type).
+	if shadowChannelSink != nil {
+		go func() {
+			ch := shadowChannelSink.Chan()
+			for {
+				select {
+				case rec, ok := <-ch:
+					if !ok {
+						// Channel closed (should not happen in normal shutdown, but
+						// handle gracefully).
+						return
+					}
+					// Structured slog line — PII-free fields only.
+					logger.Info("shadow_record",
+						"decision_id", rec.DecisionID,
+						"zone_id", rec.ZoneID,
+						"model_version", rec.ModelVersion,
+						"cascade_top", rec.ServedCampaignID,
+						"shadow_top", rec.ShadowTopCampaignID,
+						"agreement", rec.Agreement,
+						"shadow_order", rec.ShadowOrder,
+						"cascade_order", rec.CascadeOrder,
+					)
+				case <-ctx.Done():
+					// Drain remaining buffered records before exiting so that
+					// in-flight shadow observations are not lost on graceful
+					// shutdown (best-effort; channel may be non-empty on crash).
+					for {
+						select {
+						case rec := <-ch:
+							logger.Info("shadow_record",
+								"decision_id", rec.DecisionID,
+								"zone_id", rec.ZoneID,
+								"model_version", rec.ModelVersion,
+								"cascade_top", rec.ServedCampaignID,
+								"shadow_top", rec.ShadowTopCampaignID,
+								"agreement", rec.Agreement,
+								"shadow_order", rec.ShadowOrder,
+								"cascade_order", rec.CascadeOrder,
+							)
+						default:
+							return
+						}
+					}
+				}
+			}
+		}()
+		logger.Info("shadow drain goroutine started")
 	}
 
 	go func() {
@@ -644,6 +1052,45 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// parseFloat parses a decimal float64 from s, returning fallback on any error.
+// Used only for ML hyperparameters (epsilon, threshold) — not for monetary values.
+func parseFloat(s string, fallback float64) float64 { //nolint:forbidigo // ML hyperparameter, not money
+	if s == "" {
+		return fallback
+	}
+	// Simple decimal parser: optional sign, digits, optional dot+digits.
+	// Avoids importing strconv to keep the file minimal.
+	neg := false
+	i := 0
+	if i < len(s) && s[i] == '-' {
+		neg = true
+		i++
+	} else if i < len(s) && s[i] == '+' {
+		i++
+	}
+	var intPart, fracPart int64
+	var fracDivisor int64 = 1
+	for ; i < len(s) && s[i] >= '0' && s[i] <= '9'; i++ {
+		intPart = intPart*10 + int64(s[i]-'0')
+	}
+	if i < len(s) && s[i] == '.' {
+		i++
+		for ; i < len(s) && s[i] >= '0' && s[i] <= '9'; i++ {
+			fracPart = fracPart*10 + int64(s[i]-'0')
+			fracDivisor *= 10
+		}
+	}
+	if i != len(s) {
+		// Unconsumed characters (e.g., 'e') → fall back to the default.
+		return fallback
+	}
+	result := float64(intPart) + float64(fracPart)/float64(fracDivisor) //nolint:forbidigo // ML param arithmetic
+	if neg {
+		result = -result
+	}
+	return result
 }
 
 // envOrInt reads an integer environment variable, falling back to def on

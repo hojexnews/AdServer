@@ -202,6 +202,12 @@ def get_latest_model_info(
     client = MlflowClient()
 
     try:
+        # Defesa em profundidade (gate de segurança): model_name é argumento de
+        # operador (não vem de request), mas é interpolado no filtro MLflow.
+        # Valida contra um charset seguro antes de montar o filtro.
+        import re
+        if not re.fullmatch(r"[A-Za-z0-9_.\-]+", model_name):
+            raise ValueError(f"model_name invalido: {model_name!r}")
         versions = client.search_model_versions(f"name='{model_name}'")
         if not versions:
             return None
