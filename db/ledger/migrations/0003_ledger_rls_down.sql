@@ -37,5 +37,8 @@ GROUP BY a.id, a.tenant_id, a.code, a.name, a.kind, a.asset_code;
 COMMENT ON VIEW ledger.account_balances IS
     'Saldo derivado de postings (nao armazenado). Use para leitura; nunca faca UPDATE baseado nisso.';
 
+-- A 0003_down dropa e recria a view; reaplica o GRANT para adserver_app.
+GRANT SELECT ON ledger.account_balances TO adserver_app;
+
 -- Remove funcao helper
 DROP FUNCTION IF EXISTS ledger.current_tenant_id();

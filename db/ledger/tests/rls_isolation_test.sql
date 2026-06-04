@@ -42,8 +42,9 @@
 --     Fixtures usam '2026-06-15' para cair na particao postings_2026_06.
 --   - TX-2 obrigatorio: NENHUM valor monetario usa float. Todos os valores
 --     de debit_amount/credit_amount/balance sao NUMERIC inteiros (minor units).
---   - Caso (d) de INSERT/UPDATE com WITH CHECK nao e aplicavel: as policies
---     da 0003 usam apenas clausula USING sem WITH CHECK (ver nota no final).
+--   - Caso (d) de INSERT/UPDATE com WITH CHECK: coberto no BLOCO 7 apos os
+--     blocos de leitura. Prova que o banco rejeita INSERT e UPDATE cross-tenant
+--     com check_violation / insufficient_privilege.
 -- =============================================================================
 
 BEGIN;
@@ -417,33 +418,151 @@ $$;
 
 
 -- ===========================================================================
--- NOTA SOBRE CASO (d) — WITH CHECK em INSERT/UPDATE
+-- BLOCO 7 — WITH CHECK: banco rejeita INSERT/UPDATE cross-tenant (caso d)
 --
--- As policies criadas em 0003_ledger_rls_up.sql usam exclusivamente a
--- clausula USING sem WITH CHECK:
+-- Prova que, com adserver.tenant_id = tenant_A, qualquer tentativa de:
+--   (a) INSERT com tenant_id = tenant_B  -> check_violation (23514)
+--   (b) UPDATE mudando tenant_id de linha visivel para tenant_B -> check_violation
 --
---   CREATE POLICY accounts_tenant_isolation ON ledger.accounts
---       USING (tenant_id = ledger.current_tenant_id());
+-- Para cada tabela usamos um sub-bloco com EXCEPTION WHEN check_violation OR
+-- insufficient_privilege para capturar o erro sem abortar a transacao externa.
+-- O sub-bloco RAISE NOTICE 'PASS' confirma a rejeicao. Se o INSERT/UPDATE
+-- for bem-sucedido (ausencia de erro), RAISE EXCEPTION aborta o teste.
 --
--- Em Postgres, uma policy sem WITH CHECK explicito aplica a clausula USING
--- tambem como filtro de escrita (para UPDATE) — mas apenas como filtro de
--- visibilidade das linhas existentes, nao como rejeicao de INSERT com tenant
--- diferente do setado. Portanto:
---   - SELECT: RLS filtra por tenant (provado nos blocos 1-6).
---   - UPDATE: RLS impede que adserver_app altere linhas de outro tenant
---     (as linhas nao sao visiveis, logo nao sao atualizaveis).
---   - INSERT com tenant_id errado: NAO e barrado pela policy USING sozinha
---     (seria necessario WITH CHECK para isso).
+-- Nota: postings exige posted_at para o particionamento; usamos '2026-06-15'
+-- (mesma particao das fixtures). O constraint trigger de balance e DEFERRABLE
+-- INITIALLY DEFERRED — o check_violation de RLS dispara ANTES do trigger de
+-- balance (a policy e avaliada linha a linha no momento do INSERT/UPDATE),
+-- portanto o teste nao precisa montar um par balanceado.
+-- ===========================================================================
+
+DO $$
+DECLARE
+    v_tenant_a  UUID   := 'cccccccc-0000-0000-0000-000000000001';
+    v_tenant_b  UUID   := 'dddddddd-0000-0000-0000-000000000001';
+    v_acct_a_id BIGINT;
+    v_entry_a_id BIGINT;
+    v_posting_a_id BIGINT;
+BEGIN
+    -- Obtemos IDs de tenant_a como superuser (antes de SET ROLE)
+    SELECT id INTO v_acct_a_id
+    FROM ledger.accounts WHERE tenant_id = v_tenant_a AND code = 'rls-test:revenue:brl';
+
+    SELECT id INTO v_entry_a_id
+    FROM ledger.journal_entries WHERE tenant_id = v_tenant_a AND idempotency_key = 'rls-test-idem-a-001';
+
+    SELECT id INTO v_posting_a_id
+    FROM ledger.postings WHERE tenant_id = v_tenant_a AND posted_at = '2026-06-15 10:00:00+00' LIMIT 1;
+
+    SET LOCAL ROLE adserver_app;
+    SET LOCAL adserver.tenant_id = 'cccccccc-0000-0000-0000-000000000001';
+
+    -- -----------------------------------------------------------------------
+    -- 7a. accounts: INSERT com tenant_id = B deve falhar (check_violation)
+    -- -----------------------------------------------------------------------
+    BEGIN
+        INSERT INTO ledger.accounts (tenant_id, code, name, kind, asset_code)
+        VALUES (v_tenant_b, 'rls-test:forge:7a', 'Forjado cross-tenant', 'revenue', 'BRL');
+        -- Chegou aqui: nao foi rejeitado -> falha do teste
+        RAISE EXCEPTION 'ASSERT FALHOU [7a accounts INSERT cross-tenant]: banco NAO rejeitou — WITH CHECK ausente ou ineficaz';
+    EXCEPTION
+        WHEN check_violation OR insufficient_privilege THEN
+            RAISE NOTICE 'PASS [7a accounts: INSERT cross-tenant rejeitado pelo banco (check_violation)]';
+    END;
+
+    -- -----------------------------------------------------------------------
+    -- 7b. accounts: UPDATE mudando tenant_id da linha propria para B -> falha
+    -- -----------------------------------------------------------------------
+    BEGIN
+        UPDATE ledger.accounts
+        SET tenant_id = v_tenant_b
+        WHERE id = v_acct_a_id;
+        RAISE EXCEPTION 'ASSERT FALHOU [7b accounts UPDATE tenant_id cross-tenant]: banco NAO rejeitou — WITH CHECK ausente ou ineficaz';
+    EXCEPTION
+        WHEN check_violation OR insufficient_privilege THEN
+            RAISE NOTICE 'PASS [7b accounts: UPDATE tenant_id cross-tenant rejeitado pelo banco (check_violation)]';
+    END;
+
+    -- -----------------------------------------------------------------------
+    -- 7c. journal_entries: INSERT com tenant_id = B deve falhar
+    -- -----------------------------------------------------------------------
+    BEGIN
+        INSERT INTO ledger.journal_entries (tenant_id, idempotency_key, description, status, effective_at)
+        VALUES (v_tenant_b, 'rls-test-forge-7c', 'Forjado cross-tenant', 'posted', now());
+        RAISE EXCEPTION 'ASSERT FALHOU [7c journal_entries INSERT cross-tenant]: banco NAO rejeitou';
+    EXCEPTION
+        WHEN check_violation OR insufficient_privilege THEN
+            RAISE NOTICE 'PASS [7c journal_entries: INSERT cross-tenant rejeitado pelo banco (check_violation)]';
+    END;
+
+    -- -----------------------------------------------------------------------
+    -- 7d. journal_entries: UPDATE mudando tenant_id para B -> falha
+    -- -----------------------------------------------------------------------
+    BEGIN
+        UPDATE ledger.journal_entries
+        SET tenant_id = v_tenant_b
+        WHERE id = v_entry_a_id;
+        RAISE EXCEPTION 'ASSERT FALHOU [7d journal_entries UPDATE tenant_id cross-tenant]: banco NAO rejeitou';
+    EXCEPTION
+        WHEN check_violation OR insufficient_privilege THEN
+            RAISE NOTICE 'PASS [7d journal_entries: UPDATE tenant_id cross-tenant rejeitado pelo banco (check_violation)]';
+    END;
+
+    -- -----------------------------------------------------------------------
+    -- 7e. postings: INSERT com tenant_id = B deve falhar
+    -- (journal_entry_id e account_id sao do tenant A — o check_violation de
+    --  RLS dispara antes do trigger de balance DEFERRED)
+    -- -----------------------------------------------------------------------
+    BEGIN
+        INSERT INTO ledger.postings
+            (journal_entry_id, tenant_id, account_id, asset_code, scale,
+             debit_amount, credit_amount, posted_at)
+        VALUES
+            (v_entry_a_id, v_tenant_b, v_acct_a_id, 'BRL', 2,
+             1, 0, '2026-06-15 12:00:00+00');
+        RAISE EXCEPTION 'ASSERT FALHOU [7e postings INSERT cross-tenant]: banco NAO rejeitou';
+    EXCEPTION
+        WHEN check_violation OR insufficient_privilege THEN
+            RAISE NOTICE 'PASS [7e postings: INSERT cross-tenant rejeitado pelo banco (check_violation)]';
+    END;
+
+    -- -----------------------------------------------------------------------
+    -- 7f. postings: UPDATE mudando tenant_id para B -> falha
+    -- -----------------------------------------------------------------------
+    BEGIN
+        UPDATE ledger.postings
+        SET tenant_id = v_tenant_b
+        WHERE id = v_posting_a_id
+          AND posted_at = '2026-06-15 10:00:00+00';
+        RAISE EXCEPTION 'ASSERT FALHOU [7f postings UPDATE tenant_id cross-tenant]: banco NAO rejeitou';
+    EXCEPTION
+        WHEN check_violation OR insufficient_privilege THEN
+            RAISE NOTICE 'PASS [7f postings: UPDATE tenant_id cross-tenant rejeitado pelo banco (check_violation)]';
+    END;
+
+    RESET ROLE;
+END;
+$$;
+
+
+-- ===========================================================================
+-- NOTA SOBRE CASO (d) — WITH CHECK em INSERT/UPDATE (STATUS: COBERTO)
 --
--- Esta e uma limitacao conhecida da migracao 0003. O controle de escrita
--- cross-tenant e responsabilidade da camada de aplicacao (middleware que
--- injeta tenant_id via JWT antes de qualquer operacao DML).
+-- As policies em 0003_ledger_rls_up.sql agora incluem WITH CHECK:
 --
--- Para adicionar WITH CHECK: alterar 0003_up com:
 --   CREATE POLICY accounts_tenant_isolation ON ledger.accounts
 --       USING      (tenant_id = ledger.current_tenant_id())
 --       WITH CHECK (tenant_id = ledger.current_tenant_id());
--- (requer DROP POLICY + recreate ou ALTER POLICY, idempotente com 0003_down).
+--
+-- Comportamento resultante (banco garante, independente da camada de app):
+--   - SELECT: RLS filtra por tenant (blocos 1-6).
+--   - INSERT com tenant_id errado: banco rejeita com check_violation (bloco 7).
+--   - UPDATE mudando tenant_id para outro tenant: banco rejeita com
+--     check_violation (bloco 7).
+--   - UPDATE de linha de outro tenant: linha nao visivel (USING), UPDATE
+--     retorna 0 linhas sem erro — comportamento correto e esperado.
+--
+-- Remediacao fecha os 3 achados CRITICAL do money-ledger-guardian (TX-3).
 -- ===========================================================================
 
 

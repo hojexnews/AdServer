@@ -26,6 +26,8 @@
 -- O adserver_app (role de aplicacao) e um role nao-superuser — aplica-se RLS.
 --
 -- Invariante TX-2: nenhuma coluna monetaria e tocada por esta migration.
+-- Invariante TX-3: WITH CHECK em todas as policies — banco rejeita INSERT/UPDATE
+--   com tenant_id divergente do corrente, sem depender da camada de aplicacao.
 -- =============================================================================
 
 -- ---------------------------------------------------------------------------
@@ -51,10 +53,12 @@ ALTER TABLE ledger.accounts ENABLE  ROW LEVEL SECURITY;
 ALTER TABLE ledger.accounts FORCE   ROW LEVEL SECURITY;
 
 CREATE POLICY accounts_tenant_isolation ON ledger.accounts
-    USING (tenant_id = ledger.current_tenant_id());
+    USING      (tenant_id = ledger.current_tenant_id())
+    WITH CHECK (tenant_id = ledger.current_tenant_id());
 
 COMMENT ON POLICY accounts_tenant_isolation ON ledger.accounts IS
-    'Isola contas por tenant. Fail-closed: sem adserver.tenant_id setado, nenhuma linha visivel.';
+    'Isola contas por tenant. Fail-closed: sem adserver.tenant_id setado, nenhuma linha visivel. '
+    'WITH CHECK: banco rejeita INSERT/UPDATE com tenant_id diferente do tenant corrente.';
 
 -- ---------------------------------------------------------------------------
 -- ledger.journal_entries
@@ -63,10 +67,12 @@ ALTER TABLE ledger.journal_entries ENABLE  ROW LEVEL SECURITY;
 ALTER TABLE ledger.journal_entries FORCE   ROW LEVEL SECURITY;
 
 CREATE POLICY journal_entries_tenant_isolation ON ledger.journal_entries
-    USING (tenant_id = ledger.current_tenant_id());
+    USING      (tenant_id = ledger.current_tenant_id())
+    WITH CHECK (tenant_id = ledger.current_tenant_id());
 
 COMMENT ON POLICY journal_entries_tenant_isolation ON ledger.journal_entries IS
-    'Isola entradas de diario por tenant. Fail-closed: sem adserver.tenant_id setado, nenhuma linha visivel.';
+    'Isola entradas de diario por tenant. Fail-closed: sem adserver.tenant_id setado, nenhuma linha visivel. '
+    'WITH CHECK: banco rejeita INSERT/UPDATE com tenant_id diferente do tenant corrente.';
 
 -- ---------------------------------------------------------------------------
 -- ledger.postings (tabela particionada)
@@ -79,11 +85,13 @@ ALTER TABLE ledger.postings ENABLE  ROW LEVEL SECURITY;
 ALTER TABLE ledger.postings FORCE   ROW LEVEL SECURITY;
 
 CREATE POLICY postings_tenant_isolation ON ledger.postings
-    USING (tenant_id = ledger.current_tenant_id());
+    USING      (tenant_id = ledger.current_tenant_id())
+    WITH CHECK (tenant_id = ledger.current_tenant_id());
 
 COMMENT ON POLICY postings_tenant_isolation ON ledger.postings IS
     'Isola postings por tenant. Propaga para todas as particoes (PG16). '
-    'Fail-closed: sem adserver.tenant_id setado, nenhuma linha visivel.';
+    'Fail-closed: sem adserver.tenant_id setado, nenhuma linha visivel. '
+    'WITH CHECK: banco rejeita INSERT/UPDATE com tenant_id diferente do tenant corrente.';
 
 -- ---------------------------------------------------------------------------
 -- ledger.account_balances (view)
@@ -122,3 +130,7 @@ GROUP BY a.id, a.tenant_id, a.code, a.name, a.kind, a.asset_code;
 COMMENT ON VIEW ledger.account_balances IS
     'Saldo derivado de postings (nao armazenado). SECURITY INVOKER: RLS de accounts '
     'e postings se aplica atraves desta view. Use para leitura; nunca faca UPDATE baseado nisso.';
+
+-- A 0003_up dropa e recria a view (para mudar SECURITY INVOKER); os GRANTs
+-- da view anterior sao perdidos no DROP. Reaplica o GRANT para adserver_app.
+GRANT SELECT ON ledger.account_balances TO adserver_app;
