@@ -18,6 +18,7 @@ import { router } from "./lib/trpc.js";
 import { createContext } from "./lib/context.js";
 import { createConfigRouter } from "./routers/config.js";
 import { createStatsRouter } from "./routers/stats.js";
+import { createCopilotRouter } from "./routers/copilot.js";
 import { InMemoryConfigAdapter } from "./adapters/in-memory-config.js";
 import { InMemoryStatsAdapter } from "./adapters/in-memory-stats.js";
 
@@ -33,6 +34,12 @@ const statsAdapter = new InMemoryStatsAdapter();
 export const appRouter = router({
   cfg: createConfigRouter(configAdapter),
   stats: createStatsRouter(statsAdapter),
+  /**
+   * Rota do copiloto (J5/Fase 2).
+   * Protege a chave Claude, injeta tenant_id, faz proxy SSE para services/copilot.
+   * ADR-0003 §C / TX-3 / §2.4.
+   */
+  copilot: createCopilotRouter(),
 });
 
 export type AppRouter = typeof appRouter;
