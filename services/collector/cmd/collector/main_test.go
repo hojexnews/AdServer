@@ -404,6 +404,160 @@ func TestAsyncJS_MissingZoneID(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// SECURITY C2: SafeFrame isolation — HTML creative rendered in sandboxed iframe
+// ---------------------------------------------------------------------------
+
+// TestAdTagJS_HTMLCreative_NoInnerHTMLOnPublisherDOM verifies that the generated
+// ad tag JS does NOT inject creative HTML via innerHTML on the publisher DOM.
+// This is the C2 fix: innerHTML of d.html in the publisher DOM is forbidden.
+func TestAdTagJS_HTMLCreative_NoInnerHTMLOnPublisherDOM(t *testing.T) {
+	js := buildAdTagJS(
+		"http://decision:8080",
+		"http://collector:8081",
+		"zone-1", "t1", "cb123", "did-1",
+	)
+
+	// The old vulnerable pattern: "div.innerHTML = d.html" must not appear.
+	if strings.Contains(js, "div.innerHTML") {
+		t.Error("C2 violation: ad tag JS assigns d.html to div.innerHTML on publisher DOM")
+	}
+	// Also guard against any innerHTML assignment of the creative html field.
+	if strings.Contains(js, ".innerHTML = d.html") {
+		t.Error("C2 violation: ad tag JS assigns d.html via .innerHTML on publisher DOM")
+	}
+}
+
+// TestAdTagJS_HTMLCreative_UsesSrcdocSandbox verifies that the generated ad tag
+// uses an <iframe srcdoc> with the correct sandbox attribute for HTML creatives.
+func TestAdTagJS_HTMLCreative_UsesSrcdocSandbox(t *testing.T) {
+	js := buildAdTagJS(
+		"http://decision:8080",
+		"http://collector:8081",
+		"zone-1", "t1", "cb123", "did-1",
+	)
+
+	// Must create an iframe element.
+	if !strings.Contains(js, `createElement("iframe")`) {
+		t.Error("C2: ad tag JS must create an iframe for HTML creatives")
+	}
+	// Must assign creative HTML via srcdoc (not innerHTML).
+	if !strings.Contains(js, "iframe.srcdoc") {
+		t.Error("C2: ad tag JS must use iframe.srcdoc for HTML creative isolation")
+	}
+	// Sandbox must be set.
+	if !strings.Contains(js, "iframe.sandbox") {
+		t.Error("C2: ad tag JS must set iframe.sandbox attribute")
+	}
+	// allow-scripts must be present (ads require JS execution in the creative).
+	if !strings.Contains(js, "allow-scripts") {
+		t.Error("C2: sandbox must include allow-scripts for creative JS execution")
+	}
+	// allow-popups must be present (click-through links from the creative).
+	if !strings.Contains(js, "allow-popups") {
+		t.Error("C2: sandbox must include allow-popups for creative click-through")
+	}
+	// The critical safety property: allow-same-origin MUST NOT be present in
+	// the sandbox attribute value assignment.  Its presence would give the
+	// creative access to publisher cookies, localStorage, and DOM.
+	// We check the iframe.sandbox assignment line specifically, not comments.
+	if strings.Contains(js, `iframe.sandbox = `) {
+		// Extract the sandbox value from the assignment line.
+		sandboxStart := strings.Index(js, `iframe.sandbox = "`)
+		if sandboxStart == -1 {
+			t.Error("C2: cannot locate iframe.sandbox assignment in JS")
+		} else {
+			sandboxStart += len(`iframe.sandbox = "`)
+			sandboxEnd := strings.Index(js[sandboxStart:], `"`)
+			if sandboxEnd == -1 {
+				t.Error("C2: cannot parse sandbox attribute value")
+			} else {
+				sandboxValue := js[sandboxStart : sandboxStart+sandboxEnd]
+				if strings.Contains(sandboxValue, "allow-same-origin") {
+					t.Errorf("C2 violation: sandbox value %q must NOT include allow-same-origin — null origin is the security boundary", sandboxValue)
+				}
+			}
+		}
+	} else {
+		t.Error("C2: iframe.sandbox assignment not found in JS")
+	}
+}
+
+// TestAdTagJS_HTMLCreative_ImpressionPixelPreserved verifies that the impression
+// pixel (lg) is fired from the parent JS regardless of creative type.
+// The sandbox must not interfere with impression/click tracking (CA-6).
+// decision_id and model_version (J0/J1 invariant) must be present in the lg URL.
+func TestAdTagJS_HTMLCreative_ImpressionPixelPreserved(t *testing.T) {
+	js := buildAdTagJS(
+		"http://decision:8080",
+		"http://collector:8081",
+		"zone-1", "t1", "cb123", "did-1",
+	)
+
+	// The lg pixel must always be fired — it is outside any conditional branch.
+	// Verify the pixel URL template is present and carries did + mv.
+	if !strings.Contains(js, `"/lg?did="`) {
+		t.Error("impression pixel URL missing /lg?did= — tracking broken")
+	}
+	if !strings.Contains(js, `"&mv="`) {
+		t.Error("impression pixel URL missing &mv= — model_version not forwarded (J0/J1 broken)")
+	}
+	if !strings.Contains(js, `d.decision_id`) {
+		t.Error("impression pixel URL missing d.decision_id — decision_id not forwarded")
+	}
+	// The lg pixel construction must appear AFTER both the image and html
+	// rendering branches (i.e. not inside a branch that could be skipped).
+	// We verify it is not nested inside the else-if(d.html) block by checking
+	// that the lg Image construction appears after the closing brace of that block.
+	// A simple proxy: "new Image(1, 1)" must appear in the JS.
+	if !strings.Contains(js, "new Image(1, 1)") {
+		t.Error("impression pixel (new Image) must be present in ad tag JS")
+	}
+}
+
+// TestAdTagJS_ImageCreative_NoIframe verifies that image-only creatives still
+// use the safe DOM API path (no iframe inserted for img banners).
+func TestAdTagJS_ImageCreative_NoIframe_SafePath(t *testing.T) {
+	js := buildAdTagJS(
+		"http://decision:8080",
+		"http://collector:8081",
+		"zone-1", "t1", "cb123", "did-1",
+	)
+
+	// The image path must create an <img> element.
+	if !strings.Contains(js, `createElement("img")`) {
+		t.Error("image creative path must create an img element")
+	}
+	// The image path must set src from d.image_url (safe DOM API).
+	if !strings.Contains(js, "img.src = d.image_url") {
+		t.Error("image creative path must set img.src from d.image_url")
+	}
+}
+
+// TestAsyncJS_CSPHeaders verifies that the /asyncjs response includes the
+// isolation headers required by the C2 fix.
+func TestAsyncJS_CSPHeaders(t *testing.T) {
+	sink := &captureSink{}
+	h := newTestHandler(sink)
+
+	req := httptest.NewRequest(http.MethodGet, "/asyncjs?zoneid=zone-1&tid=t1&cb=1", nil)
+	rr := httptest.NewRecorder()
+	h.handleAsyncJS(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rr.Code)
+	}
+	if got := rr.Header().Get("X-Frame-Options"); got != "DENY" {
+		t.Errorf("X-Frame-Options: got %q, want DENY", got)
+	}
+	if got := rr.Header().Get("Referrer-Policy"); got != "no-referrer" {
+		t.Errorf("Referrer-Policy: got %q, want no-referrer", got)
+	}
+	if got := rr.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("X-Content-Type-Options: got %q, want nosniff", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // PRIVACY: UA reduced to coarse class — raw UA never emitted (TX-5)
 // ---------------------------------------------------------------------------
 

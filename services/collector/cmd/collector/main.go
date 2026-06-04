@@ -214,6 +214,29 @@ func (h *collectorHandler) handleAsyncJS(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
+	// CSP for the /asyncjs response itself.
+	// The ad tag JS is loaded as a script by the publisher page; this header
+	// applies to the script resource, not to the publisher page.  The ingress
+	// is responsible for setting the publisher-page-level CSP (see below).
+	//
+	// Ingress-level CSP enforcement (document this for [[platform-infra-engineer]]):
+	//   The collector's /asyncjs and /lg endpoints must be served with these
+	//   response headers to reinforce isolation:
+	//
+	//     X-Content-Type-Options: nosniff
+	//     X-Frame-Options: DENY          (collector pages must not be framed)
+	//     Referrer-Policy: no-referrer
+	//
+	//   For the srcdoc iframe rendered by buildAdTagJS, the BROWSER enforces
+	//   the sandbox attribute — no server-side header is needed for the
+	//   creative itself because it has no URL (srcdoc has a null origin).
+	//   Publishers who wish to add a frame-ancestors CSP on their own pages
+	//   should allow-list the collector domain, not the creative origin.
+	//
+	//   The ingress MUST NOT add "allow-same-origin" to the iframe via any
+	//   header manipulation.  The null origin is the entire security boundary.
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Referrer-Policy", "no-referrer")
 	fmt.Fprint(w, js)
 }
 
@@ -223,13 +246,44 @@ func (h *collectorHandler) handleAsyncJS(w http.ResponseWriter, r *http.Request)
 // Design: async/await, no blocking, impressions counted only via lg pixel.
 // The click link uses the signed "tok" parameter — no plain dest_url in query.
 //
+// Security (C2 — SafeFrame isolation):
+//
+//	HTML5 creatives (d.html) are NEVER injected via innerHTML into the publisher
+//	DOM.  Instead they are rendered inside a sandboxed <iframe srcdoc="…"> with:
+//
+//	  sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
+//
+//	Omitting allow-same-origin is the critical property: the iframe runs with a
+//	null origin, which means the creative JS cannot read document.cookie,
+//	localStorage, sessionStorage, or any DOM element of the publisher page.  The
+//	creative is fully isolated even when it contains malicious script.
+//
+//	Click-through: the creative's click URL is pre-built by the parent JS and
+//	injected as an <a> tag wrapping the entire iframe — the anchor lives in the
+//	publisher DOM (safe) and opens in a new tab.  allow-popups lets the creative
+//	itself also open links; allow-popups-to-escape-sandbox ensures those popups
+//	are NOT sandboxed (they open as normal tabs).
+//
+//	Impression pixel: the lg pixel is fired from the PARENT JS (outside the
+//	iframe) so tracking is completely unaffected by the sandbox.  decision_id and
+//	model_version flow through the pixel URL unchanged (J0/J1 invariant).
+//
+//	Image-only creatives: the existing safe path (DOM API, no innerHTML) is
+//	preserved — no iframe is inserted for img-only banners.
+//
+//	Expand / rich-media that requires same-origin: NOT supported by default.
+//	If a tenant requires same-origin rich-media, the creative HTML must be
+//	served-side sanitised and explicitly allow-listed (future feature).  The
+//	default is fail-safe: sandbox without allow-same-origin.
+//
 // model_version flow (J0→J1):
-//   The decision response carries `model_version` (empty in J0 / cascade-only;
-//   non-empty in J1+ when the ML ranker is active).  The JS embeds it as the
-//   "mv" parameter in both the /lg impression pixel URL and the /ck click URL
-//   so the collector can forward it to EmitImpression/EmitClick.  This closes
-//   the loop: every downstream event carries the ranker version that produced
-//   the decision, enabling OPE attribution by model_version in J4.
+//
+//	The decision response carries `model_version` (empty in J0 / cascade-only;
+//	non-empty in J1+ when the ML ranker is active).  The JS embeds it as the
+//	"mv" parameter in both the /lg impression pixel URL and the /ck click URL
+//	so the collector can forward it to EmitImpression/EmitClick.  This closes
+//	the loop: every downstream event carries the ranker version that produced
+//	the decision, enabling OPE attribution by model_version in J4.
 func buildAdTagJS(decisionBase, lgBase, zoneID, tenantID, cachebuster, decisionID string) string {
 	return fmt.Sprintf(`(async function(){
   "use strict";
@@ -251,17 +305,20 @@ func buildAdTagJS(decisionBase, lgBase, zoneID, tenantID, cachebuster, decisionI
     // model_version from decision response ("" in J0/cascade-only; non-empty in J1+).
     // Embedded in every downstream pixel/click URL so OPE can attribute by ranker version.
     const mv = d.model_version || "";
+    // Build the click URL (used by both image and HTML creative paths).
+    const ckURL = %q + "/ck?tok=" + encodeURIComponent(d.click_tok || "") +
+                  "&did=" + encodeURIComponent(d.decision_id) +
+                  "&bid=" + encodeURIComponent(d.banner_id) +
+                  "&cid=" + encodeURIComponent(d.campaign_id) +
+                  "&zid=" + encodeURIComponent(d.zone_id) +
+                  "&tid=" + encodeURIComponent(d.tenant_id || "") +
+                  "&mv="  + encodeURIComponent(mv);
     // Render creative.
     if (d.image_url) {
+      // Safe path: image creative — DOM API only, no innerHTML.
       const a = document.createElement("a");
       // Use the signed click token from the decision response (no plain dest_url).
-      a.href = %q + "/ck?tok=" + encodeURIComponent(d.click_tok || "") +
-               "&did=" + encodeURIComponent(d.decision_id) +
-               "&bid=" + encodeURIComponent(d.banner_id) +
-               "&cid=" + encodeURIComponent(d.campaign_id) +
-               "&zid=" + encodeURIComponent(d.zone_id) +
-               "&tid=" + encodeURIComponent(d.tenant_id || "") +
-               "&mv="  + encodeURIComponent(mv);
+      a.href = ckURL;
       a.target = "_blank";
       a.rel = "noopener noreferrer";
       const img = document.createElement("img");
@@ -273,12 +330,45 @@ func buildAdTagJS(decisionBase, lgBase, zoneID, tenantID, cachebuster, decisionI
       a.appendChild(img);
       slot.appendChild(a);
     } else if (d.html) {
-      const div = document.createElement("div");
-      div.innerHTML = d.html;
-      slot.appendChild(div);
+      // SECURITY (C2 — SafeFrame): HTML5 creative is rendered in a sandboxed
+      // iframe with null origin.  We NEVER use innerHTML on the publisher DOM.
+      //
+      // sandbox attrs:
+      //   allow-scripts              — creative JS runs (ads require it)
+      //   allow-popups               — creative can open links in new tabs
+      //   allow-popups-to-escape-sandbox — those new tabs are NOT sandboxed
+      // Intentionally omitted:
+      //   allow-same-origin          — null origin; no access to publisher
+      //                                cookies, localStorage, or DOM
+      //   allow-top-navigation       — cannot hijack the publisher page URL
+      //   allow-forms                — no form submission from creative
+      const iframe = document.createElement("iframe");
+      iframe.sandbox = "allow-scripts allow-popups allow-popups-to-escape-sandbox";
+      iframe.scrolling = "no";
+      iframe.frameBorder = "0";
+      iframe.width  = (d.width  || 0).toString();
+      iframe.height = (d.height || 0).toString();
+      iframe.style.border = "none";
+      iframe.style.display = "block";
+      // srcdoc assignment is safe: the value is the creative HTML string.
+      // It is NOT set via innerHTML on the publisher DOM; it becomes the
+      // inner document of the sandboxed iframe (null origin).
+      iframe.srcdoc = d.html;
+      // Wrap in a click-through anchor that lives in the publisher DOM.
+      // The anchor is built with DOM API (no innerHTML) so the ckURL — which
+      // contains only ASCII-safe query-param values — is never parsed as HTML.
+      const a = document.createElement("a");
+      a.href = ckURL;
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      a.style.display = "inline-block";
+      a.appendChild(iframe);
+      slot.appendChild(a);
     }
-    // Impression pixel — loaded NOW (CA-6: counted at render, not at request).
+    // Impression pixel — fired from the PARENT JS (outside the iframe) so the
+    // sandbox cannot interfere with tracking (CA-6).
     // "mv" (model_version) flows from decision → lg → telemetry for OPE attribution.
+    // decision_id and model_version are preserved (J0/J1 invariant).
     const lg = new Image(1, 1);
     lg.src = %q + "/lg?did=" + encodeURIComponent(d.decision_id) +
              "&bid=" + encodeURIComponent(d.banner_id) +
