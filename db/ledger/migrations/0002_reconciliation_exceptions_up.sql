@@ -127,11 +127,12 @@ ALTER TABLE ledger.reconciliation_exceptions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE ledger.reconciliation_exceptions FORCE ROW LEVEL SECURITY;
 
 -- Politica: cada role so ve registros do proprio tenant.
--- O role adserver_app precisa ter a variavel de sessao app.current_tenant_id
--- definida antes de qualquer query (mesma convencao do schema config).
+-- Variavel de sessao canonica do repo: adserver.tenant_id (mesma do schema
+-- config/vector — SET LOCAL adserver.tenant_id = '<uuid>' pelo middleware da app).
+-- Fail-closed: sem adserver.tenant_id setado, NULLIF -> NULL -> 0 linhas.
 CREATE POLICY reconciliation_exceptions_tenant_policy
     ON ledger.reconciliation_exceptions
-    USING (tenant_id = current_setting('app.current_tenant_id', true)::uuid);
+    USING (tenant_id = NULLIF(current_setting('adserver.tenant_id', true), '')::uuid);
 
 -- Role de servico (adserver_loader/admin) bypassa RLS para reconciliacao batch.
 -- O BYPASSRLS e concedido ao role adserver_loader (mesmo padrao do config).
