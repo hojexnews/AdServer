@@ -1,4 +1,4 @@
-// Command payments e o servico de pagamentos multi-trilho do AdServer (K4).
+// Command payments e o servico de pagamentos multi-trilho do AdServer (K4/K5).
 //
 // # Posicionamento arquitetural
 //
@@ -11,16 +11,16 @@
 //
 //   - Fiat global:  Stripe (Payment Intents + Billing, SAQ-A).
 //   - Fiat Brasil:  Asaas (PIX primario, Pix Automatico) + Mercado Pago failover.
-//   - Cripto:       Safe multisig -> Fireblocks (sob AUM) via ChainConnector (K5).
-//   - Stablecoin:   USDC (Circle Mint) como ramp; USDT por alcance (K5).
+//   - Cripto K5:   Safe multisig -> Fireblocks (sob AUM) via ChainConnector.
+//                  USDC como ramp. Deposito PENDING ate N confirmacoes via webhook.
+//                  Reorg -> estorno auditavel (RecordReversal). AEV/BND gated (scale TBD).
 //
 // # Invariantes inegociaveis
 //
 //   - Float PROIBIDO em qualquer valor monetario (TX-2).
 //   - Sem conversao automatica entre ativos (DA-10).
 //   - Deposito cripto permanece PENDING ate finalidade (webhook do custodiante) (K5).
-//   - Chaves (Stripe, Asaas, MercadoPago) NUNCA em imagem/git —
-//     apenas via OpenBao/KMS (§2.7 / ADR-0004 §F).
+//   - Chaves NUNCA em imagem/git — apenas via OpenBao/KMS (§2.7 / ADR-0004 §F).
 //   - PII/KYC apenas no cofre de compliance (celula aml-kyc), referenciado
 //     por tenant_id pseudonimo (TX-3 / DA-11).
 //   - Reconciliacao periodica ABRE EXCECOES e nunca autocorrige (§2.6).
@@ -35,6 +35,8 @@
 //   - MERCADOPAGO_ACCESS_TOKEN   — access token Mercado Pago (failover).
 //   - MERCADOPAGO_WEBHOOK_TOKEN  — token de verificacao de webhooks Mercado Pago.
 //   - PAYMENTS_PG_DSN            — DSN do Postgres do ledger (K3).
+//   - SAFE_WEBHOOK_SECRET        — segredo HMAC-SHA256 para webhooks do custodiante Safe (K5).
+//                                   Lido de SAFE_WEBHOOK_SECRET via OpenBao/env.
 //
 // # Configuracao nao-sensivel (variaveis de ambiente)
 //
@@ -45,6 +47,18 @@
 //   - ASAAS_BASE_URL        — URL base Asaas (default: https://api.asaas.com/v3).
 //   - MERCADOPAGO_BASE_URL  — URL base MP (default: https://api.mercadopago.com).
 //   - STRIPE_TAX_ENABLED    — "true" habilita Stripe Tax (default: false).
+//   - CRYPTO_ENABLED        — "true" habilita trilho cripto Safe/USDC (K5, default: false).
+//   - SAFE_RPC_URL          — endpoint JSON-RPC EVM (chain_id=1); OpenBao/env.
+//   - SAFE_ADDRESS          — endereco da carteira Safe multisig da plataforma.
+//   - SAFE_MIN_CONFIRMATIONS — min confirmacoes para finalidade (default: 12).
+//   - USDC_CONTRACT_ADDRESS — contrato USDC (default: mainnet Ethereum).
+//
+// # SEAM Fireblocks (K5)
+//
+// O trilho cripto usa EVMSafe (Safe multisig). Para o upgrade Fireblocks
+// (sob AUM — gatilho C ADR-0004), substituir EVMSafe por EVMFireblocks
+// no bloco "K5: trilho cripto" abaixo — mesma interface ChainConnector,
+// zero mudanca no resto do servico.
 package main
 
 import (
@@ -56,16 +70,17 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/hojex/adserver/internal/chainconnector"
+	"github.com/hojex/adserver/internal/ledger"
 	"github.com/hojex/adserver/services/payments/internal/asaas"
 	"github.com/hojex/adserver/services/payments/internal/config"
+	cryptopkg "github.com/hojex/adserver/services/payments/internal/crypto"
 	"github.com/hojex/adserver/services/payments/internal/fiat"
 	"github.com/hojex/adserver/services/payments/internal/health"
 	"github.com/hojex/adserver/services/payments/internal/mercadopago"
 	"github.com/hojex/adserver/services/payments/internal/secrets"
 	stripepkg "github.com/hojex/adserver/services/payments/internal/stripe"
 	"github.com/jackc/pgx/v5/pgxpool"
-
-	"github.com/hojex/adserver/internal/ledger"
 )
 
 func main() {
@@ -186,6 +201,90 @@ func main() {
 	// Webhook Mercado Pago.
 	// Path plural /webhooks/mercadopago — convencao uniforme com os demais trilhos.
 	mux.Handle("/webhooks/mercadopago", mpProvider.WebhookHandler(platformTenantID()))
+
+	// -------------------------------------------------------------------------
+	// K5: trilho cripto Safe multisig + USDC (atrás de CRYPTO_ENABLED)
+	//
+	// SEAM Fireblocks: para o upgrade sob AUM (gatilho C ADR-0004), substituir
+	// EVMSafe por EVMFireblocks abaixo — mesma interface ChainConnector, zero
+	// mudanca no webhook handler nem no resto do servico.
+	//
+	// AEV/BND: gated por scale TBD no Asset Registry (enabled=false, CHECK
+	// assets_enabled_needs_scale_chk). Qualquer posting em AEV/BND e recusado
+	// pelo ledger até scale ser definido (E.2 ADR-0004).
+	// -------------------------------------------------------------------------
+	if cfg.CryptoEnabled {
+		if cfg.SafeRPCURL == "" {
+			slog.Error("payments: CRYPTO_ENABLED=true mas SAFE_RPC_URL ausente")
+			os.Exit(1)
+		}
+		safeWebhookSecret := os.Getenv("SAFE_WEBHOOK_SECRET")
+		if safeWebhookSecret == "" {
+			slog.Error("payments: CRYPTO_ENABLED=true mas SAFE_WEBHOOK_SECRET ausente — necessario para verificar webhooks do custodiante")
+			os.Exit(1)
+		}
+
+		// Scale do USDC lido do Asset Registry no boot — NUNCA hardcoded (TX-2/DA-10).
+		// O Asset Registry e a fonte autoritativa; se USDC estiver disabled ou com
+		// scale NULL, LoadAsset falha e o trilho cripto nao sobe (fail-closed).
+		usdcAsset, err := assetLoader.LoadAsset(ctx, "USDC")
+		if err != nil {
+			slog.Error("payments: falha ao carregar scale de USDC do Asset Registry — trilho cripto nao pode subir", "err", err)
+			os.Exit(1)
+		}
+		usdcScale := usdcAsset.Scale
+
+		// Instancia EVMSafe (ChainConnector para Safe multisig).
+		evmSafe, err := chainconnector.NewEVMSafe(chainconnector.EVMSafeConfig{
+			Chains: map[int64]chainconnector.EVMSafeChainConfig{
+				1: {
+					ChainID:          1,
+					RPCURL:           cfg.SafeRPCURL, // injetado via OpenBao/env
+					ContractAddress:  cfg.USDCContractAddress,
+					AssetCode:        "USDC",
+					AssetScale:       usdcScale, // do Asset Registry, nunca literal
+					MinConfirmations: cfg.SafeMinConfirmations,
+					SafeAddress:      cfg.SafeAddress,
+				},
+			},
+		})
+		if err != nil {
+			slog.Error("payments: falha ao inicializar EVMSafe (ChainConnector)", "err", err)
+			os.Exit(1)
+		}
+
+		// Handler de webhook do custodiante Safe/Defender.
+		// Recebe: deposit.detected, deposit.finalized, chain.reorg.
+		// Verifica assinatura HMAC-SHA256 antes de qualquer processamento.
+		safeWebhookHandler, err := cryptopkg.NewSafeWebhookHandler(
+			cryptopkg.Config{
+				WebhookSecret: safeWebhookSecret, // SAFE_WEBHOOK_SECRET — nunca loga
+				ChainConfigs: map[int64]cryptopkg.ChainAccountConfig{
+					1: {AssetCode: "USDC", AssetScale: usdcScale}, // do Asset Registry, nunca literal
+				},
+			},
+			pool,
+			assetLoader,
+			evmSafe,
+			logger,
+		)
+		if err != nil {
+			slog.Error("payments: falha ao inicializar SafeWebhookHandler", "err", err)
+			os.Exit(1)
+		}
+
+		// Webhook do custodiante Safe (celula aml-kyc).
+		// Path /webhooks/safe — convencao uniforme com os demais trilhos.
+		// A celula AML/KYC tem Cilium deny-all; apenas o Safe/Defender pode acessar.
+		mux.Handle("/webhooks/safe", safeWebhookHandler)
+
+		slog.Info("payments: trilho cripto Safe/USDC ativo",
+			"chain_id", 1,
+			"usdc_contract", cfg.USDCContractAddress,
+			"min_confirmations", cfg.SafeMinConfirmations,
+			// Nunca loga: SafeRPCURL (pode conter token), safeWebhookSecret
+		)
+	}
 
 	// Health check com verificacao de trilhos ativos.
 	railCheckers := map[string]health.RailChecker{

@@ -1,5 +1,5 @@
 // Package config carrega a configuracao do servico de pagamentos a partir
-// de variaveis de ambiente (K0/K4).
+// de variaveis de ambiente (K0/K4/K5).
 //
 // # Segredos vs. configuracao
 //
@@ -9,7 +9,7 @@
 // flags de enable, timeouts, URLs base de provedores) lida de variaveis
 // de ambiente sem prefixo de segredo.
 //
-// Variaveis de ambiente:
+// Variaveis de ambiente (fiat K4):
 //
 //	PAYMENTS_ENABLED           — "true" habilita o servico (default: false — K0).
 //	PAYMENTS_LISTEN_ADDR       — endereco de escuta HTTP (default: ":8085").
@@ -17,10 +17,19 @@
 //	PAYMENTS_PG_DSN            — DSN do Postgres do ledger (K3/K4).
 //	STRIPE_BASE_URL            — URL base da API Stripe (default: "https://api.stripe.com").
 //	ASAAS_BASE_URL             — URL base da API Asaas (default: "https://api.asaas.com/v3").
-//	ASAAS_WEBHOOK_TOKEN        — token de verificacao de webhooks Asaas (nao e segredo de API).
+//	ASAAS_WEBHOOK_TOKEN        — token de verificacao de webhooks Asaas.
 //	MERCADOPAGO_BASE_URL       — URL base da API Mercado Pago (default: "https://api.mercadopago.com").
 //	MERCADOPAGO_WEBHOOK_TOKEN  — token de verificacao de webhooks Mercado Pago.
 //	STRIPE_TAX_ENABLED         — "true" habilita Stripe Tax (default: false).
+//
+// Variaveis de ambiente (cripto K5 — Safe multisig + USDC):
+//
+//	SAFE_RPC_URL               — endpoint JSON-RPC EVM para chain_id=1 (Ethereum).
+//	                             Lido de OpenBao/env; NUNCA hardcode.
+//	SAFE_ADDRESS               — endereco da carteira Safe multisig da plataforma.
+//	SAFE_MIN_CONFIRMATIONS     — numero minimo de confirmacoes para finalidade (default: 12).
+//	USDC_CONTRACT_ADDRESS      — endereco do contrato USDC na chain (default: mainnet Ethereum).
+//	CRYPTO_ENABLED             — "true" habilita o trilho cripto Safe (default: false).
 package config
 
 import (
@@ -79,6 +88,33 @@ type Config struct {
 	// StripeTaxEnabled habilita o Stripe Tax (calculo de impostos).
 	// Default false: nao bloqueia o trilho se desabilitado.
 	StripeTaxEnabled bool
+
+	// ---------------------------------------------------------------------------
+	// K5 — Trilho cripto: Safe multisig + USDC
+	// ---------------------------------------------------------------------------
+
+	// CryptoEnabled habilita o trilho cripto Safe multisig (K5).
+	// Default false: trilho inativo ate K5 estar completo com infra viva.
+	CryptoEnabled bool
+
+	// SafeRPCURL e o endpoint JSON-RPC EVM para chain_id=1 (Ethereum mainnet).
+	// Lido de SAFE_RPC_URL (env/OpenBao). NUNCA hardcode — segredo de infra.
+	// Em staging/testnet, apontar para Sepolia ou Goerli RPC.
+	SafeRPCURL string
+
+	// SafeAddress e o endereco da carteira Safe multisig da plataforma.
+	// Lido de SAFE_ADDRESS. NAO e PII — e o endereco de custodia da plataforma.
+	SafeAddress string
+
+	// SafeMinConfirmations e o numero minimo de confirmacoes para finalidade.
+	// Default 12 (Ethereum mainnet). Ajustar por chain/rede.
+	// Lido de SAFE_MIN_CONFIRMATIONS (inteiro).
+	SafeMinConfirmations uint32
+
+	// USDCContractAddress e o endereco do contrato USDC na chain.
+	// Default: 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 (Ethereum mainnet).
+	// Sobrescrever para testnet (ex.: Sepolia USDC).
+	USDCContractAddress string
 }
 
 // Load le a configuracao das variaveis de ambiente.
@@ -96,6 +132,16 @@ func Load() (Config, error) {
 		MercadoPagoBaseURL:      envOr("MERCADOPAGO_BASE_URL", "https://api.mercadopago.com"),
 		MercadoPagoWebhookToken: os.Getenv("MERCADOPAGO_WEBHOOK_TOKEN"),
 		StripeTaxEnabled:        parseBool(os.Getenv("STRIPE_TAX_ENABLED"), false),
+
+		// K5 — cripto
+		CryptoEnabled: parseBool(os.Getenv("CRYPTO_ENABLED"), false),
+		SafeRPCURL:    os.Getenv("SAFE_RPC_URL"),
+		SafeAddress:   os.Getenv("SAFE_ADDRESS"),
+		SafeMinConfirmations: parseUint32Or(os.Getenv("SAFE_MIN_CONFIRMATIONS"), 12),
+		USDCContractAddress: envOr(
+			"USDC_CONTRACT_ADDRESS",
+			"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", // Ethereum mainnet
+		),
 	}
 
 	validEnvs := map[string]bool{"development": true, "staging": true, "production": true}
@@ -131,4 +177,18 @@ func parseBool(s string, def bool) bool {
 	default:
 		return def
 	}
+}
+
+// parseUint32Or converte uma string para uint32; retorna def se vazia ou invalida.
+func parseUint32Or(s string, def uint32) uint32 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return def
+	}
+	var n uint32
+	_, err := fmt.Sscanf(s, "%d", &n)
+	if err != nil {
+		return def
+	}
+	return n
 }
