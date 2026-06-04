@@ -245,6 +245,25 @@ fail-closed; célula isolada). **Achados HIGH/MEDIUM/LOW remediados na mesma jan
 decimal, RLS do K3 corrigida p/ `adserver.tenant_id`). `go build ./...` + **27 pacotes
 Go** + `make verify` (buf TX-1 + no-float TX-2) + BFF/console (typecheck/lint/build) **verdes**.
 
+### ✅ Entregue na Fase 3 — hardening de go-live (sob ADR-0004, sem ADR novo; gates verdes)
+
+Passada de hardening **código-endereçável** sequenciada pelo `tech-lead-architect`:
+3 das pré-condições de go-live que **não** exigem infra viva, executadas pelos
+engenheiros de camada e gateadas antes do merge.
+
+| Item | Escopo | Arquivos | Invariantes |
+|---|---|---|---|
+| **Cifra PII** | KMS-envelope (AES-256-GCM, ciphertext versionado `v1$`) das colunas de nome do cofre `compliance` (Travel Rule/KYC); cifra-antes-do-INSERT fail-closed; chave via `PII_ENVELOPE_KEY`/OpenBao | [services/payments/internal/kmsenvelope/](services/payments/internal/kmsenvelope/) | TX-3/DA-11 (PII só no cofre, 0 em log); TX-2 (dinheiro nunca cifrado) |
+| **tenant_id no payout** | `TenantID` (UUID-validado, do contexto autenticado) propagado ao screening/Travel Rule; elimina o `TenantID:""`; fail-closed | [internal/chainconnector/connector.go](internal/chainconnector/connector.go) · [safe_webhook.go](services/payments/internal/crypto/safe_webhook.go) | TX-3 (tenant pseudônimo do ctx alimenta a RLS) |
+| **Adapter Postgres do BFF** | `PostgresPaymentsAdapter` real: RLS por request via `set_config('adserver.tenant_id',…,true)` em transação + WHERE defense-in-depth; Money string DECIMAL; **+ migração `0003`** de RLS no ledger (`accounts`/`journal_entries`/`postings` + view `security_invoker`) | [bff/src/adapters/postgres-payments.ts](bff/src/adapters/postgres-payments.ts) · [db/ledger/migrations/0003_ledger_rls_up.sql](db/ledger/migrations/0003_ledger_rls_up.sql) | TX-2/DA-10 (sem float/câmbio); TX-3 (RLS efetiva, sem IDOR) |
+
+**Gates verdes (hardening):** `security-reviewer` **APROVADO** após remediar **2 CRITICAL**
+— RLS ausente nas tabelas do ledger (migração `0003`) e `SET LOCAL = $1` inválido no
+PostgreSQL → `set_config` parametrizado em transação — **+ HIGH-1** (validação de UUID do
+`TenantID`) e versionamento do ciphertext; `privacy-compliance-auditor` **APROVADO**;
+`money-ledger-guardian` **APROVADO**. `go build ./...` + **go test (35 pacotes)** +
+`make verify` (buf TX-1 + no-float TX-2) + BFF (typecheck/lint/build + **51 testes**) **verdes**.
+
 ### ⏭️ Pendente da Fase 3
 
 **K8** (promoção do deep ranking sob **uplift A/B + kill-switch**) segue **gated por
