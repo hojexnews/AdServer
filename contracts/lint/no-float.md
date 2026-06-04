@@ -17,6 +17,7 @@ ML, telemetria de performance, ranking (`pCTR`/`pCVR`), métricas etc. Escopo su
 # Diretórios/sufixos considerados "financeiros" (ajustar à árvore real do monorepo):
 **/money/**            **/ledger/**           **/billing/**
 **/payments/**         **/asset*registry*/**  **/*_money_*  **/*.money.*
+**/chainconnector/**   (manipula Money no limite on-chain — Fase 3)
 migrations/**          db/migrations/**       sql/**
 ```
 

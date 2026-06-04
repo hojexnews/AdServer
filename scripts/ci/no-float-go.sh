@@ -20,6 +20,7 @@ set -euo pipefail
 
 mapfile -t files < <(git ls-files \
     '*money*/*.go' '*ledger*/*.go' '*billing*/*.go' '*payments*/*.go' \
+    '*chainconnector*/*.go' \
     2>/dev/null | sort)
 
 if [ "${#files[@]}" -eq 0 ]; then

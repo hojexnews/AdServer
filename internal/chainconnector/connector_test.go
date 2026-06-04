@@ -195,6 +195,20 @@ func TestBuildPayout_ZeroAmount(t *testing.T) {
 	}
 }
 
+func TestBuildPayout_NegativeAmount(t *testing.T) {
+	t.Parallel()
+	s := newStub()
+	req := chainconnector.PayoutRequest{
+		ToAddress: "0xAnyone",
+		Amount:    &moneyv1.Money{AssetCode: "USDC", Amount: -1_000_000, Scale: 6},
+		ChainID:   1,
+	}
+	_, err := s.BuildPayout(context.Background(), req)
+	if err == nil {
+		t.Fatal("esperava erro para Amount negativo (invariante TX-2)")
+	}
+}
+
 func TestBuildPayout_NilAmount(t *testing.T) {
 	t.Parallel()
 	s := newStub()
