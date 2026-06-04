@@ -40,8 +40,10 @@ import type {
  * Contrato do adapter de configuração.
  *
  * Todos os métodos recebem tenantId como primeiro parâmetro.
- * O adapter real usa: `await client.query("SET LOCAL adserver.tenant_id = $1", [tenantId])`
- * antes de qualquer query de dados — activando o RLS do Postgres.
+ * O adapter real usa, DENTRO de uma transação:
+ *   `await client.query("SELECT set_config('adserver.tenant_id', $1, true)", [tenantId])`
+ * antes de qualquer query de dados — ativando o RLS do Postgres.
+ * (NÃO usar `SET LOCAL ... = $1`: SET é utility statement e não aceita bind params.)
  *
  * NUNCA confiar em tenant_id vindo de parâmetros de UI.
  */

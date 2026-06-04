@@ -27,18 +27,38 @@ import { createPaymentsRouter } from "./routers/payments.js";
 import { InMemoryConfigAdapter } from "./adapters/in-memory-config.js";
 import { InMemoryStatsAdapter } from "./adapters/in-memory-stats.js";
 import { InMemoryPaymentsAdapter } from "./adapters/in-memory-payments.js";
+import {
+  PostgresPaymentsAdapter,
+  createPgPool,
+} from "./adapters/postgres-payments.js";
+import type { PaymentsAdapter } from "./adapters/payments-adapter.js";
 
 // ---------------------------------------------------------------------------
 // Adapters — substituir pelos reais em produção
 // ---------------------------------------------------------------------------
 const configAdapter = new InMemoryConfigAdapter();
 const statsAdapter = new InMemoryStatsAdapter();
+
 /**
- * K7: adapter de pagamentos in-memory.
- * Em produção: substituir por PostgresPaymentsAdapter que faz
- * SET LOCAL adserver.tenant_id e lê ledger.account_balances + journal_entries.
+ * K7: adapter de pagamentos — Postgres real quando BFF_PG_DSN configurado;
+ * InMemory como fallback de dev/teste (sem Postgres disponível).
+ *
+ * Seleção por config (padrão do repo):
+ *   - BFF_PG_DSN presente → PostgresPaymentsAdapter (produção / staging).
+ *   - BFF_PG_DSN ausente  → InMemoryPaymentsAdapter (dev / CI sem banco).
+ *
+ * O adapter Postgres:
+ *   - SELECT set_config('adserver.tenant_id', $tenant, true) dentro da transação
+ *     (ativa RLS K3/0003; SET LOCAL = $1 não vale — SET não aceita bind params).
+ *   - Lê ledger.account_balances + journal_entries + postings.
+ *   - TX-2: NUMERIC → string DECIMAL (sem Number, sem aritmética monetária).
+ *   - TX-3: tenantId SEMPRE do ctx (sessão), nunca do cliente.
+ *   - DA-11: DSN nunca exposto no payload; PII descartada.
  */
-const paymentsAdapter = new InMemoryPaymentsAdapter();
+const pgPool = createPgPool();
+const paymentsAdapter: PaymentsAdapter = pgPool
+  ? new PostgresPaymentsAdapter(pgPool)
+  : new InMemoryPaymentsAdapter();
 
 // ---------------------------------------------------------------------------
 // App tRPC

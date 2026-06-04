@@ -7,10 +7,11 @@
  * ONDE PLUGAR O ADAPTER REAL:
  *   src/index.ts → substituir InMemoryConfigAdapter por PostgresConfigAdapter.
  *   O PostgresConfigAdapter deve:
- *     1. Abrir transação/conexão
- *     2. Executar: await client.query("SET LOCAL adserver.tenant_id = $1", [tenantId])
- *     3. Executar as queries de dados (RLS do Postgres filtra automaticamente)
- *     4. Encerrar transação
+ *     1. Abrir transação/conexão (BEGIN)
+ *     2. Executar: await client.query("SELECT set_config('adserver.tenant_id', $1, true)", [tenantId])
+ *        (NÃO usar `SET LOCAL ... = $1`: SET é utility statement e não aceita bind params)
+ *     3. Executar as queries de dados (RLS do Postgres filtra por adserver.tenant_id)
+ *     4. Encerrar transação (COMMIT/ROLLBACK)
  *
  * Money: rate é armazenado como string DECIMAL no stub.
  * Nunca use Number() para representar money.
