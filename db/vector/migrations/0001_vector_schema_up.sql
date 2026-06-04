@@ -63,7 +63,7 @@ CREATE TABLE vector_store.creative_embeddings (
 
     -- CTR histórico do criativo. FLOAT: sinal de ML/ranking, NÃO dinheiro (TX-2).
     -- Atualizado periodicamente pelo pipeline de ML (J2/J6).
-    ctr             DOUBLE PRECISION NOT NULL DEFAULT 0.0
+    ctr             DOUBLE PRECISION NOT NULL DEFAULT 0.0  -- no-float-ok: taxa de ML/ranking [0,1], não é dinheiro (TX-2)
                         CHECK (ctr >= 0.0 AND ctr <= 1.0),
 
     -- Impressões totais (para filtrar criativos sem volume suficiente)

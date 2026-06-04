@@ -31,6 +31,12 @@ fi
 #   - ignora linhas de comentario (strip -> startswith('--'))
 #   - ignora COMMENT ON
 #   - remove strings SQL literais ('...') antes de testar o padrao
+#   - COMMENT-AWARE: remove o comentario inline ('-- ...') antes de testar o
+#     tipo, de modo que so o codigo DDL real dispara o alarme.
+#   - OPT-OUT EXPLICITO: uma coluna nao-monetaria que precise de FLOAT/DOUBLE
+#     (ex.: 'ctr' como taxa de ML/ranking, NAO dinheiro) carrega o marcador
+#     'no-float-ok' no comentario inline da propria linha. E greppavel e
+#     auditavel — mesma filosofia do //nolint do guard Go.
 #   Assim 'Real Brasileiro' nao dispara o alarme; REAL como tipo DDL dispara.
 hits=$(python3 - "${files[@]}" << 'PYEOF'
 import sys, re
@@ -39,6 +45,8 @@ import sys, re
 TYPE_PAT = re.compile(r'\b(float\d*|double\s+precision|real|money)\b', re.IGNORECASE)
 # Remove strings SQL literais da linha antes de testar
 STR_LIT  = re.compile(r"'[^']*'")
+# Marcador explicito de opt-out (coluna nao-monetaria documentada)
+ALLOW_PAT = re.compile(r'no-float-ok', re.IGNORECASE)
 
 found = []
 for path in sys.argv[1:]:
@@ -51,9 +59,19 @@ for path in sys.argv[1:]:
                 continue
             if re.match(r'COMMENT\s+ON', stripped, re.IGNORECASE):
                 continue
-            # Remove strings literais antes de checar o tipo
+            # Remove strings literais antes de separar codigo de comentario
             cleaned = STR_LIT.sub("''", line)
-            if TYPE_PAT.search(cleaned):
+            # Separa o codigo DDL do comentario inline ('-- ...')
+            comment_idx = cleaned.find('--')
+            if comment_idx >= 0:
+                code, comment = cleaned[:comment_idx], cleaned[comment_idx:]
+            else:
+                code, comment = cleaned, ''
+            # Opt-out explicito e documentado na propria linha
+            if ALLOW_PAT.search(comment):
+                continue
+            # So o codigo DDL real (sem comentario) dispara o alarme
+            if TYPE_PAT.search(code):
                 found.append(f"{path}:{lineno}:{line}")
 
 if found:

@@ -152,6 +152,21 @@ hits=$(grep -RIniE '\b(float[0-9]*|double\s+precision|real|money)\b' $files || t
 > `NUMERIC(precision, scale)` por ativo, com `scale` vindo do Asset Registry (ver
 > `money-type.md` §5). `MONEY` é proibido por ser locale-dependente e de escala fixa.
 
+O guard real (`scripts/ci/no-float-sql.sh`) é **comment-aware**: remove o comentário
+inline (`-- …`) antes de testar o tipo, e o escaneamento cobre todas as migrations
+(`db/*/migrations/*.sql`), não só caminhos financeiros — uma coluna monetária pode
+viver em qualquer schema. Para uma coluna **não-monetária** que legitimamente precise
+de `DOUBLE PRECISION`/`FLOAT` (ex.: `ctr` como taxa de ML/ranking ∈ [0,1], ou um score
+de similaridade), use o marcador explícito **`no-float-ok`** no comentário inline da
+própria linha, com a justificativa:
+
+```sql
+ctr DOUBLE PRECISION NOT NULL DEFAULT 0.0  -- no-float-ok: taxa de ML/ranking [0,1], não é dinheiro (TX-2)
+```
+
+O marcador é **greppável e auditável** (`git grep no-float-ok`) — mesma filosofia do
+`//nolint` do guard Go. Nunca o use em coluna que carregue valor monetário.
+
 ---
 
 ## 5. Job de CI (GitHub Actions)
