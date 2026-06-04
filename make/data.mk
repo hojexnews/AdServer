@@ -15,7 +15,8 @@ ICEBERG_JOBS_DIR := $(DATA_DIR)/iceberg/jobs
 RP_DIR           := $(DATA_DIR)/redpanda
 
 .PHONY: data-lint data-no-float data-sql-check data-yaml-check data-py-syntax \
-        data-validate data-schema-invariants data-help
+        data-validate data-schema-invariants data-ivt-test data-ivt-sql-check \
+        data-help
 
 ## data-lint: valida DDL SQL, specs YAML e jobs Python de data/ (sem subir ClickHouse)
 data-lint: data-no-float data-sql-check data-yaml-check data-py-syntax
@@ -57,9 +58,19 @@ data-py-syntax:
 	[ "$$fail" -eq 0 ] || exit 1; \
 	echo "data-py-syntax: ok"
 
-## data-validate: lint + invariantes de schema (StatsHourly, billing, ao-vivo, row-policies)
-data-validate: data-lint data-schema-invariants
-	@echo "data-validate: OK — DDL/specs de data/ validados."
+## data-validate: lint + invariantes de schema (StatsHourly, billing, ao-vivo, row-policies, IVT)
+data-validate: data-lint data-schema-invariants data-ivt-sql-check
+	@echo "data-validate: OK — DDL/specs de data/ validados (inclui IVT J6)."
+
+## data-ivt-sql-check: verifica invariantes SQL da migration IVT (007) sem subir ClickHouse
+data-ivt-sql-check:
+	@echo "== data-ivt-sql-check (TX-6 / J6) =="
+	@python3 scripts/ci/data-ivt-sql-check.py
+
+## data-ivt-test: executa testes unitarios do job de scoring IVT com o sample sintetico
+data-ivt-test:
+	@echo "== data-ivt-test (TX-6 / J6) =="
+	@ml/.venv/bin/python data/fraud/test_ivt_scoring_job.py
 
 ## data-schema-invariants: verifica invariantes normativas do StatsHourly e billing
 data-schema-invariants:
@@ -69,6 +80,6 @@ data-schema-invariants:
 ## data-help: lista os alvos de data/
 data-help:
 	@echo ""
-	@echo "Alvos de data/ (I3-prep, data-platform-engineer):"
+	@echo "Alvos de data/ (I3-prep + J6 IVT, data-platform-engineer):"
 	@grep -E '^## data-' make/data.mk | sed 's/^## //' | awk -F': ' '{printf "  \033[1m%-30s\033[0m %s\n", $$1, $$2}'
 	@echo ""

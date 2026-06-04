@@ -1,0 +1,127 @@
+# data/iceberg/specs/ivt_scores.yaml
+#
+# Especificacao da tabela Iceberg de scores IVT (fonte de verdade para
+# reconciliacao batch de faturamento e auditoria de fraude).
+#
+# PAPEL NO PIPELINE (TX-6 / J6 / ADR-0001):
+#   O job data/fraud/ivt_scoring_job.py escreve os resultados de scoring IVT aqui.
+#   O billing_batch_hourly.py faz JOIN entre events_impression e events_ivt_score
+#   para determinar o ivt_status de cada impressao na hora de billing.
+#   Isso garante que:
+#     1. Ajustes de IVT pos-fato (re-scoring, hot-reload de modelo) sejam
+#        capturados no proximo billing run sem re-ingesta de ClickHouse.
+#     2. A fonte de verdade para o billing e SEMPRE o Iceberg (ADR-0001),
+#        nunca o streaming ClickHouse.
+#     3. Time-travel: reprocessamento de billing usa o snapshot Iceberg do
+#        momento do run original (reproducibilidade contabil).
+#
+# RECONCILIACAO BATCH (invariante ADR-0001):
+#   O billing_batch_hourly.py NUNCA usa dados do ClickHouse diretamente.
+#   Ao calcular impressoes faturadas, o job faz:
+#     1. Ler events_impression do Iceberg (ivt_status do evento na ingestao).
+#     2. LEFT JOIN com events_ivt_score por event_id (score mais recente).
+#     3. Considerar clean apenas se: ivt_status_final = '' OU = 'fail_open'.
+#   Se o score nao existir no Iceberg (evento nao pontuado): considerar como
+#   'unscored' e NAO faturar (conservador — melhor perder billing que faturar IVT).
+#   EXCECAO: se o job de scoring nao rodou (score_count = 0), o billing pode
+#   usar ivt_status da events_impression diretamente (sem JOIN).
+#
+# DINHEIRO: SEM colunas monetarias nesta tabela (TX-2 N/A).
+#   ivt_prob e probabilidade de ML (float legitimo, nao dinheiro).
+#
+# PII: sem PII (TX-5/DA-11). Todos os campos sao IDs de evento ou
+#   resultados de classificacao (sem IP, sem UA bruto, sem ID de usuario).
+#
+# PARTICIONAMENTO: (tenant_id, year, month, day) — padrao do lakehouse.
+
+catalog:
+  type: rest
+  uri: "${ICEBERG_CATALOG_URI}"
+  warehouse: "${ICEBERG_WAREHOUSE}"
+
+tables:
+
+  # ===========================================================================
+  # events_ivt_score: scores IVT por event_id (fonte de verdade para billing)
+  # ===========================================================================
+  - name: adserver.events_ivt_score
+    description: >
+      Scores IVT gerados pelo job data/fraud/ivt_scoring_job.py.
+      Fonte de verdade para reconciliacao batch de faturamento: o
+      billing_batch_hourly.py faz JOIN com events_impression por event_id
+      para determinar o ivt_status final antes de calcular postings.
+      Scoring FORA do hot path (TX-6); latencia de minutos aceitavel.
+      Sem PII (TX-5/DA-11). Sem valores monetarios (TX-2 N/A).
+      ivt_prob e float legitimo (probabilidade ML, nao dinheiro).
+    schema:
+      fields:
+        - name: event_id
+          type: string
+          required: true
+          doc: "Liga ao events_impression.event_id. PK logica para o JOIN de billing."
+        - name: score_run_id
+          type: string
+          required: true
+          doc: "UUID do job run de scoring. Permite rastrear qual execucao gerou o score."
+        - name: tenant_id
+          type: string
+          required: true
+          doc: "Isolamento de tenant (TX-3). Chave de particao Iceberg."
+        - name: campaign_id
+          type: string
+          required: false
+        - name: zone_id
+          type: string
+          required: false
+        - name: occurred_at
+          type: timestamptz
+          required: true
+          doc: "Event-time do impression original. Base das janelas de billing."
+        - name: scored_at
+          type: timestamptz
+          required: true
+          doc: "Processing-time do scoring (quando o scorer rodou)."
+        - name: ivt_status
+          type: string
+          required: true
+          doc: >
+            Resultado do scoring IVT:
+            '' = clean (nao IVT, ou fail_open tratado como clean);
+            'ivt' = classificado como IVT (excluir do billing);
+            'unscored' = nao pontuado (nao faturar, conservador).
+        - name: ivt_prob
+          # ivt_prob usa tipo 'double' (Iceberg 64-bit float) que e LEGITIMO para
+          # probabilidades de ML. A restricao de no-float (TX-2/DA-10) aplica-se
+          # a valores monetarios (_value, _amount, _rate, _decimal); ivt_prob e
+          # probabilidade de classificacao, nao dinheiro.
+          type: double
+          required: false
+          doc: >
+            Probabilidade IVT em [0.0, 1.0]. Double Iceberg (64-bit float legitimo
+            para probabilidade ML, nao dinheiro — TX-2 N/A). Nulo se model_version='fail_open'.
+        - name: ivt_label
+          type: integer
+          required: false
+          doc: "0=clean, 1=IVT. Resultado discreto do threshold do scorer."
+        - name: model_version
+          type: string
+          required: true
+          doc: >
+            Versao do modelo IVT no MLflow registry (ex.: '1', '2').
+            'fail_open' se o scorer falhou (excecao ou modelo nao carregado).
+            Usado para auditoria de qual versao de modelo pontuou cada evento.
+    partition:
+      - field: tenant_id
+      - transform: year(occurred_at)
+        name: year
+      - transform: month(occurred_at)
+        name: month
+      - transform: day(occurred_at)
+        name: day
+    write:
+      format: parquet
+      compression: zstd
+    properties:
+      write.parquet.compression-codec: zstd
+      write.target-file-size-bytes: "33554432"    # 32 MB (volume menor que impressions)
+      history.expire.max-snapshot-age-ms: "7776000000"  # 90 dias (alinhado com raw_ivt_score TTL)

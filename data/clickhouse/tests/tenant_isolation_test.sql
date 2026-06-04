@@ -109,6 +109,17 @@ VALUES
      'evt-req-b-001', '', 'v1', now(), 'v1', 'test',
      'zone-b', 'site-b', 'US', 'New York', 'desktop/firefox', 'https://other.com/page', 'cb2');
 
+INSERT INTO adserver.raw_ivt_score
+    (event_id, score_run_id, tenant_id, campaign_id, zone_id,
+     occurred_at, scored_at, ivt_status, ivt_prob, ivt_label, model_version)
+VALUES
+    -- Tenant A
+    ('evt-ivt-a-001', 'run-a-001', '11111111-1111-4111-a111-111111111111',
+     'camp-a', 'zone-a', now(), now(), 'ivt', 0.95, 1, 'ivt-v1'),
+    -- Tenant B
+    ('evt-ivt-b-001', 'run-b-001', '22222222-2222-4222-a222-222222222222',
+     'camp-b', 'zone-b', now(), now(), 'ivt', 0.91, 1, 'ivt-v1');
+
 INSERT INTO adserver.raw_click
     (tenant_id, event_id, decision_id, model_version, occurred_at,
      schema_version, source, campaign_id, banner_id, zone_id, dest_url)
@@ -175,6 +186,14 @@ FROM adserver.raw_conversion FINAL
 WHERE tenant_id = '22222222-2222-4222-a222-222222222222';
 -- Resultado esperado: 0
 
+-- TESTE 1e2: raw_ivt_score — tenant A nao ve linhas de tenant B
+-- EXPECT: 0 rows
+SELECT count() AS cross_tenant_leak_ivt_score
+FROM adserver.raw_ivt_score FINAL
+WHERE tenant_id = '22222222-2222-4222-a222-222222222222';
+-- Resultado esperado: 0
+-- Se retornar > 0: FALHA DE ISOLAMENTO — vazamento cross-tenant em raw_ivt_score.
+
 -- TESTE 1f: live_stats_exact — tenant A nao ve linhas de tenant B
 -- EXPECT: 0 rows
 SELECT count() AS cross_tenant_leak_live_exact
@@ -208,6 +227,14 @@ SELECT count() AS own_rows_impression
 FROM adserver.raw_impression FINAL
 WHERE tenant_id = '11111111-1111-4111-a111-111111111111';
 -- Resultado esperado: >= 1
+
+-- TESTE 2c: tenant A ve seus proprios scores IVT
+-- EXPECT: >= 1 rows
+SELECT count() AS own_rows_ivt_score
+FROM adserver.raw_ivt_score FINAL
+WHERE tenant_id = '11111111-1111-4111-a111-111111111111';
+-- Resultado esperado: >= 1
+-- Se retornar 0: row-policy demasiado restritiva (falso negativo).
 
 -- =============================================================================
 -- BLOCO 3: Caso adversarial — usuario "tenant_ab_tenant_cd"
@@ -250,6 +277,13 @@ FROM adserver.raw_click FINAL;
 SELECT count() AS adversarial_leak_conversion
 FROM adserver.raw_conversion FINAL;
 -- Resultado esperado: 0
+
+-- TESTE 3f: usuario adversarial nao ve nenhuma linha em raw_ivt_score (fail-closed)
+-- EXPECT: 0 rows
+SELECT count() AS adversarial_leak_ivt_score
+FROM adserver.raw_ivt_score FINAL;
+-- Resultado esperado: 0
+-- Se retornar > 0: row-policy FALHOU em rejeitar nome de usuario invalido para raw_ivt_score.
 
 -- =============================================================================
 -- BLOCO 4: Verificacao da expressao de extracao de tenant_id (logica interna)
@@ -342,6 +376,9 @@ WHERE event_id IN ('evt-req-a-001', 'evt-req-b-001');
 
 ALTER TABLE adserver.raw_click DELETE
 WHERE event_id IN ('evt-clk-a-001', 'evt-clk-b-001');
+
+ALTER TABLE adserver.raw_ivt_score DELETE
+WHERE event_id IN ('evt-ivt-a-001', 'evt-ivt-b-001');
 
 ALTER TABLE adserver.raw_conversion DELETE
 WHERE event_id IN ('evt-cvr-a-001', 'evt-cvr-b-001');

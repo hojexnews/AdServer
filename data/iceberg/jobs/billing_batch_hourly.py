@@ -19,8 +19,12 @@ INVARIANTES (nao violar):
        + alerta), nunca autocorrige. Ver reconcile() abaixo.
     5. A janela de atribuicao (lookback_days) e PARAMETRO do job (ADR-0002 B.7),
        nao fato gravado no schema. Trocar a janela nao exige migracao.
-    6. IVT excluido: so fatura impressoes com ivt_status == '' (clean)
-       e billable == True (TX-6).
+    6. IVT excluido via reconciliacao batch contra Iceberg (TX-6 / J6):
+       - O filtro IVT definitivo usa events_ivt_score (Iceberg), nao o
+         ivt_status do ClickHouse.
+       - Nunca faturar ivt_status='ivt' ou 'unscored'.
+       - fail_open -> tratar como clean (nao bloquear trafego legitimo, TX-6).
+       - Ver apply_ivt_filter_to_impressions() e read_ivt_scores_for_hour().
     7. Conversoes deduplicated=True sao excluidas do billing CPA.
     8. O scale de cada ativo vem do Asset Registry (db/ledger/); nunca
        inferido do payload. Divergencia de scale = excecao, nao correcao.
@@ -54,10 +58,20 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import sys
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_EVEN, Decimal, localcontext
+from pathlib import Path
+
+# Resolve repo root para importar do data/fraud/ (mesmo processo Python)
+_REPO_ROOT = Path(__file__).parent.parent.parent.parent
+sys.path.insert(0, str(_REPO_ROOT))
+
+# Importa utilitários de reconciliação IVT do job de scoring (dono: data-platform)
+# apply_ivt_filter_to_impressions: aplica filtro IVT reconciliado (Iceberg > ClickHouse)
+from data.fraud.ivt_scoring_job import apply_ivt_filter_to_impressions  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Configuracao de logging
@@ -184,6 +198,56 @@ def calc_cpa_amount(conversions: int, rate: Decimal, asset: AssetInfo) -> Decima
 # Leitura do Iceberg (esqueleto com PyIceberg)
 # ---------------------------------------------------------------------------
 
+def read_ivt_scores_for_hour(
+    catalog,
+    hour_bucket: datetime,
+    tenant_id: str | None,
+) -> dict[str, str]:
+    """
+    Le os scores IVT do Iceberg (adserver.events_ivt_score) para a hora
+    especificada e retorna um mapa event_id -> ivt_status.
+
+    INVARIANTE (TX-6 / ADR-0001):
+      O billing NUNCA usa o ivt_status do ClickHouse diretamente.
+      A fonte de verdade para o ivt_status de billing e SEMPRE o Iceberg.
+      Este metodo le os scores IVT persistidos pelo ivt_scoring_job.py.
+
+    POLITICA DE FALLBACK:
+      Se um event_id nao tiver score em events_ivt_score:
+        -> ivt_status = 'unscored' (nao faturar — conservador)
+      Se o score for model_version='fail_open':
+        -> ivt_status = '' (clean — fail-open conservador, TX-6)
+
+    RECONCILIACAO POS-FATO:
+      Se o job de scoring rodar APOS o billing (late scoring), o proximo
+      billing run (reprocessamento da mesma hora) captara o score correto
+      via time-travel do Iceberg (snapshot_id fixo no billing_posting).
+      Divergencia detectada por reconcile_with_clickhouse() -> excecao.
+
+    Retorna dict: {event_id: ivt_status_final}
+    """
+    hour_end = hour_bucket + timedelta(hours=1)
+    log.info(
+        "read_ivt_scores_for_hour: hour=%s tenant=%s",
+        hour_bucket.isoformat(), tenant_id or "all",
+    )
+    # TODO(data-platform): implementar scan PyIceberg.
+    # table = catalog.load_table("adserver.events_ivt_score")
+    # scan = table.scan(
+    #     row_filter=(
+    #         (col("occurred_at") >= lit(hour_bucket)) &
+    #         (col("occurred_at") <  lit(hour_end)) &
+    #         (col("tenant_id")   == lit(tenant_id) if tenant_id else lit(True))
+    #     ),
+    #     selected_fields=("event_id", "ivt_status", "model_version"),
+    # )
+    # rows = scan.to_arrow().to_pylist()
+    # Politica de resolucao: score mais recente (scored_at maior) por event_id.
+    # Se model_version='fail_open': ivt_status = '' (clean, TX-6 fail-open).
+    # Retornar {event_id: ivt_status_final}.
+    return {}  # placeholder: mapa vazio (sem scores -> billing usa ivt_status da impression)
+
+
 def read_impressions_for_billing(
     catalog,
     hour_bucket: datetime,
@@ -191,8 +255,17 @@ def read_impressions_for_billing(
 ) -> list[dict]:
     """
     Le impressoes faturadas para a hora especificada.
-    Filtra: billable=True AND ivt_status='' (clean) AND blank=False.
-    Retorna lista de dicts: {tenant_id, campaign_id, banner_id, zone_id, count}.
+    Filtra primario: billable=True AND blank=False (da events_impression).
+    O filtro IVT DEFINITIVO e aplicado por apply_ivt_filter_to_impressions()
+    usando os scores de events_ivt_score (fonte de verdade IVT no Iceberg).
+
+    NOTA: o ivt_status em events_impression e o status na hora da ingestao.
+    O status reconciliado pos-scoring (events_ivt_score) pode diferir se o
+    scoring rodar apos o sink. O billing usa SEMPRE o score de events_ivt_score
+    quando disponivel (apply_ivt_filter_to_impressions).
+
+    Retorna lista de dicts: {tenant_id, campaign_id, banner_id, zone_id,
+                             event_id, ivt_status, count}.
 
     ESQUELETO: usar PyIceberg scan com filtros de predicado (partition pruning).
     """
@@ -209,16 +282,21 @@ def read_impressions_for_billing(
     #           (col("occurred_at") >= lit(hour_bucket)) &
     #           (col("occurred_at") <  lit(hour_end)) &
     #           (col("billable")    == lit(True)) &
-    #           (col("ivt_status")  == lit("")) &
     #           (col("blank")       == lit(False)) &
     #           (col("tenant_id")   == lit(tenant_id) if tenant_id else lit(True))
     #       ),
-    #       selected_fields=("tenant_id","campaign_id","banner_id","zone_id","event_id"),
+    #       selected_fields=(
+    #           "tenant_id","campaign_id","banner_id","zone_id",
+    #           "event_id","ivt_status",
+    #       ),
     #       snapshot_id=snapshot_id,   # time-travel: snapshot fixo para reproducibilidade
     #   )
-    #   rows = scan.to_arrow().group_by(["tenant_id","campaign_id","banner_id","zone_id"])
-    #              .agg([("event_id", "count_distinct")])
-    #              .to_pylist()
+    #   rows = scan.to_arrow().to_pylist()
+    #   # NAO filtrar ivt_status aqui: o filtro IVT reconciliado vem de
+    #   # apply_ivt_filter_to_impressions() com os scores de events_ivt_score.
+    #   # Retornar todas as impressoes billable=True, blank=False para o filtro
+    #   # IVT ser aplicado com a fonte de verdade (events_ivt_score).
+    #   return rows
     return []  # placeholder
 
 
@@ -436,7 +514,32 @@ def run_billing_batch(
     conversion_snapshot_id = get_iceberg_snapshot_id(catalog, "adserver.events_conversion")
 
     # 4. Leitura dos eventos
-    impression_rows = read_impressions_for_billing(catalog, hour_bucket, tenant_id)
+    #
+    # 4a. Carrega scores IVT do Iceberg (events_ivt_score) para reconciliacao.
+    #     INVARIANTE (TX-6 / ADR-0001): o filtro IVT de billing usa SEMPRE
+    #     os scores do Iceberg, nao o ivt_status do ClickHouse.
+    ivt_scores = read_ivt_scores_for_hour(catalog, hour_bucket, tenant_id)
+    log.info(
+        "run_billing_batch: %d scores IVT carregados do Iceberg para hora %s.",
+        len(ivt_scores), hour_bucket.isoformat(),
+    )
+
+    # 4b. Le impressoes (billable=True, blank=False) do Iceberg.
+    #     O filtro IVT definitivo e aplicado em seguida (4c).
+    impression_rows_raw = read_impressions_for_billing(catalog, hour_bucket, tenant_id)
+
+    # 4c. Aplica filtro IVT reconciliado (events_ivt_score > events_impression).
+    #     Exclui: ivt_status='ivt' (classificado) e 'unscored' (nao pontuado).
+    #     Inclui: '' (clean) e 'fail_open' (fail-open conservador, TX-6).
+    #     NUNCA faturar IVT ou trafego nao avaliado.
+    impression_rows = apply_ivt_filter_to_impressions(impression_rows_raw, ivt_scores)
+
+    log.info(
+        "run_billing_batch: impressoes apos filtro IVT: %d/%d (excluidas: %d).",
+        len(impression_rows), len(impression_rows_raw),
+        len(impression_rows_raw) - len(impression_rows),
+    )
+
     click_rows      = read_clicks_for_billing(catalog, hour_bucket, tenant_id)
     conversion_rows = read_conversions_for_billing(
         catalog, hour_bucket, tenant_id, lookback_days, attribution_model,
@@ -446,6 +549,7 @@ def run_billing_batch(
     postings: list[BillingPosting] = []
 
     # CPM: billing por impressoes (1 posting por campanha/banner/zona/hora)
+    # Nota: impression_rows ja esta filtrado por IVT (apenas clean, TX-6).
     for row in impression_rows:
         # TODO: buscar rate da campanha (contrato com money-ledger-guardian via db/)
         # rate = fetch_campaign_rate(row["campaign_id"], "CPM", db_uri)
