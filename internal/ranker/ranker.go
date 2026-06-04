@@ -9,13 +9,40 @@
 //  2. For each candidate, MLRanker:
 //     a. Calls Featurize to produce the float32[23] vector (zero network, TX-4).
 //     b. Sends the vector to the ranker sidecar via ScoreClient (UDS, TX-4).
-//     c. Sorts candidates by descending score (higher pCTR first).
+//     c. Sorts candidates by the stratum-appropriate objective (see below).
 //
-//  3. Hard deadline (TX-4): if the total scoring budget is exceeded, MLRanker
+//  3. Ranking objective per stratum (DA-3 / revenue vs. delivery):
+//
+//     REMNANT — revenue-maximising leilão:
+//       Sort key = ScoreCandidate(pCTR, ECPMMinorUnits) = eCPM in minor-units.
+//       Rationale: Remnant is an open auction; the economic objective is to
+//       maximise yield.  eCPM = pCTR × bid correctly captures expected
+//       revenue per impression.  Ordering by pCTR alone is an economic error:
+//       a candidate with pCTR=0.05, bid=50 (eCPM≈3) would beat one with
+//       pCTR=0.04, bid=10000 (eCPM≈400), destroying ~$4 of yield.
+//
+//     CONTRACT — delivery-driven (pacing):
+//       Sort key = pCTR (float32 from sidecar).
+//       Rationale: Contract campaigns have a committed delivery goal (pacing,
+//       DA-4).  The cascade has already ordered them by pacing deficit
+//       (sortContracts).  Within that priority, re-ranking by pCTR maximises
+//       CTR performance of the delivered impressions without violating the
+//       delivery commitment.  Revenue is not the objective here; the bid is
+//       pre-negotiated.
+//
+//     OVERRIDE — priority-driven (guaranteed placement):
+//       Sort key = pCTR (float32 from sidecar).
+//       Rationale: Override campaigns are guaranteed placements (typically
+//       sponsorships or takeovers).  Delivery priority dominates; the cascade
+//       has already sorted by campaign Priority.  Re-ranking by pCTR within
+//       the same priority level optimises CTR without affecting the
+//       contractual delivery guarantee.
+//
+//  4. Hard deadline (TX-4): if the total scoring budget is exceeded, MLRanker
 //     returns the original (deterministic cascade) order unchanged — fail-open.
 //     The caller (decision handler) sets MlFailOpen=true on the Decision.
 //
-//  4. Fail-open conditions (all result in returning the unmodified input slice):
+//  5. Fail-open conditions (all result in returning the unmodified input slice):
 //     a. Sidecar socket unavailable / dial timeout.
 //     b. Any IPC error (write/read/parse).
 //     c. Context deadline exceeded (TX-4 budget).
@@ -193,26 +220,60 @@ func (r *MLRanker) rankInternal(candidates []*cascade.Candidate) RankResult {
 		}
 	}
 
-	// Sort candidates by descending score. sort.SliceStable preserves the
-	// deterministic cascade order for equal scores (the J1 dummy model returns
-	// all 0s → order is fully preserved, which is the correct J1 behaviour).
+	// Determine the stratum from the first candidate (DA-3: all candidates in
+	// this slice belong to the same tier; the cascade never mixes strata).
+	stratum := candidates[0].Tier
+
+	// Compute the sort key for each candidate based on the stratum objective.
+	//
+	// REMNANT: sort by eCPM = ScoreCandidate(pCTR, bid) in minor-units.
+	//   This is the revenue-maximising objective.  A candidate with a lower
+	//   pCTR but a much higher bid should rank above one with a higher pCTR
+	//   and a negligible bid (e.g., pCTR=0.04/bid=10000 beats pCTR=0.05/bid=50).
+	//
+	// OVERRIDE / CONTRACT: sort by pCTR directly.
+	//   These strata are delivery-driven, not auction-driven.  Re-ranking by
+	//   pCTR optimises CTR performance within the committed delivery slot.
+	//   See package doc (point 3) for full rationale.
+	//
+	// sort.SliceStable preserves the deterministic cascade order for equal
+	// sort keys.  With the J1 stub (all pCTR=0):
+	//   - Remnant:  ScoreCandidate(0, bid) = 0 for all → stable sort is a no-op.
+	//   - Override/Contract: all pCTR=0 → stable sort is a no-op.
+	// In both cases the J1 golden tests remain green.
 	type indexed struct {
-		idx   int
-		score float32
+		idx      int
+		sortKey  int64 // eCPM minor-units for Remnant; int64(pCTR*1e9) for others
 	}
 	order := make([]indexed, len(candidates))
 	for i, s := range scores {
-		order[i] = indexed{idx: i, score: s}
+		var key int64
+		switch stratum {
+		case snapshot.TierRemnant:
+			// Revenue objective: eCPM = pCTR × bid (minor-units, int64).
+			key = ScoreCandidate(s, candidates[i].ECPMMinorUnits)
+		default:
+			// Override / Contract: CTR objective.
+			// Scale pCTR to int64 to use the same stable integer sort path.
+			// Multiply by 1e9 to preserve float32 resolution (~7 decimal digits)
+			// without introducing float comparisons in the sort comparator.
+			// float32 has ~7 significant digits; 1e9 keeps 9 digits → no loss.
+			key = int64(s * 1e9) //nolint:forbidigo // sort-key scaling, not money
+		}
+		order[i] = indexed{idx: i, sortKey: key}
 	}
 	sort.SliceStable(order, func(a, b int) bool {
-		return order[a].score > order[b].score
+		return order[a].sortKey > order[b].sortKey
 	})
 
 	reranked := make([]*cascade.Candidate, len(candidates))
 	rerankedScores := make([]float32, len(candidates))
 	for newPos, item := range order {
 		reranked[newPos] = candidates[item.idx]
-		rerankedScores[newPos] = item.score
+		// Scores carries the raw pCTR from the sidecar for OPE logging.
+		// The sort key (eCPM for Remnant, scaled-pCTR for others) is not
+		// stored here — the decision handler needs the raw pCTR for propensity.
+		rerankedScores[newPos] = scores[item.idx]
 	}
 
 	return RankResult{
