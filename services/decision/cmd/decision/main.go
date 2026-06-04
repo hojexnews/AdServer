@@ -40,6 +40,7 @@ import (
 	"github.com/hojex/adserver/internal/clicktoken"
 	"github.com/hojex/adserver/internal/configload"
 	"github.com/hojex/adserver/internal/geo"
+	mlranker "github.com/hojex/adserver/internal/ranker"
 	"github.com/hojex/adserver/internal/rules"
 	"github.com/hojex/adserver/internal/snapshot"
 	"github.com/hojex/adserver/internal/telemetry"
@@ -152,6 +153,34 @@ type decisionHandler struct {
 	sink        DecisionSink
 	logger      *slog.Logger
 	clickSigner *clicktoken.Signer // nil → click tokens omitted (degraded)
+
+	// mlRanker is the ML re-ranker client (Fase 2 / J1).
+	// nil when RANKER_ENABLED=false (default in J1 — flag is OFF by default).
+	// When non-nil, the ranker is already wired into cascadeEngine via
+	// cascade.WithRanker; mlRanker is also stored here to access LastResult()
+	// after Decide returns (for filling Decision.MlFailOpen and per-candidate scores).
+	//
+	// Two states (from the J1 spec):
+	//  1. RANKER_ENABLED=false (mlRanker==nil):
+	//     Decision.MlFailOpen = false
+	//     Decision.ExplorationPolicy = DETERMINISTIC
+	//     Decision.Envelope.ModelVersion = ""
+	//     Semantics: "ranker not attempted" — OPE baseline, pure cascade order.
+	//
+	//  2. RANKER_ENABLED=true, ranker attempted but failed (fail-open):
+	//     Decision.MlFailOpen = true
+	//     Decision.ExplorationPolicy = DETERMINISTIC  (cascade fallback)
+	//     Decision.Envelope.ModelVersion = ""
+	//     Semantics: "ranker tried, timed out / IPC error" — OPE must exclude.
+	//
+	//  3. RANKER_ENABLED=true, ranker scored successfully (even with dummy model):
+	//     Decision.MlFailOpen = false
+	//     Decision.ExplorationPolicy = EPSILON_GREEDY (or the active bandit; DETERMINISTIC for J1 stub)
+	//     Decision.Envelope.ModelVersion = "stub-j1" (or the real version from J2)
+	//     Per-candidate scores filled in Candidates[].Score.
+	//     Semantics: "ranker active, order may differ from cascade pure order".
+	//     With the J1 dummy model, all scores = 0 and order is preserved (no net change).
+	mlRanker *mlranker.MLRanker
 }
 
 func (h *decisionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -217,53 +246,82 @@ func (h *decisionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	result := h.cascade.Decide(cascadeReq, snap)
 
+	// Determine ML ranker metadata AFTER the cascade result.
+	//
+	// When RANKER_ENABLED=true, the cascade already ran the ML re-ranker
+	// (via cascade.WithRanker). We now read the RankResult from the ranker
+	// to propagate ml_fail_open, model_version, and per-candidate scores.
+	//
+	// States (documented in the mlRanker field comment):
+	//  - mlRanker == nil (RANKER_ENABLED=false): pure cascade, MlFailOpen=false.
+	//  - mlRanker != nil, FailOpen=true: ranker attempted, timed out / IPC error.
+	//  - mlRanker != nil, FailOpen=false: ranker scored successfully.
+	//    With J1 dummy model: scores=0, order unchanged, but MlFailOpen=false.
+	mlFailOpen := false
+	mlModelVersion := ""
+	if h.mlRanker != nil {
+		rankRes := h.mlRanker.LastResult()
+		mlFailOpen = rankRes.FailOpen
+		mlModelVersion = rankRes.ModelVersion
+
+		// Overwrite per-candidate Score with ML score (even if 0 for dummy model).
+		// The score field in Candidates[] is the ML signal, not the deterministic key.
+		// With the dummy model all scores are 0; with the real model (J2) they are pCTR.
+		if !rankRes.FailOpen && len(rankRes.Scores) == len(result.Candidates) {
+			for i, pc := range result.Candidates {
+				pc.Score = float64(rankRes.Scores[i]) //nolint:forbidigo // ML ranking signal, not money
+			}
+		}
+	}
+
 	// Build the Decision log entry (TX-1).
-	// model_version is "" for cascata pura (DETERMINISTIC per decision.proto).
+	// model_version is "" for pure cascade; non-empty when ML ranker scored.
 	// decision_id MUST be present on every decision — even blank (TX-1).
 	envelope := &commonv1.Envelope{
 		TenantId:      tenantID, // server-derived
 		EventId:       decisionID,
 		DecisionId:    decisionID,
-		ModelVersion:  "", // cascata pura — no ML ranker in I0/I2
+		ModelVersion:  mlModelVersion,
 		OccurredAt:    timestamppb.New(now),
 		SchemaVersion: "1.0.0",
 		Source:        "delivery-decision",
 	}
 
-	// J0 (Fase 2, cascade-only): all propensity / exploration fields set here.
-	//
-	// J1 EXTENSION POINT — when the ML sidecar is wired via cascade.WithRanker():
-	//   1. Propensity: replace 1.0 with the ranker's P(chosen | context, policy).
-	//   2. ExplorationPolicy: set to EPSILON_GREEDY / THOMPSON / LINUCB as active.
-	//   3. Epsilon: set to the current exploration rate (schedule from config).
-	//   4. MlFailOpen: set to TRUE when the ranker exceeded TX-4 budget and the
-	//      cascade fell back to deterministic order — signals OPE to exclude this
-	//      decision from ML training data.
-	//   5. model_version: set Envelope.ModelVersion to the deployed ranker tag.
-	//   The cascade stratum order (Override > Contract > Remnant) is NEVER changed
-	//   by the ML ranker; it only re-ranks within the winning stratum (DA-3).
+	// Exploration policy:
+	//  - RANKER_ENABLED=false OR fail-open: DETERMINISTIC (cascade pure order).
+	//  - RANKER_ENABLED=true, scored: DETERMINISTIC for J1 stub (epsilon=0).
+	//    J3+ will set EPSILON_GREEDY / THOMPSON / LINUCB and fill Epsilon.
+	explorationPolicy := decisionv1.ExplorationPolicy_EXPLORATION_POLICY_DETERMINISTIC
+	if h.mlRanker != nil && !mlFailOpen {
+		// Ranker scored successfully. In J1 the stub always uses DETERMINISTIC
+		// (no exploration — dummy scores are all equal, no real bandit yet).
+		// J3 will change this to EPSILON_GREEDY / THOMPSON based on config.
+		explorationPolicy = decisionv1.ExplorationPolicy_EXPLORATION_POLICY_DETERMINISTIC
+	}
+
 	decision := &decisionv1.Decision{
 		Envelope:   envelope,
 		ZoneId:     req.ZoneID,
 		ServedTier: result.ServedTier,
-		// Propensity = 1.0: cascata pura (DETERMINISTIC) — the top-ranked
-		// eligible candidate is chosen with certainty given the context.
-		// This is the correct OPE baseline (J3); never set to 0 for a served ad.
-		Propensity: 1.0,
-		// ExplorationPolicy = DETERMINISTIC (not _UNSPECIFIED): J0 is explicitly
-		// deterministic.  UNSPECIFIED would be ambiguous and break OPE filters.
-		ExplorationPolicy: decisionv1.ExplorationPolicy_EXPLORATION_POLICY_DETERMINISTIC,
-		Epsilon:    0, // no random exploration in cascade-only mode
-		Candidates: result.Candidates,
-		// CandidateCount = len(Candidates) in J0 (no truncation).
-		// J1 may truncate the slice for large stratums; CandidateCount then
-		// carries the true set size for density/competition signals.
+		// Propensity = 1.0 under DETERMINISTIC policy (both pure cascade and J1 stub).
+		// The cascade (or the dummy ranker with all-zero scores + stable sort)
+		// deterministically selects the top-ranked eligible candidate, so
+		// P(action | context, policy) = 1.0. Correct OPE baseline for J3.
+		// J3+ will replace this with the bandit propensity when exploration is active.
+		Propensity:        1.0,
+		ExplorationPolicy: explorationPolicy,
+		Epsilon:           0, // no random exploration in J1
+		Candidates:        result.Candidates,
+		// CandidateCount carries the true set size for density/competition signals
+		// even if the Candidates slice is truncated in future increments.
 		CandidateCount: uint32(len(result.Candidates)),
-		// MlFailOpen = false: no ML sidecar attempted, so no fail-open occurred.
-		// J1 sets this to true when the ranker times out (TX-4 budget exceeded)
-		// and the cascade falls back to DefaultRanker.  Consumers filter these
-		// out when building training datasets to avoid contamination.
-		MlFailOpen: false,
+		// MlFailOpen:
+		//  false when RANKER_ENABLED=false (state 1 — ranker not attempted).
+		//  true  when RANKER_ENABLED=true but timed out / IPC error (state 2).
+		//  false when RANKER_ENABLED=true and scored OK (state 3 — even dummy model).
+		// OPE consumers MUST filter out ml_fail_open=true decisions (propensity is
+		// meaningless when the ranker fell back to cascade order without scoring).
+		MlFailOpen: mlFailOpen,
 	}
 
 	if result.Campaign != nil {
@@ -281,7 +339,7 @@ func (h *decisionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Build HTTP response.
 	resp := DecideResponse{
 		DecisionID:   decisionID,
-		ModelVersion: "",
+		ModelVersion: mlModelVersion,
 		TenantID:     tenantID, // server-derived
 		ZoneID:       req.ZoneID,
 		ServedTier:   result.ServedTier.String(),
@@ -433,21 +491,57 @@ func main() {
 	}
 
 	// ---------------------------------------------------------------------------
-	// Cascade engine with real capper + default (no-op) ranker.
+	// Cascade engine with real capper + optional ML re-ranker (Fase 2 / J1).
 	//
-	// J1 EXTENSION POINT (TX-4 / Fase 2 ML ranker):
-	//   Replace DefaultRanker with the ML sidecar ranker:
-	//     mlRanker := mlsidecar.New(timeout=7ms, failOpen=cascade.DefaultRanker{})
-	//     cascadeEngine = cascade.New(rulesEngine,
-	//         cascade.WithCapper(cappingImpl),
-	//         cascade.WithRanker(mlRanker))   // ← plug here
-	//   The mlRanker MUST honour the TX-4 hard deadline (5–8ms p99):
-	//   - On timeout: return the input slice unmodified (fail-open to deterministic).
-	//   - On fail-open: the handler sets MlFailOpen=true and ExplorationPolicy=DETERMINISTIC.
-	//   The cascade stratum order is NEVER changed by the ranker (DA-3).
+	// RANKER_ENABLED controls whether the ML re-ranker is active.
+	// Default: false (DISABLED). The cascade uses DefaultRanker (deterministic).
+	//
+	// When RANKER_ENABLED=true:
+	//   - RANKER_SOCKET_PATH: path to the ranker sidecar Unix socket.
+	//     Default: /tmp/ranker.sock
+	//   - RANKER_BUDGET_MS: hard TX-4 deadline for a full Rank call (ms).
+	//     Default: 5 (ms). Must fit within the 5–8 ms p99 budget (TX-4).
+	//
+	// ML re-ranker semantics (J1 with stub/dummy model):
+	//   - The sidecar returns score=0 for every candidate.
+	//   - stable sort preserves the cascade deterministic order.
+	//   - Net effect on decision: ZERO (order unchanged, scores=0).
+	//   - Decision.ml_fail_open = false (ranker succeeded — just dummy scores).
+	//   - Decision.model_version = "stub-j1" (or RANKER_MODEL_VERSION env var).
+	//
+	// J2 will swap in the real .onnx model; the flag and socket path are unchanged.
+	// DA-3 invariant: the cascade stratum order is NEVER changed by the ranker.
+	// TX-4 invariant: timeout fires → fail-open → cascade deterministic order.
 	// ---------------------------------------------------------------------------
 	rulesEngine := rules.New()
-	cascadeEngine := cascade.New(rulesEngine, cascade.WithCapper(cappingImpl))
+	var activeMLRanker *mlranker.MLRanker
+	cascadeOpts := []cascade.Option{cascade.WithCapper(cappingImpl)}
+
+	rankerEnabled := os.Getenv("RANKER_ENABLED") == "true"
+	if rankerEnabled {
+		socketPath := envOr("RANKER_SOCKET_PATH", "/tmp/ranker.sock")
+		budgetMs := envOrInt("RANKER_BUDGET_MS", 5)
+		budget := time.Duration(budgetMs) * time.Millisecond
+
+		activeMLRanker = mlranker.New(socketPath, budget, logger)
+
+		// Read model version from env (set by the sidecar operator at deploy time).
+		// In J1 stub mode the sidecar reports "stub-j1" regardless; this env var
+		// lets the operator override it without redeploying the decision service.
+		modelVersion := envOr("RANKER_MODEL_VERSION", "stub-j1")
+		activeMLRanker.WithModelVersion(modelVersion)
+
+		cascadeOpts = append(cascadeOpts, cascade.WithRanker(activeMLRanker))
+
+		logger.Info("ML ranker: ENABLED (Fase 2 / J1)",
+			"socket", socketPath,
+			"budget_ms", budgetMs,
+			"model_version", modelVersion)
+	} else {
+		logger.Info("ML ranker: DISABLED (RANKER_ENABLED not set or false); using cascade DefaultRanker")
+	}
+
+	cascadeEngine := cascade.New(rulesEngine, cascadeOpts...)
 
 	// ---------------------------------------------------------------------------
 	// Decision sink (I2): Redpanda producer with WAL + at-least-once + dedupe.
@@ -496,6 +590,7 @@ func main() {
 		sink:        sink,
 		logger:      logger,
 		clickSigner: clickSigner, // nil → click tokens omitted (degraded mode)
+		mlRanker:    activeMLRanker, // nil when RANKER_ENABLED=false (default)
 	})
 
 	addr := envOr("DECISION_ADDR", ":8080")
@@ -549,6 +644,26 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// envOrInt reads an integer environment variable, falling back to def on
+// absence or parse error.
+func envOrInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n := 0
+	for _, ch := range v {
+		if ch < '0' || ch > '9' {
+			return def
+		}
+		n = n*10 + int(ch-'0')
+	}
+	if n <= 0 {
+		return def
+	}
+	return n
 }
 
 // snapshotRefreshInterval reads SNAPSHOT_REFRESH_INTERVAL (a Go duration like
