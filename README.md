@@ -264,6 +264,31 @@ PostgreSQL → `set_config` parametrizado em transação — **+ HIGH-1** (valid
 `money-ledger-guardian` **APROVADO**. `go build ./...` + **go test (35 pacotes)** +
 `make verify` (buf TX-1 + no-float TX-2) + BFF (typecheck/lint/build + **51 testes**) **verdes**.
 
+### ✅ Entregue na Fase 3 — 4ª onda: verificação pré-go-live (sob ADR-0004, sem ADR novo; gates verdes)
+
+Onda **código-endereçável** sequenciada pelo `tech-lead-architect`: as pré-condições de
+go-live que **provam** (não apenas afirmam) os invariantes já entregues, antes do cutover.
+Tudo roda **sem infra viva** (Postgres efêmero/local, stubs, validação offline).
+
+| Item | Escopo | Arquivos | Invariantes |
+|---|---|---|---|
+| **Teste RLS do ledger** | Isolamento por tenant das tabelas de **dinheiro** (`accounts`/`journal_entries`/`postings` + view `account_balances`): leitura cross-tenant, fail-closed, `security_invoker`, e **`WITH CHECK`** provando rejeição de INSERT/UPDATE com `tenant_id` forjado (Bloco 7). Prova o CRITICAL-2 antes só afirmado | [db/ledger/tests/rls_isolation_test.sql](db/ledger/tests/rls_isolation_test.sql) · [db/ledger/migrations/0003_ledger_rls_up.sql](db/ledger/migrations/0003_ledger_rls_up.sql) | TX-3/DA-11 (fail-closed `adserver.tenant_id`); TX-2 (minor-units, sem float) |
+| **Smoke e2e de pagamentos** | Trilho fora do hot path, com stubs: par de postings idempotente, depósito `pending`→finalidade, reconciliação que abre exceção e **nunca autocorrige**, status via BFF (Money string DECIMAL, sem IDOR). Rodado real: **PASS=20** | [deploy/local/smoke-payments.sh](deploy/local/smoke-payments.sh) | TX-2/DA-10 (sem float/câmbio); E.8 (finalidade antes de saldo); cripto fora do cliente |
+| **Validação Makefile/CI offline** | `platform-validate` (`tofu validate` + `kubeconform` + `kyverno test` das células PCI/AML) + `db-test-all` (migrações up/down + 4 RLS isolation tests em Postgres efêmero) + `platform-otel-validate` (`otelcol validate` + grep fail-closed da redação TX-5); **SHA256** nos downloads de CLI do CI | [make/platform.mk](make/platform.mk) · [make/db.mk](make/db.mk) · [.github/workflows/platform.yml](.github/workflows/platform.yml) · [.github/workflows/db.yml](.github/workflows/db.yml) | TX-3/TX-5 (isolamento de célula + redação OTel validados, não cosméticos); supply-chain |
+| **Runbook de go-live** | Ordem de migrações, segredos por célula (OpenBao/KMS), FQDNs, sequência de smoke, checklist dos 4 gates, rollback, limitações conhecidas | [docs/ops/go-live-runbook.md](docs/ops/go-live-runbook.md) | operacional |
+
+**Gates verdes (4ª onda):** `money-ledger-guardian` **APROVADO** após remediar **3 CRITICAL**
+(policies RLS do ledger sem `WITH CHECK` → INSERT/UPDATE cross-tenant não barrado) **+ BLOQUEIO**
+do smoke (5 asserções `NUMERIC(40,18)::text` vs literal inteiro falhavam em runtime →
+`trunc(...)::bigint::text`, sem float); `security-reviewer` **APROVADO** (smoke sem segredo/rede
+externa; CI sem `pull_request_target`, token mínimo, downloads com checksum); `privacy-compliance-auditor`
+**APROVADO** (isolamento de célula PCI/AML testado fail/pass, ledger PII-free, redação TX-5 deixou de
+ser cosmética); `parity-golden-test-guardian` **PASS** (smoke fora do hot path; golden/dual-run/shadow
+verdes; deep default-off, K8 não promovido). **Sweep pré-go-live verde:** `make verify` (buf TX-1 +
+no-float TX-2) + `go test ./...` (todos os pacotes) + **BFF 51 testes** + **ml/ + data/ 197 pytest** +
+smoke de pagamentos **PASS=20** + RLS do ledger **33 PASS** (2 ciclos up/down/up). *(Coleção do pytest de
+`services/copilot` falha por `pydantic_settings` ausente — gap de ambiente, fora desta onda.)*
+
 ### ⏭️ Pendente da Fase 3
 
 **K8** (promoção do deep ranking sob **uplift A/B + kill-switch**) segue **gated por
@@ -271,8 +296,9 @@ tráfego real** — o código está pronto desde K1 (flag default-off); a promo�
 número de uplift sobre o GBDT, que depende do cutover de infra da Fase 2. A **habilitação
 de AEV/BND** segue **gated pela spec de produto** (`scale`/classificação/supply — CHECK
 estrutural impede habilitar sem `scale`). **Pré-condições de go-live** restantes são
-**só de infra/spec viva** (a camada de código está pronta — ver hardening acima): chaves
-reais via OpenBao, **KMS/HSM real** para a chave do envelope de PII (a cifra e seu
+**só de infra/spec viva** (a camada de código está pronta **e provada** — ver hardening +
+4ª onda acima, com runbook em [docs/ops/go-live-runbook.md](docs/ops/go-live-runbook.md)):
+chaves reais via OpenBao, **KMS/HSM real** para a chave do envelope de PII (a cifra e seu
 versionamento já existem), FQDNs reais das células, e Triton/GPU + Fireblocks sob seus
 gatilhos mensuráveis.
 
