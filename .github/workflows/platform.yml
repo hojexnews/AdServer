@@ -6,6 +6,8 @@
 #      platform/observability/  (K8s/CRD schema validation, ignora CRDs desconhecidos)
 #   3. kyverno test sobre platform/k8s/policy/, platform/cells/pci/policy/,
 #      platform/cells/aml-kyc/policy/  (asserts de accept/reject offline)
+#   4. otelcol validate --config platform/observability/otel-collector.yaml
+#      + verificacao estrutural dos processadores de redacao de PII (TX-5)
 #
 # Aciona em PR/push apenas quando platform/ for alterado.
 # Nao exige aprovacao cloud — tudo estatico.
@@ -30,6 +32,18 @@ env:
   KUBECONFORM_VER: "0.7.0"
   KYVERNO_CLI_VER: "1.13.4"
   TOFU_VER: "1.9.1"
+  # Imagem do OTel Collector contrib para validacao semantica (TX-5).
+  # Espelha OTELCOL_IMAGE em make/platform.mk — manter em sincronia.
+  OTELCOL_IMAGE: "otel/opentelemetry-collector-contrib:0.123.0"
+  # SHA256 fixados dos tarballs de ferramentas.
+  # Atualizar ao bumpar versoes acima. Verificado antes de extrair (M-1).
+  # Digests obtidos de:
+  #   kubeconform: https://github.com/yannh/kubeconform/releases/download/v0.7.0/CHECKSUMS
+  #   kyverno:     https://github.com/kyverno/kyverno/releases/download/v1.13.4/checksums.txt
+  #   tofu:        https://github.com/opentofu/opentofu/releases/download/v1.9.1/tofu_1.9.1_SHA256SUMS
+  KUBECONFORM_SHA256: "c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3"
+  KYVERNO_SHA256: "abd318dbb971ab6de2bbe3b7226f4a03230d5c9c651df8a29b6b5e085a55aeeb"
+  TOFU_SHA256: "ebb3eb2d12833422543c3f04a7ec21d9fd260e893ad221c63dbcf0a319ff563a"
 
 jobs:
   platform-validate:
@@ -38,33 +52,44 @@ jobs:
       - uses: actions/checkout@v4
 
       # ------------------------------------------------------------------
-      # OpenTofu
+      # OpenTofu — download com verificacao de integridade SHA256 (M-1).
       # ------------------------------------------------------------------
       - name: instalar OpenTofu
         run: |
-          curl -fsSL \
-            "https://github.com/opentofu/opentofu/releases/download/v${TOFU_VER}/tofu_${TOFU_VER}_linux_amd64.tar.gz" \
-            | sudo tar -xzf - -C /usr/local/bin tofu
+          TARBALL="tofu_${TOFU_VER}_linux_amd64.tar.gz"
+          URL="https://github.com/opentofu/opentofu/releases/download/v${TOFU_VER}/${TARBALL}"
+          curl -fsSL -o "/tmp/${TARBALL}" "${URL}"
+          echo "${TOFU_SHA256}  /tmp/${TARBALL}" | sha256sum -c -
+          sudo tar -xzf "/tmp/${TARBALL}" -C /usr/local/bin tofu
+          rm -f "/tmp/${TARBALL}"
           tofu version
 
       # ------------------------------------------------------------------
-      # kubeconform
+      # kubeconform — download com verificacao de integridade SHA256 (M-1).
       # ------------------------------------------------------------------
       - name: instalar kubeconform
         run: |
-          curl -fsSL \
-            "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VER}/kubeconform-linux-amd64.tar.gz" \
-            | sudo tar -xzf - -C /usr/local/bin kubeconform
+          TARBALL="kubeconform-linux-amd64.tar.gz"
+          URL="https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VER}/${TARBALL}"
+          curl -fsSL -o "/tmp/${TARBALL}" "${URL}"
+          echo "${KUBECONFORM_SHA256}  /tmp/${TARBALL}" | sha256sum -c -
+          sudo tar -xzf "/tmp/${TARBALL}" -C /usr/local/bin kubeconform
+          rm -f "/tmp/${TARBALL}"
           kubeconform --version
 
       # ------------------------------------------------------------------
-      # kyverno CLI
+      # kyverno CLI — download com verificacao de integridade SHA256 (M-1).
+      # Nota: o asset real para v1.13.4 e kyverno-cli_v<ver>_linux_x86_64.tar.gz
+      # (nao kyverno_linux_amd64.tar.gz). O binario dentro do tarball e "kyverno".
       # ------------------------------------------------------------------
       - name: instalar kyverno CLI
         run: |
-          curl -fsSL \
-            "https://github.com/kyverno/kyverno/releases/download/v${KYVERNO_CLI_VER}/kyverno_linux_amd64.tar.gz" \
-            | sudo tar -xzf - -C /usr/local/bin kyverno
+          TARBALL="kyverno-cli_v${KYVERNO_CLI_VER}_linux_x86_64.tar.gz"
+          URL="https://github.com/kyverno/kyverno/releases/download/v${KYVERNO_CLI_VER}/${TARBALL}"
+          curl -fsSL -o "/tmp/${TARBALL}" "${URL}"
+          echo "${KYVERNO_SHA256}  /tmp/${TARBALL}" | sha256sum -c -
+          sudo tar -xzf "/tmp/${TARBALL}" -C /usr/local/bin kyverno
+          rm -f "/tmp/${TARBALL}"
           kyverno version
 
       # ------------------------------------------------------------------
@@ -78,3 +103,12 @@ jobs:
 
       - name: kyverno test (policies PCI + AML/KYC + baseline, offline)
         run: PLATFORM_STRICT=1 make platform-kyverno-test
+
+      # ------------------------------------------------------------------
+      # OTel Collector — validacao semantica (TX-5, privacy Ressalva 1).
+      # Roda otelcol validate --config via Docker (imagem pinada OTELCOL_IMAGE)
+      # + verificacao estrutural dos processadores de redacao de PII.
+      # Docker esta disponivel em ubuntu-latest por padrao.
+      # ------------------------------------------------------------------
+      - name: otel-validate (config TX-5 — redacao PII + otelcol validate)
+        run: PLATFORM_STRICT=1 make platform-otel-validate

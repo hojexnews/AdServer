@@ -5,10 +5,22 @@
 # nada sai, até que uma policy de allow explícito abra um fluxo. Egress de
 # DNS é liberado à parte (allow-dns.yaml) para o cluster funcionar.
 #
-# Replicada nas células de carga (delivery, ml, data) e nas células de
-# compliance (pci, aml). platform-system fica de fora do deny-all base
-# porque hospeda ingress/Argo/OTel que precisam de conectividade ampla
+# Replicada nas células de carga (delivery, ml, data).
+# As células de compliance (pci, aml-kyc) têm cada uma o seu próprio
+# default-deny em platform/cells/{pci,aml-kyc}/netpol/default-deny.yaml,
+# com labels de compliance explícitos — esta lista não os duplica para
+# evitar stale entries que dariam falsa impressão de cobertura.
+#
+# platform-system fica de fora do deny-all base porque hospeda
+# ingress/Argo/OTel que precisam de conectividade ampla
 # (restringir depois, por app).
+#
+# Limitação conhecida (L-1 / Ressalva-2): o deny-all do Cilium não é
+# asserido comportamentalmente por kyverno test (limitação de ferramenta;
+# exigiria e2e em cluster). O kyverno test cobre apenas as policies de
+# admission (mutate/validate). A cobertura comportamental requer testes
+# de conectividade em cluster real (ex.: netpol-tester ou Sonobuoy).
+# Ver também docs/ops/go-live-runbook.md §Limitações conhecidas.
 ---
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
@@ -35,26 +47,6 @@ kind: CiliumNetworkPolicy
 metadata:
   name: default-deny
   namespace: data
-spec:
-  endpointSelector: {}
-  ingress: []
-  egress: []
----
-apiVersion: cilium.io/v2
-kind: CiliumNetworkPolicy
-metadata:
-  name: default-deny
-  namespace: pci
-spec:
-  endpointSelector: {}
-  ingress: []
-  egress: []
----
-apiVersion: cilium.io/v2
-kind: CiliumNetworkPolicy
-metadata:
-  name: default-deny
-  namespace: aml
 spec:
   endpointSelector: {}
   ingress: []

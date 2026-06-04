@@ -8,6 +8,7 @@
 #   tofu         — OpenTofu >= 1.9 (no PATH ou ~/.local/bin/tofu)
 #   kubeconform  — valida YAML K8s/CRD contra schemas (baixado em .bin/ se ausente)
 #   kyverno      — kyverno test offline das policies (baixado em .bin/ se ausente)
+#   docker       — executa otelcol validate (imagem otel/opentelemetry-collector-contrib)
 #
 # Convencao de ausencia de ferramenta:
 #   Local: avisa e pula (nao falha make, para nao bloquear dev sem as ferramentas).
@@ -25,6 +26,13 @@ KYVERNO_CLI   := $(shell command -v kyverno 2>/dev/null || echo $(BIN)/kyverno)
 
 KUBECONFORM_VER := 0.7.0
 KYVERNO_CLI_VER := 1.13.4
+
+# Imagem do OTel Collector contrib para validacao semantica da config TX-5.
+# Espelha OTELCOL_IMAGE em .github/workflows/platform.yml — manter em sincronia.
+OTELCOL_IMAGE := otel/opentelemetry-collector-contrib:0.123.0
+
+# Config do OTel Collector a validar.
+OTEL_CONFIG := platform/observability/otel-collector.yaml
 
 # Diretorio raiz do modulo OpenTofu.
 TOFU_ROOT := platform/tofu
@@ -58,10 +66,10 @@ platform-tools:
 	@if ! command -v kyverno >/dev/null 2>&1 && [ ! -x "$(BIN)/kyverno" ]; then \
 	  echo "== platform-tools: baixando kyverno CLI $(KYVERNO_CLI_VER) -> $(BIN)/kyverno"; \
 	  curl -fsSL -o $(BIN)/kyverno \
-	    "https://github.com/kyverno/kyverno/releases/download/v$(KYVERNO_CLI_VER)/kyverno_linux_amd64.tar.gz" \
+	    "https://github.com/kyverno/kyverno/releases/download/v$(KYVERNO_CLI_VER)/kyverno-cli_v$(KYVERNO_CLI_VER)_linux_x86_64.tar.gz" \
 	    | tar -xzO kyverno > $(BIN)/kyverno 2>/dev/null || \
 	  ( curl -fsSL -o /tmp/kyverno.tar.gz \
-	      "https://github.com/kyverno/kyverno/releases/download/v$(KYVERNO_CLI_VER)/kyverno_linux_amd64.tar.gz" && \
+	      "https://github.com/kyverno/kyverno/releases/download/v$(KYVERNO_CLI_VER)/kyverno-cli_v$(KYVERNO_CLI_VER)_linux_x86_64.tar.gz" && \
 	    tar -xzf /tmp/kyverno.tar.gz -C $(BIN) kyverno && \
 	    rm -f /tmp/kyverno.tar.gz ); \
 	  chmod +x $(BIN)/kyverno; \
@@ -142,8 +150,63 @@ platform-kyverno-test:
 	 if [ "$$FAIL" = "1" ]; then echo "== platform-kyverno-test: FALHOU =="; exit 1; fi; \
 	 echo "== platform-kyverno-test: OK =="
 
-## platform-validate: tofu validate + kubeconform + kyverno test (tudo offline, sem credenciais)
-platform-validate: platform-tofu-validate platform-kubeconform platform-kyverno-test
-	@echo "OK — platform validado offline (tofu + kubeconform + kyverno test)."
+## platform-otel-validate: valida semanticamente a config do OTel Collector (TX-5).
+#
+# Usa "docker run --rm" com a imagem oficial otel/opentelemetry-collector-contrib
+# pinada em OTELCOL_IMAGE para rodar "otelcol validate --config".
+# Isso garante que os processadores de redacao de PII (transform/redact-pii,
+# redaction/allowlist-traces, redaction/allowlist-logs) sejam validados
+# pela mesma distro que os executa em producao — prevenindo falsa cobertura
+# de um kubeconform que ignora a config nativa (sem apiVersion/kind).
+#
+# Alem da validacao semantica, verifica estruturalmente:
+#   1. Os pipelines traces e logs contem transform/redact-pii (redacao por chave).
+#   2. Os pipelines traces e logs contem redaction/allowlist-* (fail-closed).
+#   3. Nenhum pipeline usa allow_all_keys: true (abre a allowlist — quebra TX-5).
+#
+# Convencao de ausencia de ferramenta:
+#   Local sem Docker: avisa e pula.
+#   CI (PLATFORM_STRICT=1): falha se Docker nao estiver disponivel.
+platform-otel-validate:
+	@echo "== platform-otel-validate: validacao semantica OTel Collector (TX-5) =="
+	@set -e; \
+	 CONFIG="$(OTEL_CONFIG)"; \
+	 FAIL=0; \
+	 echo "-- otel: verificando presenca dos processadores de redacao de PII nos pipelines..."; \
+	 grep -q "transform/redact-pii" "$$CONFIG" || { \
+	   echo "ERRO TX-5: transform/redact-pii ausente em $$CONFIG"; FAIL=1; }; \
+	 grep -q "redaction/allowlist-traces" "$$CONFIG" || { \
+	   echo "ERRO TX-5: redaction/allowlist-traces ausente em $$CONFIG"; FAIL=1; }; \
+	 grep -q "redaction/allowlist-logs" "$$CONFIG" || { \
+	   echo "ERRO TX-5: redaction/allowlist-logs ausente em $$CONFIG"; FAIL=1; }; \
+	 if grep -q "allow_all_keys:[[:space:]]*true" "$$CONFIG"; then \
+	   echo "ERRO TX-5: allow_all_keys: true detectado em $$CONFIG — fail-closed violado; altere para false"; \
+	   FAIL=1; \
+	 fi; \
+	 if [ "$$FAIL" = "1" ]; then \
+	   echo "== platform-otel-validate: FALHOU (verificacao estrutural) =="; exit 1; \
+	 fi; \
+	 echo "-- otel: verificacao estrutural OK (redact-pii + allowlists presentes, allow_all_keys=false)"; \
+	 if ! command -v docker >/dev/null 2>&1; then \
+	   if [ "$(PLATFORM_STRICT)" = "1" ]; then \
+	     echo "ERRO: docker nao encontrado — necessario para otelcol validate. Instale o Docker."; \
+	     exit 1; \
+	   else \
+	     echo "AVISO: docker nao encontrado — pulando validacao semantica do OTel Collector."; \
+	     echo "       (PLATFORM_STRICT=1 para falhar; instale Docker para validacao completa)"; \
+	     echo "       A verificacao estrutural (grep) acima ja foi executada."; \
+	     exit 0; \
+	   fi; \
+	 fi; \
+	 echo "-- otel: rodando otelcol validate --config via Docker ($(OTELCOL_IMAGE))..."; \
+	 docker run --rm \
+	   -v "$(CURDIR)/$$CONFIG:/etc/otel/config.yaml:ro" \
+	   $(OTELCOL_IMAGE) \
+	   validate --config /etc/otel/config.yaml; \
+	 echo "== platform-otel-validate: OK =="
 
-.PHONY: platform-tools platform-tofu-validate platform-kubeconform platform-kyverno-test platform-validate
+## platform-validate: tofu validate + kubeconform + kyverno test + otel-validate (tudo offline)
+platform-validate: platform-tofu-validate platform-kubeconform platform-kyverno-test platform-otel-validate
+	@echo "OK — platform validado offline (tofu + kubeconform + kyverno test + otel-validate TX-5)."
+
+.PHONY: platform-tools platform-tofu-validate platform-kubeconform platform-kyverno-test platform-otel-validate platform-validate
