@@ -1,0 +1,256 @@
+// Pacote: adserver.payments.v1
+//
+// Eventos e tipos do trilho de pagamento multi-trilho (§2.6 / K0).
+//
+// Cobre fiat (Stripe/Asaas) e cripto (Safe multisig / Fireblocks via
+// ChainConnector). Pagamentos vivem 100% FORA do hot path: nenhum
+// consumer deste pacote pode estar no caminho de decisao/cascata.
+//
+// REGRAS INVIOLAVEIS (TX-1 / TX-2 / DA-10):
+//   - BACKWARD-compat obrigatoria: nunca reutilize numeros de campo;
+//     nunca mude tipo de campo existente; ao remover, use `reserved`.
+//   - Float PROIBIDO: dinheiro e sempre Money (int64 minor-units + scale).
+//   - Sem conversao automatica entre ativos: cambio so como par de
+//     postings explicito com taxa registrada (DA-10).
+//   - Deposito cripto fica PENDING ate finalidade (C do ADR-0004).
+//   - PII/KYC NUNCA neste pacote: ledger e telemetria sem PII (DA-11).
+//
+// Reusa adserver.common.v1.Envelope (tenant_id, event_id, decision_id,
+// model_version) e adserver.money.v1.Money.
+syntax = "proto3";
+
+package adserver.payments.v1;
+
+import "adserver/common/v1/envelope.proto";
+import "adserver/money/v1/money.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/hojex/adserver/gen/go/adserver/payments/v1;paymentsv1";
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+// Trilho de pagamento pelo qual o evento transitou.
+//
+// Usado em auditoria e roteamento de reconciliacao. Nao afeta a semantica
+// contabil (cada trilho gera o mesmo par de postings idempotente).
+enum PaymentRail {
+  // Valor default (proto3): trilho nao informado.
+  PAYMENT_RAIL_UNSPECIFIED = 0;
+
+  // Stripe: fiat global, SAQ-A, tokenizacao client-side via Elements/Checkout.
+  PAYMENT_RAIL_STRIPE = 1;
+
+  // Asaas: fiat Brasil, PIX primario (QR dinamico, Pix Automatico).
+  PAYMENT_RAIL_ASAAS_PIX = 2;
+
+  // Mercado Pago: failover fiat Brasil.
+  PAYMENT_RAIL_MERCADOPAGO = 3;
+
+  // Safe multisig: cripto via Safe + automacao (OpenZeppelin Defender/Gelato).
+  // Custódia inicial para AEV/BND/USDC (E.5 do ADR-0004).
+  PAYMENT_RAIL_SAFE_MULTISIG = 4;
+
+  // Fireblocks MPC: upgrade sob AUM justificado (gatilho C do ADR-0004).
+  // Nao ativo na Fase 3 inicial — reservado para o upgrade.
+  PAYMENT_RAIL_FIREBLOCKS_MPC = 5;
+}
+
+// Estado de ciclo de vida de um pagamento/deposito.
+//
+// Deposito cripto: permanece PENDING ate atingir finalidade (N confirmacoes)
+// via webhook do custodiante (E.8 do ADR-0004). Reorg vira REVERSED com
+// estorno auditavel (par de postings).
+enum PaymentStatus {
+  // Valor default: estado desconhecido/nao informado.
+  PAYMENT_STATUS_UNSPECIFIED = 0;
+
+  // Pagamento criado, aguardando autorizacao/confirmacao do adquirente.
+  PAYMENT_STATUS_PENDING = 1;
+
+  // Pagamento autorizado mas nao capturado (trilho fiat — pre-auth).
+  PAYMENT_STATUS_AUTHORIZED = 2;
+
+  // Pagamento capturado; par de postings gravado no ledger. Para cripto:
+  // deposito atingiu finalidade (N confirmacoes).
+  PAYMENT_STATUS_CAPTURED = 3;
+
+  // Pagamento estornado/revertido (incluindo reorg de chain como estorno
+  // auditavel — par novo de postings, nunca edicao do posting anterior).
+  PAYMENT_STATUS_REVERSED = 4;
+
+  // Pagamento falhou (declinado, timeout, erro do custodiante).
+  PAYMENT_STATUS_FAILED = 5;
+}
+
+// Tipo de operacao do posting cripto associado.
+//
+// Indica a direcao da movimentacao no ledger. Cambio (swap) e sempre um
+// par de postings explicito — nunca implicito (DA-10).
+enum PostingKind {
+  // Valor default.
+  POSTING_KIND_UNSPECIFIED = 0;
+
+  // Entrada de fundos (deposito do anunciante para a plataforma).
+  POSTING_KIND_DEPOSIT = 1;
+
+  // Saida de fundos (payout da plataforma para o publisher/anunciante).
+  POSTING_KIND_PAYOUT = 2;
+
+  // Estorno auditavel (reorg on-chain, chargeback, ajuste manual).
+  // Sempre um novo par de postings — nunca edicao de posting existente.
+  POSTING_KIND_REVERSAL = 3;
+
+  // Cambio explicito entre ativos (AEV/BND <-> USDC/fiat).
+  // Requer taxa registrada por humano/desk. Proibido cambio implicito (DA-10).
+  POSTING_KIND_FX_EXCHANGE = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Mensagens principais
+// ---------------------------------------------------------------------------
+
+// Evento emitido quando um pagamento fiat ou cripto muda de estado.
+//
+// Todo estado do ciclo de vida (PENDING -> AUTHORIZED -> CAPTURED /
+// REVERSED / FAILED) produz um PaymentEvent separado. O par de postings
+// no ledger e gerado APENAS no estado CAPTURED (ou REVERSED para estorno).
+// Nunca grava saldo direto — saldo e derivado de postings (invariante §2.6).
+message PaymentEvent {
+  // Envelope universal (TX-1): tenant_id, event_id (idempotency key),
+  // decision_id, model_version, occurred_at, schema_version, source.
+  adserver.common.v1.Envelope envelope = 1;
+
+  // Identificador unico do pagamento (gerado pelo trilho/adquirente).
+  // Para Stripe: PaymentIntent id. Para Asaas: id de cobranca.
+  // Para cripto: hash da transacao on-chain (tx_hash).
+  string payment_id = 2;
+
+  // Trilho pelo qual este pagamento foi processado.
+  PaymentRail rail = 3;
+
+  // Estado atual do pagamento.
+  PaymentStatus status = 4;
+
+  // Valor do pagamento em Money canonico (TX-2).
+  // Float PROIBIDO: amount em minor-units + scale do Asset Registry.
+  // asset_code indica o ativo (ex.: "BRL", "USDC", "AEV").
+  adserver.money.v1.Money amount = 5;
+
+  // Para cripto: numero de confirmacoes no momento do evento.
+  // Zero para trilhos fiat ou antes da primeira confirmacao.
+  uint32 confirmations = 6;
+
+  // Para cripto: hash da transacao on-chain (tambem usada como payment_id).
+  // Vazio para trilhos fiat.
+  string tx_hash = 7;
+
+  // Para cripto: numero do bloco em que a transacao foi incluida.
+  // Zero para trilhos fiat ou transacao ainda nao minerada (mempool).
+  uint64 block_number = 8;
+
+  // Para cripto: chain EVM id (ex.: 1 = Ethereum mainnet, 137 = Polygon).
+  // Zero para trilhos fiat ou chain nao-EVM (TBD — E.1 do ADR-0004).
+  int64 chain_id = 9;
+
+  // Para fiat Brasil (Asaas/PIX): End-to-End id do Pix (txid/E2E).
+  // Usado na conciliacao por txid (§2.6). Vazio para outros trilhos.
+  string pix_end_to_end_id = 10;
+
+  // Instante em que o custodiante/adquirente confirmou o evento.
+  // Distinto de envelope.occurred_at (que e o event-time do nosso sistema).
+  google.protobuf.Timestamp provider_confirmed_at = 11;
+
+  // Reservado para campos futuros (ex.: fee, metadata, correlation_id).
+  reserved 12 to 19;
+}
+
+// Evento emitido quando um deposito cripto atinge finalidade definitiva.
+//
+// Gerado pelo ChainConnector apos N confirmacoes (N por chain/config).
+// O webhook do custodiante e a fonte preferida (E.8 do ADR-0004); logica
+// de reorg propria e evitada. Ao receber este evento, o ledger move o
+// deposito de PENDING para CAPTURED (par de postings idempotente).
+message DepositFinalizedEvent {
+  // Envelope universal (TX-1).
+  adserver.common.v1.Envelope envelope = 1;
+
+  // Hash da transacao on-chain que foi finalizada.
+  string tx_hash = 2;
+
+  // Chain EVM id onde a finalizacao ocorreu.
+  int64 chain_id = 3;
+
+  // Numero de confirmacoes atingidas (deve ser >= N configurado por chain).
+  uint32 confirmations = 4;
+
+  // Valor final do deposito (Money canonico, TX-2).
+  adserver.money.v1.Money amount = 5;
+
+  // Endereco on-chain de destino (carteira Safe/custodiante da plataforma).
+  // Nunca um endereco de anunciante (PII/KYC no cofre de compliance — TX-3).
+  string to_address = 6;
+
+  // Numero do bloco da finalizacao.
+  uint64 finalized_block = 7;
+
+  // Instante da finalizacao on-chain (timestamp do bloco).
+  google.protobuf.Timestamp finalized_at = 8;
+
+  // Reservado para evolucao (ex.: reorg_depth, finality_model).
+  reserved 9 to 15;
+}
+
+// Evento emitido quando uma transacao on-chain e revertida por reorg.
+//
+// Um reorg NUNCA edita um posting existente. Ele gera um novo
+// ReversalEvent que produz um par de postings de estorno (POSTING_KIND_REVERSAL).
+// O posting original permanece imutavel para auditoria (invariante §2.6).
+message ReversalEvent {
+  // Envelope universal (TX-1).
+  adserver.common.v1.Envelope envelope = 1;
+
+  // event_id do PaymentEvent ou DepositFinalizedEvent original que esta
+  // sendo revertido. Usado para rastrear o estorno no ledger.
+  string original_event_id = 2;
+
+  // Hash da transacao original revertida pelo reorg.
+  string original_tx_hash = 3;
+
+  // Chain EVM id onde o reorg ocorreu.
+  int64 chain_id = 4;
+
+  // Valor do estorno (mesmo Money do evento original; negativo no posting
+  // de debito da conta de origem — ledger determina a direcao).
+  adserver.money.v1.Money amount = 5;
+
+  // Motivo do estorno (ex.: "chain_reorg", "chargeback", "manual_adjustment").
+  string reason = 6;
+
+  // Reservado para evolucao (ex.: reorg_depth, arbiter).
+  reserved 7 to 12;
+}
+
+// Referencia a um posting do ledger gerado por um evento de pagamento.
+//
+// Nao e o posting em si (que vive no ledger Postgres double-entry, K3).
+// E uma referencia imutavel usada para rastreabilidade entre o trilho de
+// pagamento e o ledger. O par de postings e sempre idempotente
+// (idempotency_key = envelope.event_id no ledger).
+message LedgerPostingRef {
+  // event_id do PaymentEvent que gerou este posting.
+  string payment_event_id = 1;
+
+  // journal_entry_id no ledger Postgres (gerado no K3).
+  string journal_entry_id = 2;
+
+  // Tipo de operacao que originou o posting.
+  PostingKind kind = 3;
+
+  // Asset code do posting (deve coincidir com o asset_code do Money no evento).
+  string asset_code = 4;
+
+  // Reservado para metadados do posting (ex.: account_debit_id, account_credit_id).
+  reserved 5 to 9;
+}

@@ -1,0 +1,32 @@
+# Cilium default-deny para a celula PCI (ADR-0004 §F).
+#
+# Nenhum trafego entra ou sai do namespace pci sem uma policy de allow
+# explicita. O egress de DNS (UDP/TCP 53 para kube-dns) e liberado em
+# allow-dns.yaml. Todo o resto — incluindo trafego para outros namespaces
+# (delivery, ml, data, aml-kyc) — e NEGADO por default.
+#
+# Esta e a fronteira de rede que o QSA valida como "PCI scope".
+# Qualquer abertura (ex.: Stripe webhook ingress, saida para Stripe API)
+# requer uma policy separada de allow explicito, auditavel.
+#
+# Cilium e preferido a NetworkPolicy padrao do Kubernetes porque oferece
+# L7 awareness e politicas de identidade de endpoint — necessarias para
+# permitir apenas o servico payments (celula pci) de falar com a API
+# Stripe, e bloquear todo o resto (incluindo o hot path delivery).
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: default-deny
+  namespace: pci
+  labels:
+    adserver.hojex/cell: pci
+    adserver.hojex/compliance: pci-saq-a
+    adserver.hojex/phase: fase-3-k0
+spec:
+  # Seleciona todos os endpoints do namespace pci.
+  endpointSelector: {}
+  # Ingress vazio: nenhuma entrada permitida por default.
+  ingress: []
+  # Egress vazio: nenhuma saida permitida por default (DNS liberado a parte).
+  egress: []

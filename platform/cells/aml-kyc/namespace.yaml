@@ -1,0 +1,38 @@
+# Celula AML/KYC/Travel Rule — namespace isolado para cripto, compliance
+# e PII de KYC (ADR-0004 §F / §E.10 / §2.7).
+#
+# Escopo: Sumsub (KYC/KYB), Chainalysis (screening on-chain), cofre de
+# compliance (PII/KYC pseudonimo), services/payments (trilho cripto),
+# Travel Rule e screening de sancoes.
+#
+# Isolamento:
+#   - Deny-all de rede (ver netpol/default-deny.yaml + allow-dns.yaml).
+#   - PII/KYC NUNCA sai desta celula — referenciado apenas por tenant_id
+#     pseudonimo (TX-3 / DA-11). Ledger e telemetria sem PII.
+#   - Segredos (ASAAS_API_KEY, SAFE_RPC_URL, FIREBLOCKS_API_KEY,
+#     SUMSUB_API_KEY, CHAINALYSIS_API_KEY) via OpenBao/KMS — nunca em
+#     git/imagem (§2.7).
+#
+# Hot path (delivery) NAO tem acesso a esta celula — pagamentos e cripto
+# sao 100% fora do hot path (ADR-0004 §C).
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aml-kyc
+  labels:
+    adserver.hojex/cell: aml-kyc
+    adserver.hojex/compliance: aml-kyc-travel-rule
+    adserver.hojex/phase: fase-3-k0
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+  annotations:
+    adserver.hojex/scope: "Sumsub KYC/KYB + Chainalysis + Travel Rule + cofre compliance (PII pseudonimo)."
+    adserver.hojex/secrets: "ASAAS_API_KEY, SAFE_RPC_URL, SUMSUB_API_KEY, CHAINALYSIS_API_KEY via OpenBao/KMS."
+    adserver.hojex/pii-boundary: "PII/KYC referenciado por tenant_id pseudonimo. Ledger e telemetria sem PII (DA-11/TX-5)."
+    adserver.hojex/owned-by: "platform-infra-engineer"
+    adserver.hojex/security-gate: "security-reviewer + privacy-compliance-auditor (gate de merge)"

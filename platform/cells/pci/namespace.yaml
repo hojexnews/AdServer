@@ -1,0 +1,35 @@
+# Celula PCI — namespace isolado para Stripe SAQ-A (ADR-0004 §F / §2.7).
+#
+# Escopo: tokenizacao client-side (Elements/Checkout). O cartao NUNCA
+# transita pelo nosso backend. Todo processamento PCI fica dentro deste
+# namespace — vazamento para outros namespaces e falha de conformidade.
+#
+# Isolamento de rede: deny-all padrao (ver netpol/default-deny.yaml).
+# Segredos: STRIPE_SECRET_KEY e injetado via OpenBao/KMS em runtime —
+# NUNCA em ConfigMap, Secret estatico, imagem ou git (§2.7).
+#
+# Nota: em producao, esta celula rodaria em uma conta cloud separada
+# (ADR-0004 §F: "conta cloud separada, Cilium deny-all"). O namespace
+# isolado aqui modela a fronteira de rede que o QSA valida.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pci
+  labels:
+    adserver.hojex/cell: pci
+    adserver.hojex/compliance: pci-saq-a
+    adserver.hojex/phase: fase-3-k0
+    # Pod Security Standard: restricted — proibe privileged, hostPath,
+    # hostNetwork, capabilities. Linha de base minima para PCI.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+  annotations:
+    adserver.hojex/scope: "Stripe SAQ-A: tokenizacao client-side. Sem numero de cartao no backend."
+    adserver.hojex/secrets: "STRIPE_SECRET_KEY via OpenBao/KMS. Nunca em git/imagem."
+    adserver.hojex/owned-by: "platform-infra-engineer"
+    adserver.hojex/security-gate: "security-reviewer (PCI fora da celula = falha de merge)"

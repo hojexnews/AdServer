@@ -1,0 +1,31 @@
+# Egress de DNS para a celula PCI.
+#
+# Libera apenas UDP/TCP 53 para o kube-dns do cluster. Sem isso, o
+# default-deny quebraria a resolucao de nomes (ex.: api.stripe.com).
+# Todo o resto continua bloqueado pelo default-deny.
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: pci
+  labels:
+    adserver.hojex/cell: pci
+    adserver.hojex/compliance: pci-saq-a
+    adserver.hojex/phase: fase-3-k0
+spec:
+  endpointSelector: {}
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+          rules:
+            dns:
+              - matchPattern: "*"
