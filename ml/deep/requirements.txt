@@ -1,0 +1,25 @@
+# ml/deep/requirements.txt
+#
+# Dependencias exclusivas do deep ranker (K1, Fase 3).
+# ADICIONAR SOMENTE AQUI — nao editar requirements raiz compartilhados.
+#
+# NOTA DE INFRA: torch/torchvision requerem GPU (CUDA) em producao (K8).
+# No ambiente atual (sem GPU) o codigo roda em modo CPU/skeleton.
+# tritonclient requer o servidor Triton (GPU) ativo para serving real;
+# no K1 o cliente Triton fica como stub (DEEP_ENABLED=false por padrao).
+#
+# Versoes minimas testadas (Python 3.11+):
+torch>=2.3.0          # two-tower / DCN-v2 / DLRM
+onnx>=1.16.0          # export ONNX
+onnxruntime>=1.18.0   # validacao local do artefato ONNX (CPU, sem GPU)
+# INT8 quantization
+onnxruntime-extensions>=0.11.0
+# Triton client (serving GPU) -- instalar separadamente com:
+#   pip install tritonclient[grpc]
+# Listado aqui como dependencia logica; marcado como opcional pois requer
+# compilador gRPC e nao e necessario para treino/export.
+# tritonclient[grpc]>=2.46.0
+#
+# Dependencias compartilhadas com ml/ (ja instaladas no venv de ml/):
+# numpy, mmh3, scikit-learn, mlflow -- nao repetidas aqui.
+# O pipeline de treino importa ml.features.python.featurize (READ-ONLY anti-skew).
