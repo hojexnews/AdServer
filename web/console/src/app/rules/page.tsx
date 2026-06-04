@@ -9,9 +9,14 @@
  * Uma regra AND mutuamente exclusiva com outra silencia o banner.
  * O usuário é alertado com detalhes do conflito antes de confirmar.
  *
- * Usa react-querybuilder para o builder visual + Zod para validação.
- * detectContradictions() é chamada antes de submeter (e roda sobre
- * sugestões da IA na Fase 2 — mesmo código reutilizado).
+ * A validação anti-contradição roda:
+ *   1. Sobre as regras digitadas pelo usuário (antes de salvar).
+ *   2. Sobre regras SUGERIDAS pela IA (Fase 2): quando o copiloto propõe
+ *      uma regra via WriteDiff, o HitlDiffPreview já exibe o aviso
+ *      contradictionWarning antes de o usuário clicar em "Aplicar".
+ *      O mesmo detectContradictions() é usado em ambos os caminhos.
+ *
+ * Usa RHF + Zod para o formulário.
  */
 
 import { useState } from "react";
@@ -123,6 +128,8 @@ export default function RulesPage() {
 
   // ---------------------------------------------------------------------------
   // Submit — roda anti-contradição CA-4 antes de salvar
+  // A mesma lógica é reutilizada pelo copiloto (Fase 2) via checkDiffForContradictions
+  // em use-copilot-session.ts: mesmo detectContradictions(), mesmo contrato.
   // ---------------------------------------------------------------------------
   const onSubmit = (values: RuleFormValues) => {
     // CA-4: detectar contradições antes de salvar
@@ -176,6 +183,7 @@ export default function RulesPage() {
       <p className="mt-1 text-sm text-gray-500">
         Configure regras AND/OR de entrega. Regras AND mutuamente exclusivas
         silenciam o banner — o sistema detecta contradições antes de salvar (CA-4).
+        Regras sugeridas pela IA também passam pela mesma validação (Fase 2).
       </p>
 
       {/* Alerta de contradição (CA-4) */}

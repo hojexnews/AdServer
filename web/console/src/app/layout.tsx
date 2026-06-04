@@ -68,6 +68,7 @@ function NavLinks() {
     { href: "/zones", label: "Zonas" },
     { href: "/rules", label: "Regras de Entrega" },
     { href: "/dashboard", label: "Dashboard" },
+    { href: "/copilot", label: "Copiloto IA" },
   ];
 
   return (
