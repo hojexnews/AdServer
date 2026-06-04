@@ -1,0 +1,208 @@
+# db — migrações + isolamento RLS (Fase 1+3, hardening go-live TX-3).
+#
+# Sobe um Postgres 16 efêmero via service container do GitHub Actions,
+# aplica TODAS as migrations (_up) de todos os schemas em ordem obrigatória:
+#   asset_registry → config → ledger → vector → compliance
+# Roda os rls_isolation_test.sql de cada schema:
+#   config, ledger, vector, compliance
+# Aplica as migrations _down em ordem inversa e confirma reversão limpa.
+# Reporta PASS/FAIL por schema.
+#
+# Tudo sem DATABASE_URL externo: usa o service container de CI.
+# Sem credenciais de cloud — completamente offline/efêmero.
+#
+# Aciona em PR/push quando db/ ou as migrations forem alterados.
+# Separado do `verify` rápido pois requer Docker (service container).
+name: db (TX-3 RLS isolation)
+
+on:
+  pull_request:
+    paths:
+      - "db/**"
+      - "make/db.mk"
+      - ".github/workflows/db.yml"
+  push:
+    branches: [main]
+    paths:
+      - "db/**"
+
+permissions:
+  contents: read
+
+jobs:
+  db-test:
+    runs-on: ubuntu-latest
+
+    # Postgres 16 efêmero — sem persistência, sem credenciais externas.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres_test_only
+          POSTGRES_DB: adserver_test
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d adserver_test"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+
+    env:
+      # DSN do container de CI — sem segredo real.
+      DATABASE_URL: "postgres://postgres:postgres_test_only@localhost:15432/adserver_test?sslmode=disable"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: instalar psql (cliente PostgreSQL)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends postgresql-client
+          psql --version
+
+      # ------------------------------------------------------------------
+      # Roles de aplicação (adserver_loader BYPASSRLS / adserver_app RLS).
+      # Devem existir ANTES das migrations que criam GRANTs.
+      # ------------------------------------------------------------------
+      - name: criar roles de aplicação
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q <<'SQL'
+          DO $$
+          BEGIN
+            IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'adserver_loader') THEN
+              CREATE ROLE adserver_loader LOGIN PASSWORD 'loader_dev_only' BYPASSRLS;
+            END IF;
+            IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'adserver_app') THEN
+              CREATE ROLE adserver_app LOGIN PASSWORD 'app_dev_only';
+            END IF;
+          END
+          $$;
+          SQL
+
+      # ------------------------------------------------------------------
+      # Migrations _up em ordem obrigatória
+      # ------------------------------------------------------------------
+      - name: migrations up — asset_registry
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f db/asset_registry/migrations/0001_asset_registry_up.sql
+
+      - name: migrations up — config (0001, 0002, 0003)
+        run: |
+          for f in 0001_config_schema 0002_config_rls 0003_campaign_zones_rls; do
+            echo "  up: config/${f}"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "db/config/migrations/${f}_up.sql"
+          done
+
+      - name: migrations up — ledger (0001, 0002, 0003)
+        run: |
+          for f in 0001_ledger_schema 0002_reconciliation_exceptions 0003_ledger_rls; do
+            echo "  up: ledger/${f}"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "db/ledger/migrations/${f}_up.sql"
+          done
+
+      - name: migrations up — vector (0001, 0002)
+        run: |
+          for f in 0001_vector_schema 0002_vector_rls; do
+            echo "  up: vector/${f}"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "db/vector/migrations/${f}_up.sql"
+          done
+
+      - name: migrations up — compliance (0001)
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f db/compliance/migrations/0001_compliance_schema_up.sql
+
+      # ------------------------------------------------------------------
+      # Grants sobre os schemas criados pelas migrations
+      # ------------------------------------------------------------------
+      - name: grants adserver_loader + adserver_app
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f db/seed/dev_roles.sql
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q <<'SQL'
+          -- ledger
+          GRANT USAGE ON SCHEMA ledger TO adserver_loader, adserver_app;
+          GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ledger TO adserver_app;
+          GRANT SELECT ON ALL TABLES IN SCHEMA ledger TO adserver_loader;
+          GRANT USAGE ON ALL SEQUENCES IN SCHEMA ledger TO adserver_app;
+          GRANT EXECUTE ON FUNCTION ledger.current_tenant_id() TO adserver_app, adserver_loader;
+          -- vector_store
+          GRANT USAGE ON SCHEMA vector_store TO adserver_loader, adserver_app;
+          GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA vector_store TO adserver_app;
+          GRANT SELECT ON ALL TABLES IN SCHEMA vector_store TO adserver_loader;
+          -- compliance
+          GRANT USAGE ON SCHEMA compliance TO adserver_loader, adserver_app;
+          GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA compliance TO adserver_app;
+          GRANT SELECT ON ALL TABLES IN SCHEMA compliance TO adserver_loader;
+          SQL
+
+      # ------------------------------------------------------------------
+      # Testes de isolamento RLS (TX-3) — um step por schema para
+      # PASS/FAIL visível individualmente no GitHub Actions UI.
+      # Cada arquivo roda dentro de BEGIN...ROLLBACK — não persiste dados.
+      # ------------------------------------------------------------------
+      - name: "RLS isolation — config (TX-3)"
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+               -f db/config/tests/rls_isolation_test.sql
+
+      - name: "RLS isolation — ledger (TX-3 / DA-11)"
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+               -f db/ledger/tests/rls_isolation_test.sql
+
+      - name: "RLS isolation — vector (TX-3)"
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+               -f db/vector/tests/vector_rls_isolation_test.sql
+
+      - name: "RLS isolation — compliance / KYC (K6 / TX-3)"
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+               -f db/compliance/tests/rls_isolation_test.sql
+
+      # ------------------------------------------------------------------
+      # Migrations _down em ordem inversa — confirma reversão limpa
+      # ------------------------------------------------------------------
+      - name: migrations down — compliance
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f db/compliance/migrations/0001_compliance_schema_down.sql
+
+      - name: migrations down — vector (0002, 0001)
+        run: |
+          for f in 0002_vector_rls 0001_vector_schema; do
+            echo "  down: vector/${f}"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "db/vector/migrations/${f}_down.sql"
+          done
+
+      - name: migrations down — ledger (0003, 0002, 0001)
+        run: |
+          for f in 0003_ledger_rls 0002_reconciliation_exceptions 0001_ledger_schema; do
+            echo "  down: ledger/${f}"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "db/ledger/migrations/${f}_down.sql"
+          done
+
+      - name: migrations down — config (0003, 0002, 0001)
+        run: |
+          for f in 0003_campaign_zones_rls 0002_config_rls 0001_config_schema; do
+            echo "  down: config/${f}"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "db/config/migrations/${f}_down.sql"
+          done
+
+      - name: migrations down — asset_registry
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f db/asset_registry/migrations/0001_asset_registry_down.sql
+
+      - name: confirmar schema vazio apos reversao
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -t <<'SQL'
+          DO $$
+          DECLARE
+            n INTEGER;
+          BEGIN
+            SELECT COUNT(*) INTO n
+            FROM information_schema.schemata
+            WHERE schema_name IN ('config','ledger','vector_store','compliance','asset_registry');
+            IF n > 0 THEN
+              RAISE EXCEPTION 'Reversão incompleta: % schema(s) ainda presentes', n;
+            END IF;
+            RAISE NOTICE 'PASS: todos os schemas removidos corretamente pelo _down.';
+          END
+          $$;
+          SQL

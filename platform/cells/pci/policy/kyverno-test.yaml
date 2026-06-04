@@ -1,0 +1,72 @@
+# kyverno test — policies especificas da celula PCI (SAQ-A).
+#
+# Roda offline com: kyverno test platform/cells/pci/policy/
+#
+# Cobre:
+#   proibir-secret-estatico-pci   — rejeita Pod com envFrom.secretRef ou
+#                                   env.valueFrom.secretKeyRef
+#   exigir-vault-agent-pci        — rejeita Pod sem anotacao vault-agent-inject
+#   proibir-label-delivery-em-pci — rejeita Pod com label cell=delivery
+#
+# Apenas policies de namespace (Policy, nao ClusterPolicy) sao testadas aqui.
+# A baseline ClusterPolicy (verify-image, disallow-latest, require-limits)
+# e testada em platform/k8s/policy/kyverno-test.yaml.
+apiVersion: cli.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: kyverno-pci-test
+policies:
+  - kyverno-pci.yaml
+resources:
+  - test-resources.yaml
+results:
+  # --- proibir-secret-estatico-pci ---
+  - policy: proibir-secret-estatico-pci
+    rule: proibir-envfrom-secretref
+    resource: pod-pci-secret-envfrom
+    kind: Pod
+    result: fail
+
+  - policy: proibir-secret-estatico-pci
+    rule: proibir-env-secretkeyref
+    resource: pod-pci-secret-envkeyref
+    kind: Pod
+    result: fail
+
+  - policy: proibir-secret-estatico-pci
+    rule: proibir-envfrom-secretref
+    resource: pod-pci-vault-agent
+    kind: Pod
+    result: pass
+
+  - policy: proibir-secret-estatico-pci
+    rule: proibir-env-secretkeyref
+    resource: pod-pci-vault-agent
+    kind: Pod
+    result: pass
+
+  # --- exigir-vault-agent-pci ---
+  - policy: exigir-vault-agent-pci
+    rule: exigir-vault-agent-inject
+    resource: pod-pci-no-vault
+    kind: Pod
+    result: fail
+
+  - policy: exigir-vault-agent-pci
+    rule: exigir-vault-agent-inject
+    resource: pod-pci-vault-agent
+    kind: Pod
+    result: pass
+
+  # --- proibir-label-delivery-em-pci ---
+  - policy: proibir-label-delivery-em-pci
+    rule: proibir-cell-delivery
+    resource: pod-pci-label-delivery
+    kind: Pod
+    result: fail
+
+  - policy: proibir-label-delivery-em-pci
+    rule: proibir-cell-delivery
+    resource: pod-pci-vault-agent
+    kind: Pod
+    result: pass

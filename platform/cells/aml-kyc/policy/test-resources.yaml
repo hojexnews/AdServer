@@ -1,0 +1,151 @@
+# Recursos de teste para kyverno-test.yaml da celula AML/KYC.
+# Nao sao aplicados em cluster — usados exclusivamente por `kyverno test`.
+---
+# pod-aml-secret-envfrom: deve ser rejeitado por proibir-secret-estatico-aml-kyc
+# (usa envFrom[].secretRef — proibido na celula AML/KYC, TX-3)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-aml-secret-envfrom
+  namespace: aml-kyc
+  annotations:
+    vault.hashicorp.com/agent-inject: "true"
+    vault.hashicorp.com/role: "aml-kyc-payments"
+spec:
+  containers:
+    - name: kyc-screener
+      image: ghcr.io/hojex/kyc-screener:v1.0.0
+      envFrom:
+        - secretRef:
+            name: sumsub-api-secret
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "200m"
+          memory: "256Mi"
+---
+# pod-aml-secret-envkeyref: deve ser rejeitado por proibir-secret-estatico-aml-kyc
+# (usa env[].valueFrom.secretKeyRef — proibido na celula AML/KYC, TX-3)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-aml-secret-envkeyref
+  namespace: aml-kyc
+  annotations:
+    vault.hashicorp.com/agent-inject: "true"
+    vault.hashicorp.com/role: "aml-kyc-payments"
+spec:
+  containers:
+    - name: kyc-screener
+      image: ghcr.io/hojex/kyc-screener:v1.0.0
+      env:
+        - name: SUMSUB_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: sumsub-api-secret
+              key: api_key
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "200m"
+          memory: "256Mi"
+---
+# pod-aml-vault-agent: conforme — Vault Agent injetado, sem K8s Secrets,
+# sem labels de outras celulas. Deve passar em todas as policies AML/KYC.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-aml-vault-agent
+  namespace: aml-kyc
+  labels:
+    adserver.hojex/cell: aml-kyc
+    app: kyc-screener
+  annotations:
+    vault.hashicorp.com/agent-inject: "true"
+    vault.hashicorp.com/role: "aml-kyc-payments"
+spec:
+  serviceAccountName: payments
+  containers:
+    - name: kyc-screener
+      image: ghcr.io/hojex/kyc-screener:v1.0.0
+      # Segredos chegam via /vault/secrets/ injetado pelo sidecar — sem envFrom/secretKeyRef.
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "200m"
+          memory: "256Mi"
+---
+# pod-aml-no-vault: deve ser rejeitado por exigir-vault-agent-aml-kyc
+# (sem anotacao vault.hashicorp.com/agent-inject)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-aml-no-vault
+  namespace: aml-kyc
+  labels:
+    adserver.hojex/cell: aml-kyc
+spec:
+  containers:
+    - name: kyc-screener
+      image: ghcr.io/hojex/kyc-screener:v1.0.0
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "200m"
+          memory: "256Mi"
+---
+# pod-aml-label-delivery: deve ser rejeitado por proibir-label-delivery-em-aml-kyc
+# (label adserver.hojex/cell=delivery — misconfiguracao de fronteira hot-path)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-aml-label-delivery
+  namespace: aml-kyc
+  labels:
+    adserver.hojex/cell: delivery
+  annotations:
+    vault.hashicorp.com/agent-inject: "true"
+    vault.hashicorp.com/role: "aml-kyc-payments"
+spec:
+  containers:
+    - name: kyc-screener
+      image: ghcr.io/hojex/kyc-screener:v1.0.0
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "200m"
+          memory: "256Mi"
+---
+# pod-aml-label-pci: deve ser rejeitado por proibir-label-pci-em-aml-kyc
+# (label adserver.hojex/cell=pci — celulas PCI e AML/KYC sao isoladas)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-aml-label-pci
+  namespace: aml-kyc
+  labels:
+    adserver.hojex/cell: pci
+  annotations:
+    vault.hashicorp.com/agent-inject: "true"
+    vault.hashicorp.com/role: "aml-kyc-payments"
+spec:
+  containers:
+    - name: kyc-screener
+      image: ghcr.io/hojex/kyc-screener:v1.0.0
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "200m"
+          memory: "256Mi"

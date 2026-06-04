@@ -1,0 +1,128 @@
+# Recursos de teste para kyverno-test.yaml da celula PCI.
+# Nao sao aplicados em cluster — usados exclusivamente por `kyverno test`.
+---
+# pod-pci-secret-envfrom: deve ser rejeitado por proibir-secret-estatico-pci
+# (usa envFrom[].secretRef — proibido na celula PCI)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-pci-secret-envfrom
+  namespace: pci
+  annotations:
+    vault.hashicorp.com/agent-inject: "true"
+    vault.hashicorp.com/role: "pci-payments"
+spec:
+  containers:
+    - name: payments
+      image: ghcr.io/hojex/payments:v1.0.0
+      envFrom:
+        - secretRef:
+            name: stripe-secret
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "200m"
+          memory: "256Mi"
+---
+# pod-pci-secret-envkeyref: deve ser rejeitado por proibir-secret-estatico-pci
+# (usa env[].valueFrom.secretKeyRef — proibido na celula PCI)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-pci-secret-envkeyref
+  namespace: pci
+  annotations:
+    vault.hashicorp.com/agent-inject: "true"
+    vault.hashicorp.com/role: "pci-payments"
+spec:
+  containers:
+    - name: payments
+      image: ghcr.io/hojex/payments:v1.0.0
+      env:
+        - name: STRIPE_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: stripe-secret
+              key: secret_key
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "200m"
+          memory: "256Mi"
+---
+# pod-pci-vault-agent: conforme — Vault Agent injetado, sem K8s Secrets,
+# sem label delivery. Deve passar em todas as policies PCI.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-pci-vault-agent
+  namespace: pci
+  labels:
+    adserver.hojex/cell: pci
+    app: payments
+  annotations:
+    vault.hashicorp.com/agent-inject: "true"
+    vault.hashicorp.com/role: "pci-payments"
+spec:
+  serviceAccountName: payments
+  containers:
+    - name: payments
+      image: ghcr.io/hojex/payments:v1.0.0
+      # Segredos chegam via /vault/secrets/ injetado pelo sidecar — sem envFrom/secretKeyRef.
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "200m"
+          memory: "256Mi"
+---
+# pod-pci-no-vault: deve ser rejeitado por exigir-vault-agent-pci
+# (sem anotacao vault.hashicorp.com/agent-inject)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-pci-no-vault
+  namespace: pci
+  labels:
+    adserver.hojex/cell: pci
+    app: payments
+spec:
+  containers:
+    - name: payments
+      image: ghcr.io/hojex/payments:v1.0.0
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "200m"
+          memory: "256Mi"
+---
+# pod-pci-label-delivery: deve ser rejeitado por proibir-label-delivery-em-pci
+# (tem label adserver.hojex/cell=delivery — misconfiguracao de fronteira)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-pci-label-delivery
+  namespace: pci
+  labels:
+    adserver.hojex/cell: delivery
+  annotations:
+    vault.hashicorp.com/agent-inject: "true"
+    vault.hashicorp.com/role: "pci-payments"
+spec:
+  containers:
+    - name: payments
+      image: ghcr.io/hojex/payments:v1.0.0
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "200m"
+          memory: "256Mi"

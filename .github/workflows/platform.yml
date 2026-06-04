@@ -1,0 +1,80 @@
+# platform-validate — validacao offline da plataforma (Fase 3, hardening go-live).
+#
+# Roda SEM credenciais e SEM cluster vivo:
+#   1. tofu init -backend=false && tofu validate  (OpenTofu schema check)
+#   2. kubeconform sobre platform/k8s/, platform/gitops/, platform/cells/{pci,aml-kyc}/
+#      platform/observability/  (K8s/CRD schema validation, ignora CRDs desconhecidos)
+#   3. kyverno test sobre platform/k8s/policy/, platform/cells/pci/policy/,
+#      platform/cells/aml-kyc/policy/  (asserts de accept/reject offline)
+#
+# Aciona em PR/push apenas quando platform/ for alterado.
+# Nao exige aprovacao cloud — tudo estatico.
+name: platform-validate
+
+on:
+  pull_request:
+    paths:
+      - "platform/**"
+      - "make/platform.mk"
+      - ".github/workflows/platform.yml"
+  push:
+    branches: [main]
+    paths:
+      - "platform/**"
+
+permissions:
+  contents: read
+
+env:
+  # Versoes espelhadas em make/platform.mk — manter em sincronia.
+  KUBECONFORM_VER: "0.7.0"
+  KYVERNO_CLI_VER: "1.13.4"
+  TOFU_VER: "1.9.1"
+
+jobs:
+  platform-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      # OpenTofu
+      # ------------------------------------------------------------------
+      - name: instalar OpenTofu
+        run: |
+          curl -fsSL \
+            "https://github.com/opentofu/opentofu/releases/download/v${TOFU_VER}/tofu_${TOFU_VER}_linux_amd64.tar.gz" \
+            | sudo tar -xzf - -C /usr/local/bin tofu
+          tofu version
+
+      # ------------------------------------------------------------------
+      # kubeconform
+      # ------------------------------------------------------------------
+      - name: instalar kubeconform
+        run: |
+          curl -fsSL \
+            "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VER}/kubeconform-linux-amd64.tar.gz" \
+            | sudo tar -xzf - -C /usr/local/bin kubeconform
+          kubeconform --version
+
+      # ------------------------------------------------------------------
+      # kyverno CLI
+      # ------------------------------------------------------------------
+      - name: instalar kyverno CLI
+        run: |
+          curl -fsSL \
+            "https://github.com/kyverno/kyverno/releases/download/v${KYVERNO_CLI_VER}/kyverno_linux_amd64.tar.gz" \
+            | sudo tar -xzf - -C /usr/local/bin kyverno
+          kyverno version
+
+      # ------------------------------------------------------------------
+      # Alvos de validacao (PLATFORM_STRICT=1: falha em ausencia de ferramenta)
+      # ------------------------------------------------------------------
+      - name: tofu validate (sem backend, sem credenciais)
+        run: PLATFORM_STRICT=1 make platform-tofu-validate
+
+      - name: kubeconform (schemas K8s/CRD, ignore missing)
+        run: PLATFORM_STRICT=1 make platform-kubeconform
+
+      - name: kyverno test (policies PCI + AML/KYC + baseline, offline)
+        run: PLATFORM_STRICT=1 make platform-kyverno-test

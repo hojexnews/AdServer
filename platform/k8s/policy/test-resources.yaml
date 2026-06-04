@@ -1,0 +1,71 @@
+# Recursos de teste para kyverno-test.yaml (baseline ClusterPolicies).
+# Nao sao aplicados em cluster — usados exclusivamente por `kyverno test`.
+---
+# pod-latest-tag: deve ser rejeitado por disallow-latest-tag
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-latest-tag
+  namespace: delivery
+spec:
+  containers:
+    - name: app
+      image: ghcr.io/hojex/decision:latest
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "200m"
+          memory: "256Mi"
+---
+# pod-versioned-tag: deve passar em disallow-latest-tag e require-resource-limits
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-versioned-tag
+  namespace: delivery
+spec:
+  containers:
+    - name: app
+      image: ghcr.io/hojex/decision:v1.2.3
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "200m"
+          memory: "256Mi"
+---
+# pod-no-limits: deve ser rejeitado por require-resource-limits
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-no-limits
+  namespace: delivery
+spec:
+  containers:
+    - name: app
+      image: ghcr.io/hojex/decision:v1.2.3
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+---
+# pod-with-limits: deve passar em require-resource-limits
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-with-limits
+  namespace: delivery
+spec:
+  containers:
+    - name: app
+      image: ghcr.io/hojex/decision:v1.2.3
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "500m"
+          memory: "512Mi"
