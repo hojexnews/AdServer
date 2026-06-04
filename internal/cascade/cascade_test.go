@@ -355,6 +355,313 @@ func TestCascade_ZoneTenantMismatch_Blank(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// J0 (Fase 2): propensity logging invariants
+// ---------------------------------------------------------------------------
+
+// TestJ0_Propensity_Deterministic verifies that under the pure cascade
+// (no ML ranker) every candidate in the winning stratum carries
+// Propensity=1.0 and the Decision-level fields are DETERMINISTIC/epsilon=0.
+// This is the baseline required for honest OPE in J3.
+func TestJ0_Propensity_Is1_Under_DeterministicPolicy(t *testing.T) {
+	rm1 := makeCampaign("rm1", snapshot.TierRemnant, 1)
+	rm1.ECPM = &moneyv1.Money{AssetCode: "BRL", Amount: 300, Scale: 2}
+	rm2 := makeCampaign("rm2", snapshot.TierRemnant, 1)
+	rm2.ECPM = &moneyv1.Money{AssetCode: "BRL", Amount: 100, Scale: 2}
+	rm2.ZoneIDs = []string{"z1"}
+	rm2.BannerIDs = []string{"ban-rm2"}
+
+	ban1 := makeBanner("ban-rm1", "rm1")
+	ban2 := makeBanner("ban-rm2", "rm2")
+
+	snap := makeSnap(
+		[]*snapshot.Campaign{rm1, rm2},
+		[]*snapshot.Banner{ban1, ban2},
+	)
+
+	result := newEngine().Decide(defaultRequest(), snap)
+
+	// Cascade must succeed and produce candidates.
+	if result.ServedTier == commonv1.ServedTier_SERVED_TIER_BLANK {
+		t.Fatal("expected non-blank result")
+	}
+	if len(result.Candidates) == 0 {
+		t.Fatal("expected at least one candidate in the winning stratum")
+	}
+
+	// Every candidate in the winning stratum must carry Propensity=1.0
+	// (DETERMINISTIC policy: the top-ranked candidate is chosen with certainty).
+	for _, c := range result.Candidates {
+		if c.Propensity != 1.0 {
+			t.Errorf("candidate %q: Propensity=%v, want 1.0 (deterministic baseline for OPE)",
+				c.CampaignId, c.Propensity)
+		}
+	}
+}
+
+// TestJ0_ExactlyOneServed verifies the invariant: exactly one candidate
+// in the candidates slice has Served=true (the chosen one), all others false.
+func TestJ0_ExactlyOneServed(t *testing.T) {
+	rm1 := makeCampaign("rm1", snapshot.TierRemnant, 1)
+	rm1.ECPM = &moneyv1.Money{AssetCode: "BRL", Amount: 300, Scale: 2}
+	rm2 := makeCampaign("rm2", snapshot.TierRemnant, 1)
+	rm2.ECPM = &moneyv1.Money{AssetCode: "BRL", Amount: 100, Scale: 2}
+	rm2.ZoneIDs = []string{"z1"}
+	rm2.BannerIDs = []string{"ban-rm2"}
+
+	ban1 := makeBanner("ban-rm1", "rm1")
+	ban2 := makeBanner("ban-rm2", "rm2")
+
+	snap := makeSnap(
+		[]*snapshot.Campaign{rm1, rm2},
+		[]*snapshot.Banner{ban1, ban2},
+	)
+
+	result := newEngine().Decide(defaultRequest(), snap)
+
+	if len(result.Candidates) < 2 {
+		t.Fatalf("need at least 2 candidates to test served marking, got %d", len(result.Candidates))
+	}
+
+	var servedCount int
+	var servedCampaignID string
+	for _, c := range result.Candidates {
+		if c.Served {
+			servedCount++
+			servedCampaignID = c.CampaignId
+		}
+	}
+
+	if servedCount != 1 {
+		t.Errorf("expected exactly 1 served candidate, got %d", servedCount)
+	}
+
+	// The served candidate must be the winner (rm1 has higher eCPM).
+	if servedCampaignID != "rm1" {
+		t.Errorf("served candidate: got %q, want rm1 (highest eCPM)", servedCampaignID)
+	}
+
+	// The winner in result must match the served candidate.
+	if result.Campaign != nil && result.Campaign.ID != servedCampaignID {
+		t.Errorf("result.Campaign.ID=%q != served candidate %q", result.Campaign.ID, servedCampaignID)
+	}
+}
+
+// TestJ0_CandidatesAreWinningStratumOnly verifies that candidates[] contains
+// ONLY the candidates from the winning stratum (not from other tiers).
+// The ML re-ranker must only compare within a stratum — never cross-tier.
+func TestJ0_CandidatesAreWinningStratumOnly(t *testing.T) {
+	// Both Contract and Remnant candidates present; Contract wins.
+	ct := makeCampaign("ct1", snapshot.TierContract, 5)
+	ct.GoalImpressions = 1000
+	ct.DeliveredImpressions = 500
+	rm := makeCampaign("rm1", snapshot.TierRemnant, 1)
+	rm.ECPM = &moneyv1.Money{AssetCode: "BRL", Amount: 999, Scale: 2}
+
+	banCt := makeBanner("ban-ct1", "ct1")
+	banRm := makeBanner("ban-rm1", "rm1")
+
+	snap := makeSnap(
+		[]*snapshot.Campaign{ct, rm},
+		[]*snapshot.Banner{banCt, banRm},
+	)
+
+	result := newEngine().Decide(defaultRequest(), snap)
+
+	if result.ServedTier != commonv1.ServedTier_SERVED_TIER_CONTRACT {
+		t.Fatalf("expected CONTRACT tier to win, got %v", result.ServedTier)
+	}
+
+	// All candidates must be from the CONTRACT tier only.
+	for _, c := range result.Candidates {
+		if c.Tier != commonv1.ServedTier_SERVED_TIER_CONTRACT {
+			t.Errorf("candidate %q has tier %v, want CONTRACT — candidates must be stratum-pure",
+				c.CampaignId, c.Tier)
+		}
+	}
+}
+
+// TestJ0_Score_Override_UsesPriority verifies the score convention for
+// Override candidates: score = float64(Priority), monotone with the sort order.
+func TestJ0_Score_Override_UsesPriority(t *testing.T) {
+	ov1 := makeCampaign("ov-high", snapshot.TierOverride, 20)
+	ov2 := makeCampaign("ov-low", snapshot.TierOverride, 5)
+	// Give ov-low lower lexicographic ID to ensure priority (not ID) drives order.
+	ov2.ID = "ov-low"
+	ov2.BannerIDs = []string{"ban-ov-low"}
+	ov2.ZoneIDs = []string{"z1"}
+
+	ban1 := makeBanner("ban-ov-high", "ov-high")
+	ban2 := makeBanner("ban-ov-low", "ov-low")
+
+	snap := makeSnap(
+		[]*snapshot.Campaign{ov1, ov2},
+		[]*snapshot.Banner{ban1, ban2},
+	)
+
+	result := newEngine().Decide(defaultRequest(), snap)
+
+	if result.ServedTier != commonv1.ServedTier_SERVED_TIER_OVERRIDE {
+		t.Fatalf("expected OVERRIDE tier, got %v", result.ServedTier)
+	}
+	if len(result.Candidates) < 2 {
+		t.Fatalf("expected 2 override candidates, got %d", len(result.Candidates))
+	}
+
+	// The candidate with higher Priority (20) should have higher score.
+	// Find both candidates by campaign ID.
+	scoreByID := map[string]float64{}
+	for _, c := range result.Candidates {
+		scoreByID[c.CampaignId] = c.Score
+	}
+
+	if scoreByID["ov-high"] <= scoreByID["ov-low"] {
+		t.Errorf("Override score convention: ov-high (priority=20) score=%v must be > ov-low (priority=5) score=%v",
+			scoreByID["ov-high"], scoreByID["ov-low"])
+	}
+}
+
+// TestJ0_Score_Contract_UsesPacingDeficit verifies the score convention for
+// Contract candidates: score = PacingDeficit ∈ [0,1].
+func TestJ0_Score_Contract_UsesPacingDeficit(t *testing.T) {
+	ctHigh := makeCampaign("ct-high-deficit", snapshot.TierContract, 5)
+	ctHigh.GoalImpressions = 1000
+	ctHigh.DeliveredImpressions = 100 // 90% deficit
+	ctHigh.BannerIDs = []string{"ban-ct-high"}
+	ctHigh.ZoneIDs = []string{"z1"}
+
+	ctLow := makeCampaign("ct-low-deficit", snapshot.TierContract, 5)
+	ctLow.GoalImpressions = 1000
+	ctLow.DeliveredImpressions = 900 // 10% deficit
+	ctLow.BannerIDs = []string{"ban-ct-low"}
+	ctLow.ZoneIDs = []string{"z1"}
+
+	ban1 := makeBanner("ban-ct-high", "ct-high-deficit")
+	ban2 := makeBanner("ban-ct-low", "ct-low-deficit")
+
+	snap := makeSnap(
+		[]*snapshot.Campaign{ctHigh, ctLow},
+		[]*snapshot.Banner{ban1, ban2},
+	)
+
+	result := newEngine().Decide(defaultRequest(), snap)
+
+	if result.ServedTier != commonv1.ServedTier_SERVED_TIER_CONTRACT {
+		t.Fatalf("expected CONTRACT tier, got %v", result.ServedTier)
+	}
+
+	scoreByID := map[string]float64{}
+	for _, c := range result.Candidates {
+		scoreByID[c.CampaignId] = c.Score
+	}
+
+	// ct-high-deficit should have score ≈ 0.9 > ct-low-deficit ≈ 0.1
+	if scoreByID["ct-high-deficit"] <= scoreByID["ct-low-deficit"] {
+		t.Errorf("Contract score convention: ct-high-deficit score=%v must be > ct-low-deficit score=%v",
+			scoreByID["ct-high-deficit"], scoreByID["ct-low-deficit"])
+	}
+	// Score must be in [0,1] for Contract (it's a normalised deficit).
+	for id, s := range scoreByID {
+		if s < 0 || s > 1 {
+			t.Errorf("Contract candidate %q: score=%v out of [0,1] range", id, s)
+		}
+	}
+}
+
+// TestJ0_Score_Remnant_UsesECPM verifies the score convention for Remnant:
+// score = float64(ECPMMinorUnits).
+func TestJ0_Score_Remnant_UsesECPM(t *testing.T) {
+	rmHigh := makeCampaign("rm-high", snapshot.TierRemnant, 1)
+	rmHigh.ECPM = &moneyv1.Money{AssetCode: "BRL", Amount: 500, Scale: 2}
+	rmHigh.ZoneIDs = []string{"z1"}
+	rmHigh.BannerIDs = []string{"ban-rm-high"}
+
+	rmLow := makeCampaign("rm-low", snapshot.TierRemnant, 1)
+	rmLow.ECPM = &moneyv1.Money{AssetCode: "BRL", Amount: 100, Scale: 2}
+	rmLow.ZoneIDs = []string{"z1"}
+	rmLow.BannerIDs = []string{"ban-rm-low"}
+
+	ban1 := makeBanner("ban-rm-high", "rm-high")
+	ban2 := makeBanner("ban-rm-low", "rm-low")
+
+	snap := makeSnap(
+		[]*snapshot.Campaign{rmHigh, rmLow},
+		[]*snapshot.Banner{ban1, ban2},
+	)
+
+	result := newEngine().Decide(defaultRequest(), snap)
+
+	if result.ServedTier != commonv1.ServedTier_SERVED_TIER_REMNANT {
+		t.Fatalf("expected REMNANT tier, got %v", result.ServedTier)
+	}
+
+	scoreByID := map[string]float64{}
+	for _, c := range result.Candidates {
+		scoreByID[c.CampaignId] = c.Score
+	}
+
+	if scoreByID["rm-high"] != 500.0 {
+		t.Errorf("rm-high score: got %v, want 500.0 (ECPMMinorUnits)", scoreByID["rm-high"])
+	}
+	if scoreByID["rm-low"] != 100.0 {
+		t.Errorf("rm-low score: got %v, want 100.0 (ECPMMinorUnits)", scoreByID["rm-low"])
+	}
+}
+
+// TestJ0_BlankHasNoCandidates verifies that a BLANK result (no eligible
+// candidate) returns an empty Candidates slice, consistent with the proto
+// comment ("Vazio quando served_tier == SERVED_TIER_BLANK").
+func TestJ0_BlankHasNoCandidates(t *testing.T) {
+	snap := makeSnap(nil, nil)
+	result := newEngine().Decide(defaultRequest(), snap)
+
+	if result.ServedTier != commonv1.ServedTier_SERVED_TIER_BLANK {
+		t.Fatalf("expected BLANK, got %v", result.ServedTier)
+	}
+	if len(result.Candidates) != 0 {
+		t.Errorf("BLANK result must have empty Candidates[], got %d candidates",
+			len(result.Candidates))
+	}
+}
+
+// TestJ0_CascadeInvariantPreserved_PropensityAdditive verifies that adding
+// propensity logging does NOT change which candidate is chosen (additive, not
+// semantic change).  This is the core J0 gate: instrumentation is PURELY additive.
+func TestJ0_CascadeInvariantPreserved_PropensityAdditive(t *testing.T) {
+	// Override + Contract + Remnant all present; Override must still win.
+	override := makeCampaign("ov1", snapshot.TierOverride, 10)
+	contract := makeCampaign("ct1", snapshot.TierContract, 5)
+	remnant := makeCampaign("rm1", snapshot.TierRemnant, 1)
+	remnant.ECPM = &moneyv1.Money{AssetCode: "BRL", Amount: 9999, Scale: 2}
+
+	banOv := makeBanner("ban-ov1", "ov1")
+	banCt := makeBanner("ban-ct1", "ct1")
+	banRm := makeBanner("ban-rm1", "rm1")
+
+	snap := makeSnap(
+		[]*snapshot.Campaign{override, contract, remnant},
+		[]*snapshot.Banner{banOv, banCt, banRm},
+	)
+
+	result := newEngine().Decide(defaultRequest(), snap)
+
+	// The cascade authority is unchanged: OVERRIDE wins.
+	if result.ServedTier != commonv1.ServedTier_SERVED_TIER_OVERRIDE {
+		t.Errorf("cascade invariant violated: expected OVERRIDE, got %v — propensity logging must be additive",
+			result.ServedTier)
+	}
+	if result.Campaign.ID != "ov1" {
+		t.Errorf("expected ov1, got %v", result.Campaign.ID)
+	}
+
+	// Propensity must still be 1.0 for all candidates (no ML ranker).
+	for _, c := range result.Candidates {
+		if c.Propensity != 1.0 {
+			t.Errorf("candidate %q: Propensity=%v, want 1.0", c.CampaignId, c.Propensity)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Benchmarks — goal: near-zero allocations in hot path
 // ---------------------------------------------------------------------------
 

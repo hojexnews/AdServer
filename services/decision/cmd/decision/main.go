@@ -230,16 +230,40 @@ func (h *decisionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Source:        "delivery-decision",
 	}
 
+	// J0 (Fase 2, cascade-only): all propensity / exploration fields set here.
+	//
+	// J1 EXTENSION POINT — when the ML sidecar is wired via cascade.WithRanker():
+	//   1. Propensity: replace 1.0 with the ranker's P(chosen | context, policy).
+	//   2. ExplorationPolicy: set to EPSILON_GREEDY / THOMPSON / LINUCB as active.
+	//   3. Epsilon: set to the current exploration rate (schedule from config).
+	//   4. MlFailOpen: set to TRUE when the ranker exceeded TX-4 budget and the
+	//      cascade fell back to deterministic order — signals OPE to exclude this
+	//      decision from ML training data.
+	//   5. model_version: set Envelope.ModelVersion to the deployed ranker tag.
+	//   The cascade stratum order (Override > Contract > Remnant) is NEVER changed
+	//   by the ML ranker; it only re-ranks within the winning stratum (DA-3).
 	decision := &decisionv1.Decision{
-		Envelope:          envelope,
-		ZoneId:            req.ZoneID,
-		ServedTier:        result.ServedTier,
-		Propensity:        1.0, // cascata pura = 1.0 always
+		Envelope:   envelope,
+		ZoneId:     req.ZoneID,
+		ServedTier: result.ServedTier,
+		// Propensity = 1.0: cascata pura (DETERMINISTIC) — the top-ranked
+		// eligible candidate is chosen with certainty given the context.
+		// This is the correct OPE baseline (J3); never set to 0 for a served ad.
+		Propensity: 1.0,
+		// ExplorationPolicy = DETERMINISTIC (not _UNSPECIFIED): J0 is explicitly
+		// deterministic.  UNSPECIFIED would be ambiguous and break OPE filters.
 		ExplorationPolicy: decisionv1.ExplorationPolicy_EXPLORATION_POLICY_DETERMINISTIC,
-		Epsilon:           0,
-		Candidates:        result.Candidates,
-		CandidateCount:    uint32(len(result.Candidates)),
-		MlFailOpen:        false,
+		Epsilon:    0, // no random exploration in cascade-only mode
+		Candidates: result.Candidates,
+		// CandidateCount = len(Candidates) in J0 (no truncation).
+		// J1 may truncate the slice for large stratums; CandidateCount then
+		// carries the true set size for density/competition signals.
+		CandidateCount: uint32(len(result.Candidates)),
+		// MlFailOpen = false: no ML sidecar attempted, so no fail-open occurred.
+		// J1 sets this to true when the ranker times out (TX-4 budget exceeded)
+		// and the cascade falls back to DefaultRanker.  Consumers filter these
+		// out when building training datasets to avoid contamination.
+		MlFailOpen: false,
 	}
 
 	if result.Campaign != nil {
@@ -410,7 +434,17 @@ func main() {
 
 	// ---------------------------------------------------------------------------
 	// Cascade engine with real capper + default (no-op) ranker.
-	// Ranker extension point (Fase 2 / TX-4): wire ML ranker here when ready.
+	//
+	// J1 EXTENSION POINT (TX-4 / Fase 2 ML ranker):
+	//   Replace DefaultRanker with the ML sidecar ranker:
+	//     mlRanker := mlsidecar.New(timeout=7ms, failOpen=cascade.DefaultRanker{})
+	//     cascadeEngine = cascade.New(rulesEngine,
+	//         cascade.WithCapper(cappingImpl),
+	//         cascade.WithRanker(mlRanker))   // ← plug here
+	//   The mlRanker MUST honour the TX-4 hard deadline (5–8ms p99):
+	//   - On timeout: return the input slice unmodified (fail-open to deterministic).
+	//   - On fail-open: the handler sets MlFailOpen=true and ExplorationPolicy=DETERMINISTIC.
+	//   The cascade stratum order is NEVER changed by the ranker (DA-3).
 	// ---------------------------------------------------------------------------
 	rulesEngine := rules.New()
 	cascadeEngine := cascade.New(rulesEngine, cascade.WithCapper(cappingImpl))

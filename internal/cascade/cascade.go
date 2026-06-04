@@ -434,6 +434,35 @@ func tierToProto(t snapshot.Tier) commonv1.ServedTier {
 	}
 }
 
+// deterministicScore returns a stable, tier-appropriate score for the
+// DETERMINISTIC cascade (no ML ranker).  This is the same key used by the
+// sort functions above, normalised to a float64 so that OPE estimators in J3
+// have a monotone baseline to compare against ML scores later.
+//
+// Convention (J0, cascade-only):
+//   - Override: float64(Priority)         — higher priority wins; sort is by Priority desc.
+//   - Contract: PacingDeficit ∈ [0,1]     — higher deficit wins; sort is by deficit desc.
+//   - Remnant:  float64(ECPMMinorUnits)   — higher eCPM wins; sort is by eCPM desc.
+//
+// When the ML ranker plugs in (J1), it replaces this score with its own signal
+// and sets ExplorationPolicy to the active bandit policy.  The deterministic
+// score then becomes the "baseline" column used by OPE for pre-ML data.
+//
+// Note: this is a ranking signal (double), NOT money — float64 is correct here
+// per the decision.proto comment (TX-2 prohibits float for money, not for scores).
+func deterministicScore(c *Candidate) float64 { //nolint:forbidigo // ranking signal, not money
+	switch c.Tier {
+	case snapshot.TierOverride:
+		return float64(c.Campaign.Priority) //nolint:forbidigo // ranking signal
+	case snapshot.TierContract:
+		return c.PacingDeficit // already in [0,1], no conversion needed
+	case snapshot.TierRemnant:
+		return float64(c.ECPMMinorUnits) //nolint:forbidigo // ranking signal, not money
+	default:
+		return 0
+	}
+}
+
 func makeProtoCandidates(cs []*Candidate) []*decisionv1.Candidate {
 	out := make([]*decisionv1.Candidate, len(cs))
 	for i, c := range cs {
@@ -441,12 +470,17 @@ func makeProtoCandidates(cs []*Candidate) []*decisionv1.Candidate {
 			CampaignId: c.Campaign.ID,
 			BannerId:   c.Banner.ID,
 			Tier:       tierToProto(c.Tier),
-			// Score: for DETERMINISTIC cascade the score is the sort key
-			// (deficit or eCPM); we use the eCPM minor-units as a proxy.
-			// The re-ranker in Fase 2 will overwrite this with the ML score.
-			Score:      float64(c.ECPMMinorUnits), //nolint:forbidigo // ML/ranking signal, not money (see decision.proto comment)
-			Propensity: 1.0,                       // cascata pura: propensity = 1.0
-			Served:     false,                     // updated in tryStratum
+			// Score: tier-appropriate deterministic sort key (see deterministicScore).
+			// Convention: Override=Priority, Contract=PacingDeficit, Remnant=eCPM minor-units.
+			// The ML re-ranker (J1) will overwrite Score with its own signal; the
+			// baseline score here allows OPE to identify pre-ML traffic via model_version="".
+			Score: deterministicScore(c),
+			// Propensity = 1.0 under the DETERMINISTIC policy (DA-3):
+			// the cascade deterministically selects the top-ranked eligible candidate,
+			// so P(action | context, policy) = 1.0 for the chosen action.
+			// This is the correct baseline for off-policy evaluation (OPE/IPS/DR) in J3.
+			Propensity: 1.0,
+			Served:     false, // updated in tryStratum after capper check
 		}
 	}
 	return out

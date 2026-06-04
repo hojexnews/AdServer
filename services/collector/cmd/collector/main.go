@@ -222,6 +222,14 @@ func (h *collectorHandler) handleAsyncJS(w http.ResponseWriter, r *http.Request)
 //
 // Design: async/await, no blocking, impressions counted only via lg pixel.
 // The click link uses the signed "tok" parameter — no plain dest_url in query.
+//
+// model_version flow (J0→J1):
+//   The decision response carries `model_version` (empty in J0 / cascade-only;
+//   non-empty in J1+ when the ML ranker is active).  The JS embeds it as the
+//   "mv" parameter in both the /lg impression pixel URL and the /ck click URL
+//   so the collector can forward it to EmitImpression/EmitClick.  This closes
+//   the loop: every downstream event carries the ranker version that produced
+//   the decision, enabling OPE attribution by model_version in J4.
 func buildAdTagJS(decisionBase, lgBase, zoneID, tenantID, cachebuster, decisionID string) string {
 	return fmt.Sprintf(`(async function(){
   "use strict";
@@ -240,6 +248,9 @@ func buildAdTagJS(decisionBase, lgBase, zoneID, tenantID, cachebuster, decisionI
     if (!d.banner_id) return; // blank impression: nothing to render
     const slot = document.currentScript && document.currentScript.parentElement;
     if (!slot) return;
+    // model_version from decision response ("" in J0/cascade-only; non-empty in J1+).
+    // Embedded in every downstream pixel/click URL so OPE can attribute by ranker version.
+    const mv = d.model_version || "";
     // Render creative.
     if (d.image_url) {
       const a = document.createElement("a");
@@ -249,7 +260,8 @@ func buildAdTagJS(decisionBase, lgBase, zoneID, tenantID, cachebuster, decisionI
                "&bid=" + encodeURIComponent(d.banner_id) +
                "&cid=" + encodeURIComponent(d.campaign_id) +
                "&zid=" + encodeURIComponent(d.zone_id) +
-               "&tid=" + encodeURIComponent(d.tenant_id || "");
+               "&tid=" + encodeURIComponent(d.tenant_id || "") +
+               "&mv="  + encodeURIComponent(mv);
       a.target = "_blank";
       a.rel = "noopener noreferrer";
       const img = document.createElement("img");
@@ -266,6 +278,7 @@ func buildAdTagJS(decisionBase, lgBase, zoneID, tenantID, cachebuster, decisionI
       slot.appendChild(div);
     }
     // Impression pixel — loaded NOW (CA-6: counted at render, not at request).
+    // "mv" (model_version) flows from decision → lg → telemetry for OPE attribution.
     const lg = new Image(1, 1);
     lg.src = %q + "/lg?did=" + encodeURIComponent(d.decision_id) +
              "&bid=" + encodeURIComponent(d.banner_id) +
@@ -273,7 +286,8 @@ func buildAdTagJS(decisionBase, lgBase, zoneID, tenantID, cachebuster, decisionI
              "&zid=" + encodeURIComponent(d.zone_id) +
              "&tid=" + encodeURIComponent(d.tenant_id || "") +
              "&tier=" + encodeURIComponent(d.served_tier || "") +
-             "&cb=" + encodeURIComponent(%q);
+             "&mv="  + encodeURIComponent(mv) +
+             "&cb="  + encodeURIComponent(%q);
   } catch(e) {
     // Silent fail: ad tag MUST NOT break the publisher page (DA-5).
   }
@@ -309,10 +323,17 @@ func (h *collectorHandler) handleImpression(w http.ResponseWriter, r *http.Reque
 	blank := servedTier == commonv1.ServedTier_SERVED_TIER_BLANK || bannerID == ""
 	billable := !blank && servedTier != commonv1.ServedTier_SERVED_TIER_UNSPECIFIED
 
+	// model_version is forwarded from the JS tag (passed as "mv" query param).
+	// In J0 (cascade-only) this is always "" (modelVersionDeterministic).
+	// When J1 plugs in the ML sidecar, the decision response will carry a
+	// non-empty model_version, the JS tag will embed it in the pixel URL, and
+	// it will flow here unchanged — enabling OPE attribution by ranker version.
+	modelVersion := q.Get("mv")
+
 	h.sink.EmitImpression(
 		tenantID, campaignID, bannerID, zoneID,
 		servedTier, billable, blank,
-		decisionID, "", // model_version: caller passes via future extension
+		decisionID, modelVersion,
 	)
 
 	// Return 1×1 transparent GIF pixel.
@@ -421,8 +442,12 @@ func (h *collectorHandler) handleClick(w http.ResponseWriter, r *http.Request) {
 	// Use the validated decision_id from the token as the authoritative one.
 	effectiveDecisionID := signedDecisionID
 
+	// model_version is forwarded from the JS tag (passed as "mv" query param).
+	// In J0 this is always ""; J1 will carry the active ranker version here.
+	modelVersion := q.Get("mv")
+
 	// Record the click event (fire-and-forget).
-	h.sink.EmitClick(tenantID, campaignID, bannerID, zoneID, destURL, effectiveDecisionID, "")
+	h.sink.EmitClick(tenantID, campaignID, bannerID, zoneID, destURL, effectiveDecisionID, modelVersion)
 
 	// Server-side 302 redirect to the advertiser landing page (CA-6).
 	http.Redirect(w, r, destURL, http.StatusFound)
@@ -566,10 +591,14 @@ func (h *collectorHandler) handleConversion(w http.ResponseWriter, r *http.Reque
 	// attributed.  It links this conversion to the ad that drove it (TX-1).
 	attributionDecisionID := q.Get("adid")
 
+	// model_version forwarded from the conversion pixel URL ("mv" param).
+	// In J0 always ""; propagated from the decision that originated the ad.
+	modelVersion := q.Get("mv")
+
 	h.sink.EmitConversion(
 		tenantID, campaignID, bannerID,
 		attributionDecisionID,
-		decisionID, "",
+		decisionID, modelVersion,
 	)
 
 	// Return 1×1 transparent GIF (same as impression pixel).
