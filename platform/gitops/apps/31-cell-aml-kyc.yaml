@@ -1,0 +1,46 @@
+# Application filho — célula AML/KYC (K6): NetworkPolicies Cilium, Kyverno,
+# RBAC, Gateway API, namespace. Prefixo 31 = após netpols globais e Kyverno
+# baseline (30-cell-pci e 31-cell-aml-kyc podem sincronizar em paralelo).
+#
+# Conteúdo de platform/cells/aml-kyc/ (todos os subdirs via recurse=true):
+#   gateway/         — HTTPRoute para webhook Sumsub (POST /webhooks/sumsub)
+#   netpol/          — default-deny, allow-dns, allow-egress-* (Cilium)
+#   policy/          — Kyverno Enforce (proibir K8s Secret, exigir Vault Agent)
+#   rbac/            — Role/RoleBinding menor privilégio
+#   secrets/         — ServiceAccount + ConfigMap ref Vault Agent (sem valores)
+#   namespace.yaml   — Namespace aml-kyc com labels de compliance
+#
+# INVARIANTES (privacy-compliance-auditor valida no merge):
+#   - PII/KYC não escapa da célula (Cilium deny-all + Kyverno).
+#   - Nenhum segredo em YAML — só refs OpenBao.
+#   - Ingress único: POST /webhooks/sumsub via Envoy Gateway.
+#   - Hot path (delivery) sem dependência de aml-kyc.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cell-aml-kyc
+  namespace: argocd
+  labels:
+    adserver.hojex/cell: aml-kyc
+    adserver.hojex/compliance: aml-kyc-travel-rule
+    adserver.hojex/phase: fase-3-k6
+spec:
+  project: platform
+  source:
+    repoURL: "https://github.com/hojex/adserver.git"
+    targetRevision: main
+    path: platform/cells/aml-kyc
+    directory:
+      recurse: true
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: aml-kyc
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+  # Recursos órfãos disparam alerta — qualquer netpol sem correspondente
+  # no git indica deriva de configuração que deve ser investigada.
+  ignoreDifferences: []

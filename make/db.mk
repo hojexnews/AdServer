@@ -13,7 +13,8 @@
 MIGRATE := $(shell command -v migrate 2>/dev/null || echo migrate)
 
 # Schemas e suas pastas de migrations (ordem de aplicação obrigatória)
-DB_SCHEMAS := asset_registry config ledger
+# compliance e o ultimo: depende do schema config (funcao current_tenant_id) e ledger.
+DB_SCHEMAS := asset_registry config ledger compliance
 
 ## db-lint: roda o guard anti-float (TX-2) sobre todos os arquivos SQL em db/
 db-lint:
@@ -21,7 +22,7 @@ db-lint:
 	@bash scripts/ci/no-float-sql.sh db/
 	@echo "== db-lint: ok =="
 
-## db-migrate-up: aplica todas as migrations em ordem (asset_registry → config → ledger)
+## db-migrate-up: aplica todas as migrations em ordem (asset_registry → config → ledger → compliance)
 db-migrate-up: _db-check-url
 	@for schema in $(DB_SCHEMAS); do \
 	  echo "-- migrate up: $$schema"; \
@@ -29,9 +30,9 @@ db-migrate-up: _db-check-url
 	done
 	@echo "== db-migrate-up: concluído =="
 
-## db-migrate-down: reverte UM passo de cada schema (em ordem inversa)
+## db-migrate-down: reverte UM passo de cada schema (em ordem inversa: compliance → ledger → config → asset_registry)
 db-migrate-down: _db-check-url
-	@for schema in ledger config asset_registry; do \
+	@for schema in compliance ledger config asset_registry; do \
 	  echo "-- migrate down 1: $$schema"; \
 	  $(MIGRATE) -database "$(DATABASE_URL)" -path "db/$$schema/migrations" down 1 || exit 1; \
 	done
@@ -44,7 +45,7 @@ db-migrate-status: _db-check-url
 	  $(MIGRATE) -database "$(DATABASE_URL)" -path "db/$$schema/migrations" version; \
 	done
 
-## db-test: executa o teste de isolamento RLS (TX-3) contra instância Postgres local.
+## db-test: executa o teste de isolamento RLS (TX-3) do schema config contra Postgres local.
 ##   Requer DATABASE_URL e que as migrations 0001/0002/0003 do schema config
 ##   já tenham sido aplicadas (make db-migrate-up).
 ##   O role adserver_app deve existir com GRANT SELECT/INSERT/UPDATE/DELETE
@@ -55,11 +56,27 @@ db-migrate-status: _db-check-url
 ##     export DATABASE_URL="postgres://adserver_admin:pass@localhost:5432/adserver?sslmode=disable"
 ##     make db-test
 db-test: _db-check-url
-	@echo "== db-test: isolamento RLS por tenant (TX-3) =="
+	@echo "== db-test: isolamento RLS por tenant — schema config (TX-3) =="
 	@psql "$(DATABASE_URL)" \
 	      -v ON_ERROR_STOP=1 \
 	      -f db/config/tests/rls_isolation_test.sql
 	@echo "== db-test: concluído =="
+
+## db-test-compliance: executa o teste de isolamento RLS do cofre de compliance (K6 / TX-3).
+##   Requer DATABASE_URL e que a migration 0001_compliance_schema_up.sql tenha sido aplicada.
+##   O role adserver_app deve existir com GRANT SELECT/INSERT/UPDATE/DELETE
+##   em todas as tabelas do schema compliance.
+##   O teste roda dentro de ROLLBACK — não persiste dados.
+##
+##   Uso:
+##     export DATABASE_URL="postgres://adserver_admin:pass@localhost:5432/adserver?sslmode=disable"
+##     make db-test-compliance
+db-test-compliance: _db-check-url
+	@echo "== db-test-compliance: isolamento RLS cofre compliance (K6 / TX-3) =="
+	@psql "$(DATABASE_URL)" \
+	      -v ON_ERROR_STOP=1 \
+	      -f db/compliance/tests/rls_isolation_test.sql
+	@echo "== db-test-compliance: concluído =="
 
 # Alvo interno: verifica se DATABASE_URL está definido
 _db-check-url:
@@ -69,4 +86,4 @@ _db-check-url:
 	  exit 1; \
 	fi
 
-.PHONY: db-lint db-migrate-up db-migrate-down db-migrate-status db-test _db-check-url
+.PHONY: db-lint db-migrate-up db-migrate-down db-migrate-status db-test db-test-compliance _db-check-url

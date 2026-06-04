@@ -23,8 +23,16 @@ spec:
       namespace: data
     - server: https://kubernetes.default.svc
       namespace: pci
+    # aml-kyc: célula AML/KYC/Travel Rule (K6) — namespace canônico.
+    # Corrigido de "aml" para "aml-kyc" em alinhamento com
+    # platform/cells/aml-kyc/namespace.yaml e platform/k8s/namespaces.yaml.
     - server: https://kubernetes.default.svc
-      namespace: aml
+      namespace: aml-kyc
+    # db-compliance: namespace do cofre de compliance (PII/KYC pseudônimo).
+    # Usado apenas quando o Postgres roda no cluster (Opção A de
+    # allow-egress-postgres-compliance.yaml).
+    - server: https://kubernetes.default.svc
+      namespace: db-compliance
   clusterResourceWhitelist:
     - group: "*"
       kind: Namespace
@@ -32,6 +40,9 @@ spec:
       kind: CiliumNetworkPolicy
     - group: kyverno.io
       kind: ClusterPolicy
+    # Gateway API — HTTPRoute é namespace-scoped, mas GatewayClass é cluster-scoped.
+    - group: gateway.networking.k8s.io
+      kind: GatewayClass
   namespaceResourceWhitelist:
     - group: "*"
       kind: "*"

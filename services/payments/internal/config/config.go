@@ -30,6 +30,14 @@
 //	SAFE_MIN_CONFIRMATIONS     — numero minimo de confirmacoes para finalidade (default: 12).
 //	USDC_CONTRACT_ADDRESS      — endereco do contrato USDC na chain (default: mainnet Ethereum).
 //	CRYPTO_ENABLED             — "true" habilita o trilho cripto Safe (default: false).
+//
+// Variaveis de ambiente (compliance K6 — Sumsub + Chainalysis + Travel Rule):
+//
+//	COMPLIANCE_ENABLED         — "true" habilita screening/KYC no trilho cripto (default: false).
+//	CHAINALYSIS_BASE_URL       — URL base da API Chainalysis (default: https://api.chainalysis.com).
+//	CHAINALYSIS_RISK_THRESHOLD — score de risco 0-100 acima do qual bloqueia (default: 70).
+//	SUMSUB_BASE_URL            — URL base da API Sumsub (default: https://api.sumsub.com).
+//	TRAVEL_RULE_THRESHOLD_USDC — limiar Travel Rule em minor-units USDC (default: 0 = sempre).
 package config
 
 import (
@@ -115,6 +123,33 @@ type Config struct {
 	// Default: 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 (Ethereum mainnet).
 	// Sobrescrever para testnet (ex.: Sepolia USDC).
 	USDCContractAddress string
+
+	// ---------------------------------------------------------------------------
+	// K6 — Compliance: Sumsub + Chainalysis + Travel Rule
+	// ---------------------------------------------------------------------------
+
+	// ComplianceEnabled habilita o screening Chainalysis e KYC Sumsub no trilho cripto.
+	// Default false: compliance inativo ate K6 estar completo com chaves vivas.
+	// SEGURANCA: em producao, deve ser true quando CRYPTO_ENABLED=true.
+	ComplianceEnabled bool
+
+	// ChainalysisBaseURL e a URL base da API Chainalysis.
+	// Default: "https://api.chainalysis.com"
+	ChainalysisBaseURL string
+
+	// ChainalysisRiskThreshold e o score de risco (0-100) acima do qual a operacao e bloqueada.
+	// Default: 70. TX-2: sem float — int.
+	ChainalysisRiskThreshold int
+
+	// SumsubBaseURL e a URL base da API Sumsub.
+	// Default: "https://api.sumsub.com"
+	SumsubBaseURL string
+
+	// TravelRuleThresholdUSDC e o limiar de Travel Rule em minor-units de USDC.
+	// Default: 0 (registrar todas as transferencias — comportamento conservador).
+	// Para USD 1.000 com USDC scale=6: 1_000_000_000 minor-units.
+	// TX-2: int64, sem float.
+	TravelRuleThresholdUSDC int64
 }
 
 // Load le a configuracao das variaveis de ambiente.
@@ -142,6 +177,13 @@ func Load() (Config, error) {
 			"USDC_CONTRACT_ADDRESS",
 			"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", // Ethereum mainnet
 		),
+
+		// K6 — compliance
+		ComplianceEnabled:        parseBool(os.Getenv("COMPLIANCE_ENABLED"), false),
+		ChainalysisBaseURL:       envOr("CHAINALYSIS_BASE_URL", "https://api.chainalysis.com"),
+		ChainalysisRiskThreshold: parseInt(os.Getenv("CHAINALYSIS_RISK_THRESHOLD"), 70),
+		SumsubBaseURL:            envOr("SUMSUB_BASE_URL", "https://api.sumsub.com"),
+		TravelRuleThresholdUSDC:  parseInt64(os.Getenv("TRAVEL_RULE_THRESHOLD_USDC"), 0),
 	}
 
 	validEnvs := map[string]bool{"development": true, "staging": true, "production": true}
@@ -186,6 +228,36 @@ func parseUint32Or(s string, def uint32) uint32 {
 		return def
 	}
 	var n uint32
+	_, err := fmt.Sscanf(s, "%d", &n)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+// parseInt converte uma string para int; retorna def se vazia ou invalida.
+// TX-2: usado apenas para thresholds de risco (0-100), nao para valores monetarios.
+func parseInt(s string, def int) int {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return def
+	}
+	var n int
+	_, err := fmt.Sscanf(s, "%d", &n)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+// parseInt64 converte uma string para int64; retorna def se vazia ou invalida.
+// TX-2: usado para limiares em minor-units (int64, sem float).
+func parseInt64(s string, def int64) int64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return def
+	}
+	var n int64
 	_, err := fmt.Sscanf(s, "%d", &n)
 	if err != nil {
 		return def

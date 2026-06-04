@@ -1,5 +1,5 @@
 # Namespaces por célula (TX-3 / §2.7). Cada um rotulado com a célula e o
-# baseline Pod Security "restricted". PCI e AML são células de escopo
+# baseline Pod Security "restricted". PCI e AML/KYC são células de escopo
 # mínimo — no alvo, em contas cloud separadas; aqui, namespaces isolados
 # com deny-all de rede (ver netpol/).
 ---
@@ -49,12 +49,33 @@ metadata:
     pod-security.kubernetes.io/enforce: restricted
     pod-security.kubernetes.io/enforce-version: latest
 ---
+# Namespace da célula AML/KYC/Travel Rule — compliance, cofre PII/KYC
+# pseudônimo, Sumsub, Chainalysis, trilho cripto.
+# Nota: o namespace aml-kyc tem também manifest próprio em
+# platform/cells/aml-kyc/namespace.yaml (mais labels de compliance);
+# ambos devem ser idênticos no nome. O Argo CD aplica este para
+# bootstrapping e o de cells/ para os controles complementares.
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: aml
+  name: aml-kyc
   labels:
-    adserver.hojex/cell: aml
+    adserver.hojex/cell: aml-kyc
+    adserver.hojex/compliance: aml-kyc-travel-rule
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+---
+# Namespace de banco de dados do cofre de compliance (PII/KYC pseudônimo).
+# Isolado da célula aml-kyc de aplicação; acesso apenas via Cilium policy
+# explícita (allow-egress-postgres-compliance.yaml — Opção A).
+# Se o Postgres for gerenciado (RDS/Cloud SQL), este namespace pode não
+# ser provisionado — ver PLACEHOLDER em allow-egress-postgres-compliance.yaml.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: db-compliance
+  labels:
+    adserver.hojex/cell: db-compliance
     adserver.hojex/compliance: aml-kyc-travel-rule
     pod-security.kubernetes.io/enforce: restricted
     pod-security.kubernetes.io/enforce-version: latest

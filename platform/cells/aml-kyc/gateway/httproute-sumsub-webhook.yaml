@@ -1,0 +1,74 @@
+# Gateway API — HTTPRoute para o endpoint de webhook do Sumsub (ADR-0004 §E.10 / K6).
+#
+# Restricoes de roteamento (compliance / auditor de privacidade):
+#   - Path exato: /webhooks/sumsub — nenhuma outra rota exposta para a celula AML/KYC.
+#   - Metodo: POST (callbacks do Sumsub sao sempre POST).
+#   - O header X-App-Token (ou equivalente) deve estar presente e ser
+#     validado pelo servico payments com SUMSUB_WEBHOOK_SECRET via OpenBao.
+#   - TLS termina no Envoy Gateway / Cloudflare. O backend recebe HTTP
+#     simples na porta 8080 (comunicacao intra-cluster).
+#
+# Por que Gateway API e nao Ingress:
+#   O ADR-0004 §2.7 adota Gateway API (Envoy Gateway). HTTPRoute v1 e GA
+#   desde Kubernetes 1.28. Nao usamos Ingress kubernetes.io/ingress-class.
+#
+# GatewayClass / Gateway: referencia o Gateway 'platform-gateway' no
+# namespace platform-system (criado pelo Helm do Envoy Gateway via Tofu).
+# O parentRef abaixo e o UNICO ponto de entrada HTTP/HTTPS para esta celula.
+#
+# IMPORTANTE: nenhuma outra rota deve apontar de/para o namespace aml-kyc
+# exceto esta. O security-reviewer e o privacy-compliance-auditor validam
+# a ausencia de outras rotas. PII/KYC transita APENAS por esta rota (POST
+# de callback — sem PII no path/query; PII e no corpo criptografado).
+#
+# Timeout: callbacks do Sumsub tem timeout de 10s na entrega. O servico
+# payments deve enfileirar o evento e responder 200 imediatamente para
+# evitar reentrega. Timeout configurado em 8s para folga.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: sumsub-webhook
+  namespace: aml-kyc
+  labels:
+    adserver.hojex/cell: aml-kyc
+    adserver.hojex/compliance: aml-kyc-travel-rule
+    adserver.hojex/phase: fase-3-k6
+    adserver.hojex/owner: platform-infra-engineer
+    adserver.hojex/audit: privacy-compliance-validavel
+  annotations:
+    adserver.hojex/scope: >
+      Unica rota exposta para a celula AML/KYC. Apenas POST /webhooks/sumsub.
+      Assinatura validada pelo servico (SUMSUB_WEBHOOK_SECRET via OpenBao).
+      PII/KYC nao e exportado por esta rota — apenas status de verificacao.
+spec:
+  parentRefs:
+    # Referencia o Gateway compartilhado da plataforma (Envoy Gateway,
+    # namespace platform-system). O 'sectionName' restringe a porta HTTPS.
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: platform-gateway
+      namespace: platform-system
+      sectionName: https
+
+  # Hostname publico para esta celula.
+  # PLACEHOLDER: substituir pelo DNS real no apply.
+  hostnames:
+    - "compliance.hojexnews.com.br"  # PLACEHOLDER: substituir no apply
+
+  rules:
+    - matches:
+        - path:
+            type: Exact
+            value: /webhooks/sumsub
+          method: POST
+      backendRefs:
+        - name: payments
+          namespace: aml-kyc
+          port: 8080
+      filters:
+        # Timeout: enfileirar async e responder 200 antes de 8s.
+        # O Sumsub reentrega se nao receber 200 dentro de 10s.
+        - type: RequestTimeout
+          requestTimeout:
+            request: 8s

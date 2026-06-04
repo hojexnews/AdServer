@@ -1,0 +1,73 @@
+# Egress para o Postgres do cofre de compliance (db/compliance) — celula AML/KYC
+# (ADR-0004 §G / K6).
+#
+# O cofre de compliance (db/compliance) armazena PII/KYC pseudonimo (TX-3/DA-11):
+# dados de identidade de tenants/anunciantes referenciados por tenant_id pseudonimo,
+# com Row-Level Security (RLS) por tenant. O Postgres desta celula e o UNICO banco
+# que contem PII/KYC no sistema — ledger (db/ledger) e telemetria nao recebem PII.
+#
+# Topologia de deploy:
+#
+#   Opcao A (Postgres em namespace proprio no mesmo cluster):
+#     O workload payments se conecta ao Postgres no namespace db-compliance
+#     (label app.kubernetes.io/name: postgres-compliance). Esta e a policy
+#     abaixo — aplica-se quando o Postgres rodar no cluster.
+#
+#   Opcao B (RDS / Cloud SQL gerenciado):
+#     Se o Postgres for um servico gerenciado (RDS, Cloud SQL), substituir
+#     toEndpoints pelo FQDN do endpoint RDS em toFQDNs. Exemplo:
+#       toFQDNs:
+#         - matchPattern: "*.compliance.*.rds.amazonaws.com"
+#     Requer atualizacao desta policy e aprovacao do security-reviewer.
+#     O PLACEHOLDER de FQDN de RDS deve ser substituido antes do go-live.
+#
+# Porta 5432: PostgreSQL padrao. Se o Postgres gerenciado usar outra porta,
+# atualizar aqui e documentar no comentario.
+#
+# Credenciais de banco:
+#   O Vault Agent injeta a DSN de conexao como dynamic secret (lease renovavel)
+#   via OpenBao database secrets engine. O container payments le a DSN de
+#   /vault/secrets/db-compliance-dsn — nunca de K8s Secret nem de env estatica.
+#   O lease e renovado automaticamente pelo Vault Agent sidecar.
+#
+# Nota sobre KMS (criptografia em repouso):
+#   O Postgres do cofre de compliance usa criptografia em repouso com envelope
+#   KMS (AWS KMS / GCP KMS), conforme §2.7 / K6. Os dados de PII sao cifrados
+#   na camada de armazenamento. A chave de envelope nunca e exposta ao workload
+#   payments — o Postgres/RDS gerencia a decifragem em repouso internamente.
+#   Docs: docs/adr/0004-fase-3-sequenciamento-ia-avancada-cripto.md §F.
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-egress-postgres-compliance
+  namespace: aml-kyc
+  labels:
+    adserver.hojex/cell: aml-kyc
+    adserver.hojex/compliance: aml-kyc-travel-rule
+    adserver.hojex/phase: fase-3-k6
+    adserver.hojex/owner: platform-infra-engineer
+    adserver.hojex/audit: privacy-compliance-validavel
+  annotations:
+    adserver.hojex/placeholder: >
+      Opcao B (RDS/Cloud SQL gerenciado): substituir toEndpoints por toFQDNs
+      com o FQDN do endpoint gerenciado antes do go-live. Aprovacao:
+      security-reviewer + privacy-compliance-auditor.
+spec:
+  # Aplica somente ao workload payments dentro da celula AML/KYC.
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: payments
+      adserver.hojex/cell: aml-kyc
+
+  egress:
+    # --- Opcao A: Postgres em namespace db-compliance no cluster -----------
+    # Se usar RDS/Cloud SQL, substituir este bloco por toFQDNs (ver nota).
+    - toEndpoints:
+        - matchLabels:
+            io.kubernetes.pod.namespace: db-compliance
+            app.kubernetes.io/name: postgres-compliance
+      toPorts:
+        - ports:
+            - port: "5432"
+              protocol: TCP

@@ -1,4 +1,4 @@
-// Command payments e o servico de pagamentos multi-trilho do AdServer (K4/K5).
+// Command payments e o servico de pagamentos multi-trilho do AdServer (K4/K5/K6).
 //
 // # Posicionamento arquitetural
 //
@@ -14,6 +14,9 @@
 //   - Cripto K5:   Safe multisig -> Fireblocks (sob AUM) via ChainConnector.
 //                  USDC como ramp. Deposito PENDING ate N confirmacoes via webhook.
 //                  Reorg -> estorno auditavel (RecordReversal). AEV/BND gated (scale TBD).
+//   - Compliance K6: Sumsub (KYC/KYB) + Chainalysis (screening on-chain) + Travel Rule.
+//                    Cofre db/compliance (PII/KYC pseudonimo, RLS por tenant).
+//                    Screening fail-closed: sancoes/alto risco bloqueiam deposito/payout.
 //
 // # Invariantes inegociaveis
 //
@@ -37,6 +40,9 @@
 //   - PAYMENTS_PG_DSN            — DSN do Postgres do ledger (K3).
 //   - SAFE_WEBHOOK_SECRET        — segredo HMAC-SHA256 para webhooks do custodiante Safe (K5).
 //                                   Lido de SAFE_WEBHOOK_SECRET via OpenBao/env.
+//   - CHAINALYSIS_API_KEY        — chave de API Chainalysis KYT (K6). OpenBao/env.
+//   - SUMSUB_API_KEY             — chave de API Sumsub (K6). OpenBao/env.
+//   - SUMSUB_WEBHOOK_SECRET      — segredo HMAC para webhooks Sumsub (K6). OpenBao/env.
 //
 // # Configuracao nao-sensivel (variaveis de ambiente)
 //
@@ -52,6 +58,11 @@
 //   - SAFE_ADDRESS          — endereco da carteira Safe multisig da plataforma.
 //   - SAFE_MIN_CONFIRMATIONS — min confirmacoes para finalidade (default: 12).
 //   - USDC_CONTRACT_ADDRESS — contrato USDC (default: mainnet Ethereum).
+//   - COMPLIANCE_ENABLED    — "true" habilita compliance K6 (default: false).
+//   - CHAINALYSIS_BASE_URL  — URL base Chainalysis (default: https://api.chainalysis.com).
+//   - CHAINALYSIS_RISK_THRESHOLD — limiar de risco 0-100 (default: 70).
+//   - SUMSUB_BASE_URL       — URL base Sumsub (default: https://api.sumsub.com).
+//   - TRAVEL_RULE_THRESHOLD_USDC — limiar Travel Rule em minor-units USDC (default: 0).
 //
 // # SEAM Fireblocks (K5)
 //
@@ -63,6 +74,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
@@ -73,6 +85,7 @@ import (
 	"github.com/hojex/adserver/internal/chainconnector"
 	"github.com/hojex/adserver/internal/ledger"
 	"github.com/hojex/adserver/services/payments/internal/asaas"
+	"github.com/hojex/adserver/services/payments/internal/chainalysis"
 	"github.com/hojex/adserver/services/payments/internal/config"
 	cryptopkg "github.com/hojex/adserver/services/payments/internal/crypto"
 	"github.com/hojex/adserver/services/payments/internal/fiat"
@@ -80,6 +93,8 @@ import (
 	"github.com/hojex/adserver/services/payments/internal/mercadopago"
 	"github.com/hojex/adserver/services/payments/internal/secrets"
 	stripepkg "github.com/hojex/adserver/services/payments/internal/stripe"
+	"github.com/hojex/adserver/services/payments/internal/sumsub"
+	"github.com/hojex/adserver/services/payments/internal/travelrule"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -203,6 +218,102 @@ func main() {
 	mux.Handle("/webhooks/mercadopago", mpProvider.WebhookHandler(platformTenantID()))
 
 	// -------------------------------------------------------------------------
+	// K6: compliance — Sumsub (KYC/KYB) + Chainalysis (screening) + Travel Rule
+	//
+	// Inicializado ANTES do K5 para que os adaptadores de compliance possam ser
+	// injetados no SafeWebhookHandler no momento de sua construcao.
+	//
+	// POSICIONAMENTO (ADR-0004 §E.10 / §F):
+	//   - Vive na celula AML/KYC (Cilium deny-all, segredos via OpenBao).
+	//   - PII/KYC apenas no cofre db/compliance, referenciado por tenant_id pseudonimo (TX-3).
+	//   - Ledger e telemetria SEM PII (DA-11).
+	//   - Screening fail-closed: sancoes/alto risco bloqueiam deposito/payout.
+	//   - Webhook Sumsub verificado por HMAC antes de qualquer efeito.
+	//   - Segredos (CHAINALYSIS_API_KEY, SUMSUB_API_KEY, SUMSUB_WEBHOOK_SECRET)
+	//     NUNCA em imagem/git — injetados pelo OpenBao/Vault Agent (celula aml-kyc).
+	// -------------------------------------------------------------------------
+
+	// Adaptadores de compliance injetados no SafeWebhookHandler (K5).
+	// nil = compliance desabilitado (dev/staging); nao-nil em producao.
+	// NOTA DE PRODUCAO: COMPLIANCE_ENABLED=false NAO e aceitavel em producao
+	// — ambos devem ser nao-nil para que o screening fail-closed opere.
+	var cryptoScreener cryptopkg.AddressScreener     // injetado abaixo se COMPLIANCE_ENABLED
+	var cryptoTravelRecorder cryptopkg.TravelRuleRecorder // injetado abaixo se COMPLIANCE_ENABLED
+
+	if cfg.ComplianceEnabled {
+		// Segredos K6 lidos de env/OpenBao — nunca em imagem/git.
+		chainalysisAPIKey := os.Getenv("CHAINALYSIS_API_KEY")
+		if chainalysisAPIKey == "" {
+			slog.Error("payments: COMPLIANCE_ENABLED=true mas CHAINALYSIS_API_KEY ausente")
+			os.Exit(1)
+		}
+		sumsubAPIKey := os.Getenv("SUMSUB_API_KEY")
+		if sumsubAPIKey == "" {
+			slog.Error("payments: COMPLIANCE_ENABLED=true mas SUMSUB_API_KEY ausente")
+			os.Exit(1)
+		}
+		sumsubWebhookSecret := os.Getenv("SUMSUB_WEBHOOK_SECRET")
+		if sumsubWebhookSecret == "" {
+			slog.Error("payments: COMPLIANCE_ENABLED=true mas SUMSUB_WEBHOOK_SECRET ausente")
+			os.Exit(1)
+		}
+
+		// Screener Chainalysis (screening on-chain).
+		// Fail-closed: sancoes ou risco acima do limiar bloqueiam a operacao.
+		// A chamada HTTP real pende de CHAINALYSIS_API_KEY viva.
+		rawScreener, err := chainalysis.New(chainalysis.Config{
+			APIKey:        chainalysisAPIKey, // NUNCA loga
+			BaseURL:       cfg.ChainalysisBaseURL,
+			RiskThreshold: cfg.ChainalysisRiskThreshold, // int 0-100; TX-2: sem float
+		}, pool, logger)
+		if err != nil {
+			slog.Error("payments: falha ao inicializar Chainalysis screener", "err", err)
+			os.Exit(1)
+		}
+		// Adapta *chainalysis.Screener -> cryptopkg.AddressScreener.
+		// O adaptador traduz o ScreenAddressParams do pacote crypto para o do
+		// pacote chainalysis — sem ciclo de import, sem PII em logs.
+		cryptoScreener = &chainalysisScreenerAdapter{s: rawScreener}
+
+		// Client Sumsub (KYC/KYB).
+		// Webhook verificado por HMAC-SHA1 antes de qualquer efeito.
+		// PII dos documentos fica exclusivamente no Sumsub; cofre local guarda
+		// apenas subject_ref pseudonimo + status (TX-3 / DA-11).
+		sumsubClient, err := sumsub.New(sumsub.Config{
+			APIKey:        sumsubAPIKey,        // NUNCA loga
+			WebhookSecret: sumsubWebhookSecret, // NUNCA loga
+			BaseURL:       cfg.SumsubBaseURL,
+		}, pool, logger)
+		if err != nil {
+			slog.Error("payments: falha ao inicializar client Sumsub", "err", err)
+			os.Exit(1)
+		}
+
+		// Webhook Sumsub: /webhooks/sumsub
+		// Verificacao HMAC-SHA1 tempo-constante + anti-replay antes de atualizar status KYC.
+		// A celula AML/KYC tem Cilium deny-all; apenas o Sumsub pode acessar este path.
+		mux.Handle("/webhooks/sumsub", sumsubClient.WebhookHandler())
+
+		// Recorder de Travel Rule.
+		// Registra transferencias acima do limiar em compliance.travel_rule_records.
+		// Fail-closed: falha no registro bloqueia o payout (ErrTravelRuleRequired).
+		// PII de originador/beneficiario cifrada via KMS antes do INSERT em producao.
+		rawTravelRecorder := travelrule.New(travelrule.Config{
+			ThresholdMinorUnits: cfg.TravelRuleThresholdUSDC, // int64; TX-2: sem float
+			AssetCode:           "USDC",
+		}, pool, nil, logger) // transport nil = StubVASPTransport (ate integracao Notabene/Sygna)
+		// Adapta *travelrule.Recorder -> cryptopkg.TravelRuleRecorder.
+		cryptoTravelRecorder = &travelRuleRecorderAdapter{r: rawTravelRecorder}
+
+		slog.Info("payments: compliance K6 ativo",
+			"chainalysis_threshold", cfg.ChainalysisRiskThreshold,
+			"travel_rule_threshold_usdc_minor", cfg.TravelRuleThresholdUSDC,
+			"sumsub_base_url", cfg.SumsubBaseURL,
+			// Nunca loga: API keys, webhook secrets
+		)
+	}
+
+	// -------------------------------------------------------------------------
 	// K5: trilho cripto Safe multisig + USDC (atrás de CRYPTO_ENABLED)
 	//
 	// SEAM Fireblocks: para o upgrade sob AUM (gatilho C ADR-0004), substituir
@@ -256,12 +367,16 @@ func main() {
 		// Handler de webhook do custodiante Safe/Defender.
 		// Recebe: deposit.detected, deposit.finalized, chain.reorg.
 		// Verifica assinatura HMAC-SHA256 antes de qualquer processamento.
+		// Screener e TravelRecorder injetados do bloco K6 (nil se COMPLIANCE_ENABLED=false).
+		// Em producao, COMPLIANCE_ENABLED deve ser true para screening fail-closed operar.
 		safeWebhookHandler, err := cryptopkg.NewSafeWebhookHandler(
 			cryptopkg.Config{
 				WebhookSecret: safeWebhookSecret, // SAFE_WEBHOOK_SECRET — nunca loga
 				ChainConfigs: map[int64]cryptopkg.ChainAccountConfig{
 					1: {AssetCode: "USDC", AssetScale: usdcScale}, // do Asset Registry, nunca literal
 				},
+				Screener:       cryptoScreener,       // nil se COMPLIANCE_ENABLED=false
+				TravelRecorder: cryptoTravelRecorder, // nil se COMPLIANCE_ENABLED=false
 			},
 			pool,
 			assetLoader,
@@ -282,6 +397,8 @@ func main() {
 			"chain_id", 1,
 			"usdc_contract", cfg.USDCContractAddress,
 			"min_confirmations", cfg.SafeMinConfirmations,
+			"compliance_screening", cryptoScreener != nil,
+			"compliance_travel_rule", cryptoTravelRecorder != nil,
 			// Nunca loga: SafeRPCURL (pode conter token), safeWebhookSecret
 		)
 	}
@@ -352,4 +469,59 @@ func platformTenantID() string {
 	}
 	// Default para desenvolvimento — nunca usado em producao (Enabled=false por default).
 	return "00000000-0000-0000-0000-000000000001"
+}
+
+// ---------------------------------------------------------------------------
+// Adaptadores de compliance (K6)
+//
+// Traduzem os tipos concretos de chainalysis e travelrule para as interfaces
+// definidas no pacote crypto, sem ciclo de import.
+// ---------------------------------------------------------------------------
+
+// chainalysisScreenerAdapter adapta *chainalysis.Screener para cryptopkg.AddressScreener.
+//
+// A traducao de ScreenAddressParams (crypto) -> ScreenAddressParams (chainalysis)
+// e feita campo-a-campo; os tipos sao identicos em semantica.
+// PII: nenhum campo de identidade e adicionado pelo adaptador.
+type chainalysisScreenerAdapter struct {
+	s *chainalysis.Screener
+}
+
+func (a *chainalysisScreenerAdapter) ScreenAddress(ctx context.Context, p cryptopkg.ScreenAddressParams) error {
+	return a.s.ScreenAddress(ctx, chainalysis.ScreenAddressParams{
+		TenantID:  p.TenantID,
+		Address:   p.Address,
+		Direction: chainalysis.Direction(p.Direction),
+		TxRef:     p.TxRef,
+		Network:   p.Network,
+	})
+}
+
+// travelRuleRecorderAdapter adapta *travelrule.Recorder para cryptopkg.TravelRuleRecorder.
+//
+// Traduz PayoutTravelRuleParams (crypto) -> RecordParams (travelrule).
+// ErrBelowThreshold do travelrule e mapeado para cryptopkg.ErrTravelRuleBelowThreshold
+// para que o chamador no pacote crypto possa distinguir sem importar travelrule.
+// Qualquer outro erro (ErrTravelRuleRequired) e retornado diretamente — o pacote
+// crypto envelopa em ErrTravelRuleBlocked.
+type travelRuleRecorderAdapter struct {
+	r *travelrule.Recorder
+}
+
+func (a *travelRuleRecorderAdapter) RecordPayout(ctx context.Context, p cryptopkg.PayoutTravelRuleParams) error {
+	err := a.r.Record(ctx, travelrule.RecordParams{
+		TenantID:         p.TenantID,
+		TxRef:            p.TxRef,
+		OriginatorVASP:   p.OriginatorVASP,
+		BeneficiaryVASP:  p.BeneficiaryVASP,
+		OriginatorName:   p.OriginatorName,
+		BeneficiaryName:  p.BeneficiaryName,
+		AmountMinorUnits: p.AmountMinorUnits,
+		AssetCode:        p.AssetCode,
+		Direction:        travelrule.DirectionOutbound,
+	})
+	if errors.Is(err, travelrule.ErrBelowThreshold) {
+		return cryptopkg.ErrTravelRuleBelowThreshold
+	}
+	return err
 }

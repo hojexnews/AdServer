@@ -1,0 +1,58 @@
+# Egress allowlist Sumsub (KYC/KYB) para a celula AML/KYC (ADR-0004 §E.10 / §F / K6).
+#
+# Destinos liberados — minimo para o pipeline de KYC/KYB:
+#
+#   1. api.sumsub.com:443
+#      Motivo: API REST do Sumsub para submissao de aplicacoes de KYC/KYB,
+#      consulta de status de verificacao, liveness check e SDK token
+#      endpoint. O servico payments chama o Sumsub para verificar
+#      identidade de tenants/anunciantes antes de processar pagamentos
+#      cripto ou fiat de alto risco (ADR-0004 §E.3 — compliance
+#      conservador, como se security-adjacent).
+#
+#   2. api.sumsub.com:443 — webhooks de retorno (Sumsub envia callbacks
+#      de status de verificacao para o servico payments). O ingress
+#      correspondente e coberto por allow-ingress-sumsub-webhook.yaml.
+#      Este FQDN e tambem ponto de verificacao de SDK (chamadas de
+#      confirmacao de callback). Listado explicitamente para o auditor.
+#
+# Destinos NAO liberados (justificativa para auditor):
+#   - Qualquer outro FQDN da internet: BLOQUEADO.
+#   - Namespaces delivery, ml, data, pci: BLOQUEADO (deny-all base).
+#   - O hot path de decisao (delivery) nunca chama a celula AML/KYC.
+#
+# Implementacao: CiliumNetworkPolicy com toFQDNs — requer Cilium DNS proxy
+# ativo (--enable-l7-proxy=true, padrao >=1.14). O DNS e resolvido em
+# allow-dns.yaml (K0). Cilium verifica identidade do FQDN via SNI/TLS.
+#
+# endpointSelector: aplica-se apenas ao workload payments (label
+# app.kubernetes.io/name: payments, adserver.hojex/cell: aml-kyc).
+# Nunca endpointSelector vazio para egress externo — escopo minimo.
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-egress-sumsub
+  namespace: aml-kyc
+  labels:
+    adserver.hojex/cell: aml-kyc
+    adserver.hojex/compliance: aml-kyc-travel-rule
+    adserver.hojex/phase: fase-3-k6
+    adserver.hojex/owner: platform-infra-engineer
+    adserver.hojex/audit: privacy-compliance-validavel
+spec:
+  # Aplica somente ao workload payments dentro da celula AML/KYC.
+  # Label explicito; nunca endpointSelector vazio para egress externo.
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: payments
+      adserver.hojex/cell: aml-kyc
+
+  egress:
+    # --- 1. api.sumsub.com:443 (KYC/KYB REST API + SDK tokens) --------------
+    - toFQDNs:
+        - matchName: "api.sumsub.com"
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP

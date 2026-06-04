@@ -1,0 +1,208 @@
+# Kyverno — policies especificas da celula AML/KYC (ADR-0004 §F / §E.10 / K6).
+#
+# Complementam o ClusterPolicy baseline (platform/k8s/policy/kyverno-baseline.yaml)
+# com controles adicionais exigidos pelo escopo AML/KYC/Travel Rule:
+#
+#   1. proibir-secret-estatico-aml-kyc:
+#      Nenhum Pod no namespace aml-kyc pode montar K8s Secret via envFrom[].secretRef
+#      ou env[].valueFrom.secretKeyRef. Segredos (SUMSUB_API_KEY, CHAINALYSIS_API_KEY,
+#      SAFE_OWNER_KEY, etc.) entram SOMENTE via Vault Agent (/vault/secrets/).
+#      Invariante TX-3: PII/KYC nunca sai em claro do cofre; API keys de compliance
+#      nunca ficam expostas no etcd.
+#
+#   2. exigir-vault-agent-aml-kyc:
+#      Todo Pod no namespace aml-kyc DEVE ter a anotacao
+#      vault.hashicorp.com/agent-inject="true" e role="aml-kyc-payments".
+#      Sem essa anotacao, o Pod nao tem como obter segredos do OpenBao de forma
+#      auditavel — deve ser rejeitado no admission.
+#
+#   3. proibir-rotas-hot-path-aml-kyc:
+#      Garante que nenhum Pod do namespace aml-kyc tem labels que o identificariam
+#      como parte do hot path (adserver.hojex/cell: delivery). Linha de defesa
+#      contra misconfiguracao de label que criaria rota implicita entre o motor
+#      de decisao e a celula de compliance (invariante ADR-0004 §F).
+#
+#   4. proibir-cell-pci-em-aml-kyc:
+#      Nenhum Pod do namespace aml-kyc pode ter label adserver.hojex/cell=pci.
+#      As celulas PCI e AML/KYC sao completamente separadas — sem rota direta
+#      entre elas. Misconfiguracao de label quebraria o isolamento de escopo PCI.
+#
+# Escopo: namespace aml-kyc (Policy, nao ClusterPolicy).
+# validationFailureAction: Enforce — rejeita no admission.
+# Conformidade: LGPD art.46 (medidas tecnicas e administrativas), BACEN PLD/FT,
+# TX-3 (PII isolada), DA-11 (telemetria sem PII).
+---
+apiVersion: kyverno.io/v1
+kind: Policy
+metadata:
+  name: proibir-secret-estatico-aml-kyc
+  namespace: aml-kyc
+  labels:
+    adserver.hojex/cell: aml-kyc
+    adserver.hojex/compliance: aml-kyc-travel-rule
+    adserver.hojex/phase: fase-3-k6
+    adserver.hojex/owner: platform-infra-engineer
+  annotations:
+    policies.kyverno.io/title: "AML-KYC: proibir Kubernetes Secret estatico"
+    policies.kyverno.io/description: >
+      Na celula AML/KYC, segredos (SUMSUB_API_KEY, CHAINALYSIS_API_KEY,
+      SAFE_OWNER_KEY, DB_COMPLIANCE_DSN, etc.) entram somente via Vault Agent
+      (/vault/secrets/). Montar K8s Secret via envFrom ou env[].valueFrom.secretKeyRef
+      e proibido — violaria o controle de auditoria do OpenBao, exporia o segredo
+      no etcd do cluster e quebraria a invariante TX-3 de PII isolada.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: proibir-envfrom-secretref
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [aml-kyc]
+      validate:
+        message: >
+          [AML-KYC TX-3] Proibido envFrom[].secretRef na celula aml-kyc.
+          Use Vault Agent (/vault/secrets/) para SUMSUB_API_KEY, CHAINALYSIS_API_KEY,
+          SAFE_OWNER_KEY e demais segredos de compliance.
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.spec.containers[].envFrom[].secretRef | length(@) }}"
+                operator: GreaterThan
+                value: "0"
+              - key: "{{ request.object.spec.initContainers[].envFrom[].secretRef | length(@) }}"
+                operator: GreaterThan
+                value: "0"
+
+    - name: proibir-env-secretkeyref
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [aml-kyc]
+      validate:
+        message: >
+          [AML-KYC TX-3] Proibido env[].valueFrom.secretKeyRef na celula aml-kyc.
+          Use Vault Agent (/vault/secrets/) para segredos de compliance.
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.spec.containers[].env[].valueFrom.secretKeyRef | length(@) }}"
+                operator: GreaterThan
+                value: "0"
+---
+apiVersion: kyverno.io/v1
+kind: Policy
+metadata:
+  name: exigir-vault-agent-aml-kyc
+  namespace: aml-kyc
+  labels:
+    adserver.hojex/cell: aml-kyc
+    adserver.hojex/compliance: aml-kyc-travel-rule
+    adserver.hojex/phase: fase-3-k6
+    adserver.hojex/owner: platform-infra-engineer
+  annotations:
+    policies.kyverno.io/title: "AML-KYC: exigir anotacao Vault Agent"
+    policies.kyverno.io/description: >
+      Todo Pod na celula aml-kyc deve ter vault.hashicorp.com/agent-inject="true"
+      e vault.hashicorp.com/role="aml-kyc-payments". Sem essa anotacao, o Pod
+      nao tem como buscar segredos do OpenBao de forma auditavel — seria necessario
+      um K8s Secret, o que e proibido. Conformidade: TX-3, BACEN PLD/FT, LGPD art.46.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: exigir-vault-agent-inject
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [aml-kyc]
+      validate:
+        message: >
+          [AML-KYC TX-3] Todo Pod na celula aml-kyc deve ter as anotacoes:
+          vault.hashicorp.com/agent-inject: "true"
+          vault.hashicorp.com/role: "aml-kyc-payments"
+          Segredos entram exclusivamente via Vault Agent (/vault/secrets/).
+        pattern:
+          metadata:
+            annotations:
+              vault.hashicorp.com/agent-inject: "true"
+              vault.hashicorp.com/role: "aml-kyc-payments"
+---
+apiVersion: kyverno.io/v1
+kind: Policy
+metadata:
+  name: proibir-label-delivery-em-aml-kyc
+  namespace: aml-kyc
+  labels:
+    adserver.hojex/cell: aml-kyc
+    adserver.hojex/compliance: aml-kyc-travel-rule
+    adserver.hojex/phase: fase-3-k6
+    adserver.hojex/owner: platform-infra-engineer
+  annotations:
+    policies.kyverno.io/title: "AML-KYC: proibir label de hot-path na celula"
+    policies.kyverno.io/description: >
+      Nenhum Pod na celula aml-kyc pode ter adserver.hojex/cell=delivery.
+      Impede misconfiguracao de label que criaria rota implicita entre o hot path
+      e a celula de compliance (invariante ADR-0004 §F: hot path intocado).
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: proibir-cell-delivery
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [aml-kyc]
+      validate:
+        message: >
+          [AML-KYC ADR-0004 §F] Pod na celula aml-kyc nao pode ter label
+          adserver.hojex/cell=delivery. O hot path (delivery) nao tem acesso
+          a celula AML/KYC — misconfiguracao de label seria violacao de fronteira.
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.metadata.labels.\"adserver.hojex/cell\" }}"
+                operator: Equals
+                value: "delivery"
+---
+apiVersion: kyverno.io/v1
+kind: Policy
+metadata:
+  name: proibir-label-pci-em-aml-kyc
+  namespace: aml-kyc
+  labels:
+    adserver.hojex/cell: aml-kyc
+    adserver.hojex/compliance: aml-kyc-travel-rule
+    adserver.hojex/phase: fase-3-k6
+    adserver.hojex/owner: platform-infra-engineer
+  annotations:
+    policies.kyverno.io/title: "AML-KYC: proibir label de celula PCI na celula AML-KYC"
+    policies.kyverno.io/description: >
+      Nenhum Pod na celula aml-kyc pode ter adserver.hojex/cell=pci.
+      As celulas PCI e AML/KYC sao completamente separadas — sem rota direta.
+      Misconfiguracao de label quebraria o isolamento de escopo PCI SAQ-A.
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: proibir-cell-pci
+      match:
+        any:
+          - resources:
+              kinds: [Pod]
+              namespaces: [aml-kyc]
+      validate:
+        message: >
+          [AML-KYC / PCI SAQ-A] Pod na celula aml-kyc nao pode ter label
+          adserver.hojex/cell=pci. As celulas sao isoladas sem rota direta —
+          misconfiguracao de label violaria o escopo PCI SAQ-A.
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.metadata.labels.\"adserver.hojex/cell\" }}"
+                operator: Equals
+                value: "pci"

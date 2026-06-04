@@ -1,0 +1,44 @@
+# Application filho — célula PCI (K4): NetworkPolicies, Kyverno, RBAC,
+# Gateway API, namespace. Prefixo 30 = após netpols globais e Kyverno baseline.
+#
+# O path platform/cells/pci/ contém tudo da célula PCI exceto o diretório
+# secrets/ (gerenciado separadamente — segredos nunca em git). O Argo CD
+# aplica com recurse=true para capturar subdirs (gateway/, netpol/, policy/,
+# rbac/).
+#
+# Nota: secrets/openbao-auth.yaml contém apenas ServiceAccount e ConfigMap
+# de referência (sem valores de segredo) — é seguro sincronizar pelo Argo CD.
+# O Vault Agent busca os valores em runtime do OpenBao server.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cell-pci
+  namespace: argocd
+  labels:
+    adserver.hojex/cell: pci
+    adserver.hojex/compliance: pci-saq-a
+    adserver.hojex/phase: fase-3-k4
+spec:
+  project: platform
+  source:
+    repoURL: "https://github.com/hojex/adserver.git"
+    targetRevision: main
+    path: platform/cells/pci
+    directory:
+      recurse: true
+      # Exclui o secrets/ que contém apenas refs mas cujo diretório
+      # é gerenciado com cuidado extra (pode ser excluído do sync se
+      # o ServiceAccount for gerenciado por outro Application).
+      # Por ora, inclui tudo: nenhum valor de segredo está em YAML.
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: pci
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+  # Notificar se houver recurso órfão (ex.: netpol antiga sem correspondente
+  # no git). Importante para auditorias PCI SAQ-A.
+  ignoreDifferences: []

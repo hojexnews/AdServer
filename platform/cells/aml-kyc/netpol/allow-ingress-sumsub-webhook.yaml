@@ -1,0 +1,60 @@
+# Ingress para o endpoint de webhook do Sumsub na celula AML/KYC
+# (ADR-0004 §E.10 / §F / K6).
+#
+# Modelo de entrada: o Sumsub envia callbacks de status de verificacao
+# (applicant.reviewed, applicant.pending, applicant.onHold, etc.) para
+# o endpoint /webhooks/sumsub do servico payments. Esta e a UNICA rota
+# de ingress para a celula AML/KYC.
+#
+# Fluxo:
+#   Sumsub
+#     |-- HTTPS -> Cloudflare (TLS termination)
+#             |-- HTTP -> Envoy Gateway (namespace platform-system)
+#                     |-- HTTPRoute POST /webhooks/sumsub
+#                             |-- payments:8080 (namespace aml-kyc)
+#
+# Porta: 8080 (HTTP interno; TLS termina no Envoy/Cloudflare).
+#
+# Verificacao de assinatura do webhook:
+#   O servico payments DEVE validar o header X-App-Token (ou o header
+#   de assinatura equivalente do Sumsub SDK) usando SUMSUB_WEBHOOK_SECRET
+#   (referenciado via OpenBao — ver secrets/openbao-auth.yaml).
+#   Nenhum evento e processado sem validacao de assinatura HMAC-SHA256.
+#   Controle de aplicacao, nao de rede — documentado aqui para o auditor.
+#
+# O que NAO e permitido:
+#   - Ingress direto de qualquer outro namespace (delivery, ml, data, pci):
+#     BLOQUEADO. O hot path nunca chama a celula AML/KYC.
+#   - Ingress da internet direta (sem Envoy/Cloudflare): BLOQUEADO.
+#   - Ingress da celula PCI para aml-kyc: BLOQUEADO (deny-all + ausencia
+#     de policy de allow entre pci e aml-kyc).
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-ingress-sumsub-webhook
+  namespace: aml-kyc
+  labels:
+    adserver.hojex/cell: aml-kyc
+    adserver.hojex/compliance: aml-kyc-travel-rule
+    adserver.hojex/phase: fase-3-k6
+    adserver.hojex/owner: platform-infra-engineer
+    adserver.hojex/audit: privacy-compliance-validavel
+spec:
+  # Aplica somente ao workload payments dentro da celula AML/KYC.
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: payments
+      adserver.hojex/cell: aml-kyc
+
+  ingress:
+    # Permite entrada apenas do Envoy Gateway (namespace platform-system).
+    # O Envoy Gateway e o unico intermediario entre a internet e este pod.
+    - fromEndpoints:
+        - matchLabels:
+            io.kubernetes.pod.namespace: platform-system
+            app.kubernetes.io/name: envoy-gateway
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
