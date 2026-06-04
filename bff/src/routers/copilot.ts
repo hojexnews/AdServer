@@ -332,12 +332,22 @@ export function createCopilotRouter() {
 /**
  * NOTA PARA O FRONTEND-BFF-ENGINEER:
  *
- * O endpoint SSE `/api/copilot/stream/:sessionId` é implementado como uma
- * rota HTTP raw (não tRPC) em web/console/src/app/api/copilot/stream/[sessionId]/route.ts.
+ * ROTAS SSE (HTTP raw — não tRPC):
  *
- * UPSTREAM CORRETO (H4 corrigido):
- *   O copiloto Python expõe POST /v1/chat com SSE streaming.
- *   NÃO existe /v1/stream/:sessionId.
+ *   GET /api/copilot/stream/:sessionId
+ *     Inicia o stream SSE de uma nova sessão de chat.
+ *     Upstream: POST /v1/chat (copiloto Python) com a mensagem do usuário.
+ *     Implementado em web/console/src/app/api/copilot/stream/[sessionId]/route.ts.
+ *
+ *   GET /api/copilot/resume/:threadId
+ *     Retoma o stream SSE pós-HITL (após copilot.hitlApprove / copilot.hitlReject).
+ *     Upstream: POST /v1/chat/{thread_id}/resume (copiloto Python) — sem "message".
+ *     NÃO usa /v1/chat com body vazio (violaria min_length=1 e reiniciaria o grafo).
+ *     Implementado em web/console/src/app/api/copilot/resume/[threadId]/route.ts.
+ *
+ * UPSTREAM CORRETO (H4 — não regride):
+ *   POST /v1/chat         → stream inicial (ChatRequest: message obrigatório, min_length=1)
+ *   POST /v1/chat/{id}/resume → re-stream pós-HITL (ResumeRequest: sem message)
  *   O header X-Session-ID carrega o thread_id para checkpointing LangGraph.
  *
  * EVENTOS SSE EMITIDOS PELO COPILOTO (a UI deve consumir):
@@ -347,9 +357,9 @@ export function createCopilotRouter() {
  *   event: done      → {"session_id": "...", "usage": {"input_tokens": N, "output_tokens": N}}
  *   event: error     → {"message": "..."}
  *
- * Ao receber "hitl_required", a UI deve:
- *   1. Pausar o stream (fechar o EventSource)
+ * FLUXO COMPLETO PÓS-HITL:
+ *   1. Pausar o stream (fechar o EventSource ao receber "hitl_required")
  *   2. Exibir o diff ao usuário com botões "Aplicar" e "Cancelar"
- *   3. Chamar copilot.hitlApprove ou copilot.hitlReject
- *   4. Reabrir o EventSource para receber a resposta final
+ *   3. Chamar copilot.hitlApprove ou copilot.hitlReject (tRPC)
+ *   4. Reabrir EventSource para /api/copilot/resume/:threadId (NÃO para /stream/:sessionId)
  */

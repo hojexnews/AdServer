@@ -386,6 +386,12 @@ export function useCopilotSession() {
   // ---------------------------------------------------------------------------
   // approve — aprova o HITL (mutation tRPC copilot.hitlApprove)
   // Nenhuma escrita ocorre sem esta chamada explícita (§2.4 / HITL obrigatório)
+  //
+  // RETOMADA SSE PÓS-HITL (contrato services/copilot/app/server.py):
+  //   Após a aprovação, o re-stream usa /api/copilot/resume/:threadId, que faz
+  //   proxy de POST /v1/chat/{thread_id}/resume no copiloto Python.
+  //   NÃO reabre /api/copilot/stream/:sessionId com message:"" — isso violaria
+  //   min_length=1 de ChatRequest e reiniciaria o grafo do START.
   // ---------------------------------------------------------------------------
   const approve = useCallback(
     async (threadId: string) => {
@@ -393,20 +399,22 @@ export function useCopilotSession() {
       try {
         await approveMutation.mutateAsync({ threadId, approved: true, reason: "" });
         dispatch({ type: "HITL_RESOLVED" });
-        // Reabre o stream para receber a resposta final
-        if (state.sessionId) {
-          openStream(`/api/copilot/stream/${state.sessionId}`);
-        }
+        // Re-stream via endpoint de RETOMADA — nunca via /stream/:sessionId com body vazio.
+        openStream(`/api/copilot/resume/${threadId}`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : "Falha ao aprovar a operação.";
         dispatch({ type: "ERROR", message: msg });
       }
     },
-    [approveMutation, openStream, state.sessionId]
+    [approveMutation, openStream]
   );
 
   // ---------------------------------------------------------------------------
   // reject — rejeita o HITL
+  //
+  // RETOMADA SSE PÓS-REJEIÇÃO:
+  //   Idem ao approve: usa /api/copilot/resume/:threadId para receber a resposta
+  //   final do copiloto (mensagem de confirmação da rejeição), não /stream/:sessionId.
   // ---------------------------------------------------------------------------
   const reject = useCallback(
     async (threadId: string, reason: string) => {
@@ -414,15 +422,14 @@ export function useCopilotSession() {
       try {
         await rejectMutation.mutateAsync({ threadId, reason });
         dispatch({ type: "HITL_RESOLVED" });
-        if (state.sessionId) {
-          openStream(`/api/copilot/stream/${state.sessionId}`);
-        }
+        // Re-stream via endpoint de RETOMADA — nunca via /stream/:sessionId com body vazio.
+        openStream(`/api/copilot/resume/${threadId}`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : "Falha ao cancelar a operação.";
         dispatch({ type: "ERROR", message: msg });
       }
     },
-    [rejectMutation, openStream, state.sessionId]
+    [rejectMutation, openStream]
   );
 
   const reset = useCallback(() => {
