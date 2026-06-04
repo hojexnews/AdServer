@@ -179,6 +179,56 @@ middleware Next; ClickHouse real para o teste de isolamento de tenant de
 
 ---
 
+## Estado atual — Fase 3 (IA avançada + cripto/tokens) **em andamento**
+
+A Fase 3 foi **aberta e sequenciada** em
+[ADR-0004](docs/adr/0004-fase-3-sequenciamento-ia-avancada-cripto.md), que trava o
+deep ranking **atrás do mesmo ponto de extensão** do GBDT (re-ranker dentro do
+estrato, fail-open — DA-3 segue autoridade final), define a **interface
+`ChainConnector` única** e as **células PCI / AML-KYC** para os trilhos de
+pagamento **fora do hot path**, resolve as **10 perguntas abertas de AEV/BND**
+(§3) com defaults recomendados + gatilhos de reabertura (token **ERC-20/EVM**,
+custódia **Safe → Fireblocks sob AUM**, ramp **USDC**, preço **administrado/
+governado**, **Sumsub+Chainalysis+Travel Rule**), e impõe a **regra de ouro**:
+deep/Triton/GPU **só sob prova de uplift A/B**, Fireblocks só sob AUM, TigerBeetle
+só sob gargalo provado. Define **9 incrementos** (K0…K8). Nada de promover deep sem
+**uplift A/B + kill-switch**; AEV/BND seguem `enabled=false` até a spec definir `scale`.
+
+### ✅ Entregue na Fase 3 — 1ª onda (K0 ∥ K1 ∥ K2; gates verdes)
+
+A primeira onda cobre os incrementos sem dependência: as **fundações cripto** e os
+dois eixos de **IA** que reusam o arcabouço da Fase 2. K3…K7 (ledger cripto + trilhos
+fiat/cripto + compliance + UI) dependem de K0; **K8** (promoção do deep) é gated por
+**tráfego real**.
+
+| Inc | Artefato | Local | Cobre |
+|---|---|---|---|
+| **K0** | Interface `ChainConnector` única (impl EVM stub) + esqueleto `services/payments` (default-off) + proto de pagamentos (BACKWARD-compat) + **células PCI/AML-KYC** (Cilium deny-all); valida AEV/BND no Asset Registry (`enabled=false`, `scale=NULL`, CHECKs) | [internal/chainconnector/](internal/chainconnector/) · [services/payments/](services/payments/) · [proto/adserver/payments/v1/](proto/adserver/payments/v1/) · [platform/cells/](platform/cells/) | TX-1 (buf BACKWARD); TX-2/DA-10 (Money, sem float, sem câmbio implícito); §2.7 (células); cripto **fora do hot path** |
+| **K1** | Scaffolding do **deep ranker two-tower DCN-v2/DLRM** (treino PyTorch→ONNX INT8, alvo Triton/GPU) **atrás de flag, default-off**; fiação mínima no `internal/ranker`/sidecar; reusa `ml/features` (anti-skew) | [ml/deep/](ml/deep/) · [services/ranker-sidecar/](services/ranker-sidecar/) · [internal/ranker/](internal/ranker/) | DA-3 (re-rank só no estrato); TX-4 (timeout duro + fail-open, budget 5–8 ms **não** ampliado); deep-off ≡ cascata pura |
+| **K2** | **Fraude não-supervisionada** (Isolation Forest + autoencoder) complementando o GBDT de IVT, treinável sobre sample sintético; marcação combinada (OR) **antes** do StatsHourly/faturamento; migração 008 (RLS fail-closed) | [ml/fraud/](ml/fraud/) · [data/fraud/](data/fraud/) · [data/clickhouse/migrations/008_ivt_unsup_scoring.sql](data/clickhouse/migrations/008_ivt_unsup_scoring.sql) | TX-6 (fora do hot path, marca IVT); RLS por tenant; reconciliação contra Iceberg |
+
+**Gates verdes (1ª onda):** `parity-golden-test-guardian` **PASS** (deep-off ≡ cascata
+pura bit-a-bit; golden/shadow/dual-run intactos; DA-3 confinado; TX-4 não ampliado);
+`security-reviewer` **APROVADO** (0 CRITICAL/HIGH; RLS fail-closed na 008 idêntica ao
+padrão 006/007; sem SQLi no job; `services/payments` default-off sem segredo; Cilium
+deny-all correto); `privacy-compliance-auditor` **APROVADO** (0 PII; K2 PII-free reusa
+features da Fase 2; K0 confina KYC fora do ledger/telemetria; OTel allowlist fail-closed);
+`money-ledger-guardian` **PASS** (proto/ChainConnector em `Money`/minor-units, sem float;
+DA-10 sem câmbio implícito; AEV/BND disabled com CHECKs). **2 LOW remediados:** no-float-go
+passou a varrer `internal/chainconnector`; teste de payout negativo. `make verify` +
+`go test ./...` (incl. `tests/parity`) + **89 pytest** (deep + fraude não-superv. + regressão Fase 2) **verdes**.
+
+### ⏭️ Próxima onda da Fase 3 (depende de K0)
+
+**K3** ledger cripto + reconciliação · **K4** trilho fiat (Stripe SAQ-A + Asaas/PIX,
+célula PCI) · **K5** trilho cripto (Safe multisig + USDC via `ChainConnector`) ·
+**K6** compliance (Sumsub + Chainalysis + Travel Rule, célula AML/KYC) · **K7** BFF +
+UI de pagamentos (status; cripto fora do cliente). **K8** (promoção do deep sob uplift
+A/B + kill-switch) e a habilitação de AEV/BND seguem **gated** por tráfego real e pela
+spec de produto, respectivamente.
+
+---
+
 ## Layout do repositório
 
 ```text
