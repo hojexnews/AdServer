@@ -139,7 +139,10 @@ em toda escrita do copiloto.
 | **—** | Spec única de featurização (anti-skew Go↔Python) + teste de paridade por fixtures gold | [ml/features/](ml/features/) | função única (TX-4/TX-5); 23 features PII-free, `feature_spec_version` |
 | **J1** | Re-ranker `internal/ranker` (featurização Go, IPC UDS, **timeout duro + fail-open**) + `ranker-sidecar` (ONNX, modelo dummy) atrás de `RANKER_ENABLED` (off) | [internal/ranker/](internal/ranker/) · [services/ranker-sidecar/](services/ranker-sidecar/) | TX-4; DA-3 (re-rank só no estrato); eCPM=pCTR×bid em minor-units (TX-2) |
 | **J2** | Treino pCTR LightGBM→ONNX + calibração isotônica (ECE) + MLflow registry | [ml/training/](ml/training/) · [ml/calibration/](ml/calibration/) · [ml/registry/](ml/registry/) | anti-skew; treino lê Iceberg (dados reais pendem de infra) |
+| **J3** | OPE **IPS/SNIPS/DR** sobre propensão logada (filtra `ml_fail_open`, checa positividade/ESS) + **shadow** do ranker (loga decisão-sombra, não serve; `SHADOW_ENABLED` off) + bandit preparado (não exposto) | [ml/ope/](ml/ope/) · [internal/ranker/shadow.go](internal/ranker/shadow.go) · [services/decision/](services/decision/) | OPE honesto (overlap/positividade); shadow parity-safe (servido ≡ cascata pura) |
+| **J4** | A/B determinístico por zona/tenant (FNV-1a) + **guarda de receita** (eCPM minor-units) + **kill-switch** fail-safe + **promoção** de `model_version` recusada por código sem prova de uplift + bandit exposto (ε-greedy/Thompson, `propensity<1.0` fecha o loop do OPE) | [internal/ranker/ab.go](internal/ranker/ab.go) · [internal/ranker/guard.go](internal/ranker/guard.go) · [ml/registry/promote_model.py](ml/registry/promote_model.py) | nada promovido sem uplift+kill-switch; DA-3; control ≡ cascata pura; TX-2 |
 | **J5** | Copiloto LangGraph (HITL obrigatório, ferramentas tipadas server-side, roteamento Haiku/Sonnet/Opus, Haiku-as-judge fail-closed) + RAG pgvector RLS + C2PA; rota BFF + UI (SSE, diff HITL, builder anti-contradição, WCAG 2.2 AA) | [services/copilot/](services/copilot/) · [db/vector/](db/vector/) · [bff/](bff/) · [web/console/](web/console/) | TX-3 (isolamento + HITL); TX-5 (sem PII); EU AI Act Art. 50 |
+| **J6** | Pacing **proporcional** (DA-4) + forecast leve sobre StatsHourly; **fraude/IVT** GBDT supervisionado (TX-6) marcado **antes** do StatsHourly/faturamento + reconciliação **batch contra Iceberg** | [ml/pacing/](ml/pacing/) · [ml/fraud/](ml/fraud/) · [data/fraud/](data/fraud/) · [data/clickhouse/migrations/007_ivt_scoring.sql](data/clickhouse/migrations/007_ivt_scoring.sql) | DA-4 (proporcional, não RL/MPC); TX-6 (fora do hot path, fatura só válido); RLS por tenant |
 
 **Gates verdes (re-auditados):** `security-reviewer` **PASSA** (2 CRITICAL + 4 HIGH
 remediados — IDOR cross-tenant no HITL, XSS do ad tag via iframe sandbox, HMAC
@@ -151,16 +154,28 @@ Go↔Python); `money-ledger-guardian` **PASSA** (eCPM=pCTR×bid em minor-units, 
 float em dinheiro). `make verify` + `go test ./...` + pytest do copiloto +
 typecheck/build de web/bff **verdes**.
 
+**Re-gate J3/J4/J6 (todos verdes):** `parity-golden-test-guardian` **PASS**
+(control e shadow ≡ cascata pura bit-a-bit; DA-3 sob treatment — re-rank só dentro
+do estrato; fail-open ≡ cascata; filtro IVT não corrompe double-entry/DA-10);
+`security-reviewer` **PASS** (RLS fail-closed em `raw_ivt_score`, sem SQLi no job de
+ingestão, kill-switch e A/B só server-side); `privacy-compliance-auditor`
+**APROVADO** (shadow/OPE/IVT/pacing PII-free; redação OTel); `money-ledger-guardian`
+**PASS** (guarda de receita/billing em minor-units; DA-10 intacto). Achados
+remediados antes do merge: SQLi por f-string no pacing, footgun shadow+AB (WARN de
+runtime), validação de `model_name` no filtro MLflow, cobertura de isolamento de
+tenant para `raw_ivt_score`. `make verify` + `go test ./...` (incl. `tests/parity` +
+`tests/parity/shadow`) + **112 pytest** (ope/pacing/fraud/promote/data) **verdes**.
+
 ### ⏭️ Pendente para fechar a Fase 2
 
-**Incrementos restantes** (dependem de J1/J2 maduros e de runtime/A-B): **J3** (OPE
-IPS/SNIPS/DR sobre propensão logada + shadow do ranker), **J4** (A/B por
-zona/tenant + kill-switch + promoção de `model_version`), **J6** (pacing
-proporcional DA-4 + fraude/IVT na ingestão). **Pendente de ambiente/modelo:** ONNX
-Runtime nativo no sidecar (hoje stub); dados reais no Iceberg para treinar o pCTR;
-`ANTHROPIC_API_KEY` + pgvector + Langfuse self-hosted para o copiloto vivo; RLS
-executável do RAG + teste de isolamento com Postgres real; `SESSION_SECRET`/OpenBao
-para o fail-closed do middleware Next em produção.
+**Todos os incrementos de código J0…J6 estão completos.** O que resta é
+**ambiente/modelo:** ONNX Runtime nativo no sidecar (hoje stub) + promoção do modelo
+real (pCTR/IVT); dados reais no Iceberg para treinar e rodar **OPE/A-B com tráfego
+real** (a promoção é recusada por código sem prova de uplift); `ANTHROPIC_API_KEY` +
+pgvector + Langfuse self-hosted para o copiloto vivo; RLS executável do RAG + teste
+de isolamento com Postgres real; `SESSION_SECRET`/OpenBao para o fail-closed do
+middleware Next; ClickHouse real para o teste de isolamento de tenant de
+`raw_ivt_score`. Depois → **Fase 3** (deep ranking sob uplift A/B + cripto/AEV/BND).
 
 ---
 
