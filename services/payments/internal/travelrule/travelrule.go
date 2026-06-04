@@ -13,6 +13,16 @@
 // repouso via envelope KMS antes de producao. Nunca transitam pelo ledger,
 // telemetria ou logs.
 //
+// # Cifra em repouso (KMS envelope)
+//
+// O Recorder recebe uma interface KMSEnvelope (kmsenvelope.KMSEnvelope) que
+// cifra OriginatorName e BeneficiaryName antes do INSERT em
+// compliance.travel_rule_records. Em dev/CI, usa LocalEnvelope (chave lida
+// de PII_ENVELOPE_KEY). Em producao, ExternalEnvelope com KMS real.
+//
+// Se envelope for nil (testes de logica pura sem PII), os nomes sao gravados
+// em claro — NUNCA permitido em producao (o main.go garante isso).
+//
 // # Limiar configuravel
 //
 // O limiar de Travel Rule e configurado em minor-units do ativo (int64, TX-2:
@@ -31,18 +41,14 @@
 // que registra o record como 'sent' sem envio real — troca por implementacao
 // Notabene/Sygna quando disponivel sem alterar o chamador.
 //
-// # Segredos
-//
-// Nenhum segredo necessario neste pacote. A cifragem dos campos PII (nomes)
-// e responsabilidade da camada de aplicacao antes do INSERT — marcada com
-// comentarios 'PII — cifrar em repouso (KMS envelope)' no schema SQL.
-//
 // # Invariantes inegociaveis
 //
 //   - amount em minor-units int64 — TX-2: sem float.
 //   - PII (nomes) nunca logada — apenas ids pseudonimos em logs.
 //   - Registro idempotente: (tenant_id, tx_ref) unico no cofre.
 //   - Fail-closed: payout bloqueado se registro falhar acima do limiar.
+//   - TX-2: cifra incide SOMENTE sobre campos TEXT de nome — NUNCA sobre
+//     amount_minor_units (NUMERIC(20,0)) ou qualquer valor monetario.
 package travelrule
 
 import (
@@ -52,8 +58,24 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/hojex/adserver/services/payments/internal/kmsenvelope"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// ---------------------------------------------------------------------------
+// dbExecer — interface minima de banco injetavel (para testes)
+//
+// Isola o Recorder do *pgxpool.Pool concreto, permitindo que testes
+// injetem um mock que capture os argumentos do Exec sem banco real.
+// *pgxpool.Pool satisfaz esta interface automaticamente.
+// ---------------------------------------------------------------------------
+
+// dbExecer abstrai as operacoes de banco usadas pelo Recorder.
+// Implementado por *pgxpool.Pool em producao e por fakes em testes.
+type dbExecer interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+}
 
 // ---------------------------------------------------------------------------
 // Erros exportados
@@ -154,8 +176,9 @@ type Config struct {
 // Recorder registra transferencias cripto acima do limiar em compliance.travel_rule_records.
 type Recorder struct {
 	cfg       Config
-	pool      *pgxpool.Pool
+	pool      dbExecer // *pgxpool.Pool em producao; fake em testes (LOW-2)
 	transport VASPTransport
+	envelope  kmsenvelope.KMSEnvelope // cifra OriginatorName e BeneficiaryName antes do INSERT
 	logger    *slog.Logger
 }
 
@@ -163,7 +186,32 @@ type Recorder struct {
 //
 // pool pode ser nil em testes — gravar no banco sera ignorado.
 // transport pode ser nil — usa StubVASPTransport por padrao.
-func New(cfg Config, pool *pgxpool.Pool, transport VASPTransport, logger *slog.Logger) *Recorder {
+// envelope pode ser nil APENAS em testes de logica pura sem banco.
+// Em producao (pool nao-nil), envelope DEVE ser nao-nil — insertRecord
+// falha com erro explicito se envelope for nil e houver PII a cifrar.
+func New(cfg Config, pool *pgxpool.Pool, transport VASPTransport, envelope kmsenvelope.KMSEnvelope, logger *slog.Logger) *Recorder {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if transport == nil {
+		transport = StubVASPTransport{}
+	}
+	var db dbExecer
+	if pool != nil {
+		db = pool
+	}
+	return &Recorder{
+		cfg:       cfg,
+		pool:      db,
+		transport: transport,
+		envelope:  envelope,
+		logger:    logger,
+	}
+}
+
+// newWithDB cria um Recorder injetando qualquer dbExecer (uso em testes).
+// Nao exportado: os testes do pacote acessam diretamente (package travelrule).
+func newWithDB(cfg Config, db dbExecer, transport VASPTransport, envelope kmsenvelope.KMSEnvelope, logger *slog.Logger) *Recorder {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -172,8 +220,9 @@ func New(cfg Config, pool *pgxpool.Pool, transport VASPTransport, logger *slog.L
 	}
 	return &Recorder{
 		cfg:       cfg,
-		pool:      pool,
+		pool:      db,
 		transport: transport,
+		envelope:  envelope,
 		logger:    logger,
 	}
 }
@@ -280,25 +329,48 @@ func (r *Recorder) AboveThreshold(amountMinorUnits int64) bool {
 
 // insertRecord persiste o record em compliance.travel_rule_records (idempotente).
 // Se pool for nil (testes), retorna nil.
-// PII (nomes) inserida conforme p.OriginatorName / p.BeneficiaryName —
-// a camada de aplicacao e responsavel pela cifragem KMS antes de chamar Record.
+//
+// PII (TX-3 / DA-11): OriginatorName e BeneficiaryName sao cifrados via
+// envelope KMS (AES-256-GCM) antes do INSERT. Se envelope for nil e houver
+// PII a cifrar, retorna erro — producao nao pode inserir PII em claro.
+//
+// TX-2: amount_minor_units e int64 -> NUMERIC(20,0); a cifra NAO e chamada
+// sobre este campo nem sobre qualquer valor monetario.
 func (r *Recorder) insertRecord(ctx context.Context, p RecordParams) error {
 	if r.pool == nil {
 		return nil
 	}
 
+	// Cifra OriginatorName (PII) antes do INSERT.
+	// TX-3: nome cifrado — nunca em claro no cofre de compliance.
 	var originatorName *string
 	if p.OriginatorName != "" {
-		originatorName = &p.OriginatorName
-	}
-	var beneficiaryName *string
-	if p.BeneficiaryName != "" {
-		beneficiaryName = &p.BeneficiaryName
+		if r.envelope == nil {
+			return fmt.Errorf("travelrule: envelope KMS nao configurado — nao e possivel inserir PII em claro em producao")
+		}
+		sealed, err := r.envelope.Seal(p.OriginatorName)
+		if err != nil {
+			return fmt.Errorf("travelrule: cifrar originator_name: %w", err)
+		}
+		originatorName = &sealed
 	}
 
+	// Cifra BeneficiaryName (PII) antes do INSERT.
+	// TX-3: nome cifrado — nunca em claro no cofre de compliance.
+	var beneficiaryName *string
+	if p.BeneficiaryName != "" {
+		if r.envelope == nil {
+			return fmt.Errorf("travelrule: envelope KMS nao configurado — nao e possivel inserir PII em claro em producao")
+		}
+		sealed, err := r.envelope.Seal(p.BeneficiaryName)
+		if err != nil {
+			return fmt.Errorf("travelrule: cifrar beneficiary_name: %w", err)
+		}
+		beneficiaryName = &sealed
+	}
+
+	// amount_minor_units: NUMERIC(20,0) — TX-2: sem float; NAO cifrado.
 	_, err := r.pool.Exec(ctx,
-		// amount_minor_units: NUMERIC(20,0) — TX-2: sem float.
-		// originator_name / beneficiary_name: PII — cifrar via KMS antes de INSERT em producao.
 		`INSERT INTO compliance.travel_rule_records
 		   (tenant_id, tx_ref, originator_vasp, beneficiary_vasp,
 		    originator_name, beneficiary_name,
@@ -309,10 +381,10 @@ func (r *Recorder) insertRecord(ctx context.Context, p RecordParams) error {
 		p.TxRef,
 		p.OriginatorVASP,
 		p.BeneficiaryVASP,
-		originatorName,
-		beneficiaryName,
+		originatorName,  // ciphertext base64url ou NULL — nunca plaintext PII
+		beneficiaryName, // ciphertext base64url ou NULL — nunca plaintext PII
 		p.AssetCode,
-		p.AmountMinorUnits, // int64 -> NUMERIC(20,0); cast explicito no SQL
+		p.AmountMinorUnits, // int64 -> NUMERIC(20,0); nao cifrado (TX-2)
 	)
 	if err != nil {
 		return fmt.Errorf("travelrule: insertRecord: %w", err)

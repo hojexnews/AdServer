@@ -90,6 +90,7 @@ import (
 	cryptopkg "github.com/hojex/adserver/services/payments/internal/crypto"
 	"github.com/hojex/adserver/services/payments/internal/fiat"
 	"github.com/hojex/adserver/services/payments/internal/health"
+	"github.com/hojex/adserver/services/payments/internal/kmsenvelope"
 	"github.com/hojex/adserver/services/payments/internal/mercadopago"
 	"github.com/hojex/adserver/services/payments/internal/secrets"
 	stripepkg "github.com/hojex/adserver/services/payments/internal/stripe"
@@ -275,15 +276,29 @@ func main() {
 		// pacote chainalysis — sem ciclo de import, sem PII em logs.
 		cryptoScreener = &chainalysisScreenerAdapter{s: rawScreener}
 
+		// Envelope KMS para cifra de PII (originator_name / beneficiary_name / full_name).
+		// PII_ENVELOPE_KEY lida de env/OpenBao — nunca em imagem/git (DA-11 / TX-3).
+		// Em producao, injetar via OpenBao como PII_ENVELOPE_KEY.
+		// Fail-closed: se a chave estiver ausente, o servico nao sobe.
+		// Inicializado antes de sumsub.New e travelrule.New pois ambos dependem do envelope.
+		piiEnvelope, err := kmsenvelope.NewFromEnv()
+		if err != nil {
+			slog.Error("payments: PII_ENVELOPE_KEY ausente — nao e possivel cifrar PII de Travel Rule/KYC",
+				"err", err,
+			)
+			os.Exit(1)
+		}
+
 		// Client Sumsub (KYC/KYB).
 		// Webhook verificado por HMAC-SHA1 antes de qualquer efeito.
 		// PII dos documentos fica exclusivamente no Sumsub; cofre local guarda
 		// apenas subject_ref pseudonimo + status (TX-3 / DA-11).
+		// piiEnvelope: cifra full_name se necessario por regulacao (TX-3).
 		sumsubClient, err := sumsub.New(sumsub.Config{
 			APIKey:        sumsubAPIKey,        // NUNCA loga
 			WebhookSecret: sumsubWebhookSecret, // NUNCA loga
 			BaseURL:       cfg.SumsubBaseURL,
-		}, pool, logger)
+		}, pool, piiEnvelope, logger)
 		if err != nil {
 			slog.Error("payments: falha ao inicializar client Sumsub", "err", err)
 			os.Exit(1)
@@ -297,11 +312,11 @@ func main() {
 		// Recorder de Travel Rule.
 		// Registra transferencias acima do limiar em compliance.travel_rule_records.
 		// Fail-closed: falha no registro bloqueia o payout (ErrTravelRuleRequired).
-		// PII de originador/beneficiario cifrada via KMS antes do INSERT em producao.
+		// PII de originador/beneficiario cifrada via envelope KMS antes do INSERT (TX-3/DA-11).
 		rawTravelRecorder := travelrule.New(travelrule.Config{
 			ThresholdMinorUnits: cfg.TravelRuleThresholdUSDC, // int64; TX-2: sem float
 			AssetCode:           "USDC",
-		}, pool, nil, logger) // transport nil = StubVASPTransport (ate integracao Notabene/Sygna)
+		}, pool, nil, piiEnvelope, logger) // transport nil = StubVASPTransport; envelope KMS obrigatorio em producao
 		// Adapta *travelrule.Recorder -> cryptopkg.TravelRuleRecorder.
 		cryptoTravelRecorder = &travelRuleRecorderAdapter{r: rawTravelRecorder}
 

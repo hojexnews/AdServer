@@ -46,8 +46,25 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hojex/adserver/services/payments/internal/kmsenvelope"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// ---------------------------------------------------------------------------
+// dbQuerier — interface minima de banco injetavel (para testes)
+//
+// Isola o Client do *pgxpool.Pool concreto, permitindo que testes
+// injetem um fake que capture argumentos do Exec/QueryRow sem banco real.
+// *pgxpool.Pool satisfaz esta interface automaticamente.
+// ---------------------------------------------------------------------------
+
+// dbQuerier abstrai as operacoes de banco usadas pelo Client Sumsub.
+type dbQuerier interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
 
 // ---------------------------------------------------------------------------
 // Erros exportados
@@ -117,15 +134,55 @@ type Client struct {
 	webhookSecret string // NUNCA logue
 	baseURL       string
 	httpClient    *http.Client
-	pool          *pgxpool.Pool
-	logger        *slog.Logger
+	pool          dbQuerier // *pgxpool.Pool em producao; fake em testes (LOW-2)
+	// envelope cifra full_name (PII) antes do INSERT em compliance.kyc_subjects.
+	// Obrigatorio em producao quando full_name for gravado (TX-3 / DA-11).
+	// nil = full_name NAO e gravado (comportamento atual — Sumsub e a fonte de verdade).
+	envelope kmsenvelope.KMSEnvelope
+	logger   *slog.Logger
 }
 
 // New cria um Client Sumsub.
 //
 // pool pode ser nil em testes de assinatura/parsing. Em producao, deve ser
 // nao-nil para gravar em compliance.kyc_subjects.
-func New(cfg Config, pool *pgxpool.Pool, logger *slog.Logger) (*Client, error) {
+//
+// envelope e o KMSEnvelope para cifrar full_name (PII) antes de INSERT.
+// Pode ser nil se full_name nunca for gravado (comportamento atual: Sumsub
+// e a fonte de verdade de PII; full_name fica NULL no cofre local).
+// Em producao, se full_name for necessario por regulacao, envelope DEVE ser
+// nao-nil — o metodo de INSERT recusara gravar PII em claro (TX-3 / DA-11).
+func New(cfg Config, pool *pgxpool.Pool, envelope kmsenvelope.KMSEnvelope, logger *slog.Logger) (*Client, error) {
+	if cfg.APIKey == "" {
+		return nil, errors.New("sumsub: APIKey obrigatorio (SUMSUB_API_KEY)")
+	}
+	if cfg.WebhookSecret == "" {
+		return nil, errors.New("sumsub: WebhookSecret obrigatorio (SUMSUB_WEBHOOK_SECRET)")
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	baseURL := cfg.BaseURL
+	if baseURL == "" {
+		baseURL = "https://api.sumsub.com"
+	}
+	var db dbQuerier
+	if pool != nil {
+		db = pool
+	}
+	return &Client{
+		apiKey:        cfg.APIKey,
+		webhookSecret: cfg.WebhookSecret,
+		baseURL:       baseURL,
+		httpClient:    &http.Client{Timeout: 15 * time.Second},
+		pool:          db,
+		envelope:      envelope,
+		logger:        logger,
+	}, nil
+}
+
+// newWithDB cria um Client injetando qualquer dbQuerier (uso interno em testes).
+func newWithDB(cfg Config, db dbQuerier, envelope kmsenvelope.KMSEnvelope, logger *slog.Logger) (*Client, error) {
 	if cfg.APIKey == "" {
 		return nil, errors.New("sumsub: APIKey obrigatorio (SUMSUB_API_KEY)")
 	}
@@ -144,7 +201,8 @@ func New(cfg Config, pool *pgxpool.Pool, logger *slog.Logger) (*Client, error) {
 		webhookSecret: cfg.WebhookSecret,
 		baseURL:       baseURL,
 		httpClient:    &http.Client{Timeout: 15 * time.Second},
-		pool:          pool,
+		pool:          db,
+		envelope:      envelope,
 		logger:        logger,
 	}, nil
 }
@@ -167,6 +225,11 @@ func New(cfg Config, pool *pgxpool.Pool, logger *slog.Logger) (*Client, error) {
 //
 // PII: externalUserId e um pseudonimo (nao-PII). O nome/CPF/documento e enviado
 // diretamente ao Sumsub pelo SDK client-side — nunca transita por este servidor.
+//
+// FullName e OPCIONAL. Armazenar SOMENTE se exigido por regulacao local
+// (ex.: Travel Rule BACEN). Sera cifrado via envelope KMS antes do INSERT.
+// Se FullName for fornecido e o Client nao tiver envelope configurado,
+// CreateApplicant retornara erro — nunca grava PII em claro (TX-3 / DA-11).
 type CreateApplicantParams struct {
 	// TenantID e o UUID pseudonimo do tenant.
 	TenantID string
@@ -177,6 +240,11 @@ type CreateApplicantParams struct {
 	// LevelName e o nome do fluxo no Sumsub (ex.: "basic-kyc-level").
 	// Deve corresponder ao fluxo configurado no painel Sumsub.
 	LevelName string
+	// FullName e o nome completo do sujeito (PII OPCIONAL).
+	// Armazenar SOMENTE se exigido por regulacao. Cifrado via KMS antes do INSERT.
+	// Preferencia: deixar NULL — usar o Sumsub como fonte de verdade.
+	// NUNCA logar este campo (DA-11).
+	FullName string
 }
 
 // CreateApplicantResult e o resultado da criacao de applicant.
@@ -222,14 +290,32 @@ func (c *Client) CreateApplicant(ctx context.Context, p CreateApplicantParams) (
 		return CreateApplicantResult{}, fmt.Errorf("sumsub: CreateApplicant HTTP: %w", err)
 	}
 
-	// Grava no cofre local
+	// Grava no cofre local.
+	// full_name (PII): cifrado via envelope KMS antes do INSERT se fornecido.
+	// TX-3: nunca em claro no cofre de compliance.
+	// DA-11: full_name nunca logado.
 	if c.pool != nil {
+		// Cifra full_name (PII OPCIONAL) se fornecido.
+		var sealedFullName *string
+		if p.FullName != "" {
+			if c.envelope == nil {
+				return CreateApplicantResult{}, fmt.Errorf(
+					"sumsub: envelope KMS nao configurado — nao e possivel inserir full_name em claro em producao (TX-3)")
+			}
+			sealed, sealErr := c.envelope.Seal(p.FullName)
+			if sealErr != nil {
+				return CreateApplicantResult{}, fmt.Errorf("sumsub: cifrar full_name: %w", sealErr)
+			}
+			sealedFullName = &sealed
+		}
+
 		_, err = c.pool.Exec(ctx,
 			`INSERT INTO compliance.kyc_subjects
-			   (tenant_id, subject_ref, sumsub_applicant_id, level, status)
-			 VALUES ($1::uuid, $2::uuid, $3, $4, 'pending')
+			   (tenant_id, subject_ref, sumsub_applicant_id, level, status, full_name)
+			 VALUES ($1::uuid, $2::uuid, $3, $4, 'pending', $5)
 			 ON CONFLICT (tenant_id, subject_ref, level) DO NOTHING`,
 			p.TenantID, p.SubjectRef, applicantID, string(p.Level),
+			sealedFullName, // ciphertext base64url ou NULL — nunca plaintext PII
 		)
 		if err != nil {
 			return CreateApplicantResult{}, fmt.Errorf("sumsub: gravar applicant no cofre: %w", err)

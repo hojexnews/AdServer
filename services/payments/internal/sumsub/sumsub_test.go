@@ -15,14 +15,22 @@ package sumsub
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha1" //nolint:gosec
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/hojex/adserver/services/payments/internal/kmsenvelope"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // testSecret e o segredo de teste (nunca em producao).
@@ -35,7 +43,7 @@ func buildTestClient(t *testing.T) *Client {
 		APIKey:        "test-api-key",
 		WebhookSecret: testSecret,
 		BaseURL:       "https://api.sumsub.com",
-	}, nil, nil) // pool nil, logger nil
+	}, nil, nil, nil) // pool nil, envelope nil (sem INSERT de PII em testes de assinatura), logger nil
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -72,21 +80,21 @@ func makeWebhookPayload(reviewStatus, reviewAnswer, applicantID string) []byte {
 // ---------------------------------------------------------------------------
 
 func TestNew_RequiresAPIKey(t *testing.T) {
-	_, err := New(Config{APIKey: "", WebhookSecret: "secret"}, nil, nil)
+	_, err := New(Config{APIKey: "", WebhookSecret: "secret"}, nil, nil, nil)
 	if err == nil {
 		t.Fatal("esperava erro para APIKey vazio")
 	}
 }
 
 func TestNew_RequiresWebhookSecret(t *testing.T) {
-	_, err := New(Config{APIKey: "key", WebhookSecret: ""}, nil, nil)
+	_, err := New(Config{APIKey: "key", WebhookSecret: ""}, nil, nil, nil)
 	if err == nil {
 		t.Fatal("esperava erro para WebhookSecret vazio")
 	}
 }
 
 func TestNew_OK(t *testing.T) {
-	c, err := New(Config{APIKey: "key", WebhookSecret: "secret"}, nil, nil)
+	c, err := New(Config{APIKey: "key", WebhookSecret: "secret"}, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -263,4 +271,158 @@ func TestCreateApplicant_InvalidLevel(t *testing.T) {
 	if err == nil {
 		t.Fatal("esperava erro para Level invalido")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// LOW-2: fakeDB — prova ciphertext no INSERT e ramo fail-closed (sumsub)
+// ---------------------------------------------------------------------------
+
+// fakeDBRow implementa pgx.Row retornando ErrNoRows (sem registro existente).
+type fakeDBRow struct{}
+
+func (fakeDBRow) Scan(dest ...any) error {
+	return errNoRows
+}
+
+// errNoRows simula pgx.ErrNoRows para o fake QueryRow.
+var errNoRows = errors.New("no rows in result set")
+
+// fakeDBSumsub implementa dbQuerier para testes de sumsub.
+type fakeDBSumsub struct {
+	execCalls []struct {
+		sql  string
+		args []any
+	}
+}
+
+func (f *fakeDBSumsub) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	f.execCalls = append(f.execCalls, struct {
+		sql  string
+		args []any
+	}{sql, args})
+	return pgconn.NewCommandTag("INSERT 0 1"), nil
+}
+
+func (f *fakeDBSumsub) QueryRow(_ context.Context, _ string, _ ...any) pgx.Row {
+	// Simula "nao encontrado" — o CreateApplicant prossegue com chamada HTTP
+	return fakeDBRow{}
+}
+
+// fakeHTTPTransport intercepta chamadas HTTP ao Sumsub (retorna applicant ID fake).
+type fakeHTTPTransport struct{}
+
+func (fakeHTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	body := `{"id":"applicant-fake-001"}`
+	return &http.Response{
+		StatusCode: http.StatusCreated,
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     make(http.Header),
+	}, nil
+}
+
+// TestCreateApplicant_FullName_CiphertextNotPlaintext verifica que full_name
+// enviado ao SQL e ciphertext, nunca o plaintext PII (LOW-2-a sumsub).
+func TestCreateApplicant_FullName_CiphertextNotPlaintext(t *testing.T) {
+	env := kmsenvelope.NewForTest()
+	db := &fakeDBSumsub{}
+
+	c, err := newWithDB(Config{
+		APIKey:        "test-key",
+		WebhookSecret: "test-secret",
+	}, db, env, nil)
+	if err != nil {
+		t.Fatalf("newWithDB: %v", err)
+	}
+	// Injeta transporte HTTP fake para evitar chamada real ao Sumsub
+	c.httpClient = &http.Client{Transport: fakeHTTPTransport{}}
+
+	fullName := "Joao da Silva Santos" // PII
+	_, err = c.CreateApplicant(context.Background(), CreateApplicantParams{
+		TenantID:   "aaaaaaaa-0000-0000-0000-000000000001",
+		SubjectRef: "bbbbbbbb-0000-0000-0000-000000000002",
+		Level:      KYCLevelKYC,
+		LevelName:  "basic-kyc-level",
+		FullName:   fullName,
+	})
+	if err != nil {
+		t.Fatalf("CreateApplicant: %v", err)
+	}
+
+	// Localiza o INSERT em kyc_subjects
+	var insertCall *struct {
+		sql  string
+		args []any
+	}
+	for i := range db.execCalls {
+		if strings.Contains(db.execCalls[i].sql, "kyc_subjects") {
+			insertCall = &db.execCalls[i]
+			break
+		}
+	}
+	if insertCall == nil {
+		t.Fatal("fakeDB nao recebeu INSERT em kyc_subjects")
+	}
+
+	// full_name e o 5o parametro ($5, indice 4)
+	// INSERT INTO compliance.kyc_subjects (tenant_id, subject_ref, sumsub_applicant_id, level, status, full_name)
+	// VALUES ($1::uuid, $2::uuid, $3, $4, 'pending', $5)
+	if len(insertCall.args) < 5 {
+		t.Fatalf("INSERT com poucos args: %d", len(insertCall.args))
+	}
+	fullNameArg := insertCall.args[4]
+	ptr, ok := fullNameArg.(*string)
+	if !ok || ptr == nil {
+		t.Fatalf("full_name arg nao e *string nao-nil: %T", fullNameArg)
+	}
+	if *ptr == fullName {
+		t.Errorf("VIOLACAO LOW-2: full_name enviado em plaintext ao SQL")
+	}
+	if strings.Contains(*ptr, fullName) {
+		t.Errorf("VIOLACAO LOW-2: full_name contem o plaintext no valor enviado ao SQL")
+	}
+	if !strings.HasPrefix(*ptr, "v1$") {
+		t.Errorf("full_name no SQL sem prefixo v1$: primeiros bytes: %q", (*ptr)[:minSub(len(*ptr), 10)])
+	}
+}
+
+// TestCreateApplicant_FailClosed_EnvelopeNilWithFullName verifica que
+// envelope==nil com FullName presente retorna erro fail-closed (LOW-2-b sumsub).
+func TestCreateApplicant_FailClosed_EnvelopeNilWithFullName(t *testing.T) {
+	db := &fakeDBSumsub{}
+	// envelope nil: misconfiguracao
+	c, err := newWithDB(Config{
+		APIKey:        "test-key",
+		WebhookSecret: "test-secret",
+	}, db, nil, nil)
+	if err != nil {
+		t.Fatalf("newWithDB: %v", err)
+	}
+	c.httpClient = &http.Client{Transport: fakeHTTPTransport{}}
+
+	_, err = c.CreateApplicant(context.Background(), CreateApplicantParams{
+		TenantID:   "aaaaaaaa-0000-0000-0000-000000000001",
+		SubjectRef: "bbbbbbbb-0000-0000-0000-000000000002",
+		Level:      KYCLevelKYC,
+		LevelName:  "basic-kyc-level",
+		FullName:   "Joao da Silva Santos", // PII: exige envelope
+	})
+	if err == nil {
+		t.Fatal("VIOLACAO fail-closed: esperava erro quando envelope=nil e FullName presente, got nil")
+	}
+	// Garante que nenhum plaintext chegou ao SQL
+	for _, call := range db.execCalls {
+		for _, arg := range call.args {
+			if s, ok := arg.(string); ok && s == "Joao da Silva Santos" {
+				t.Errorf("VIOLACAO DA-11: plaintext PII chegou ao SQL com envelope nil")
+			}
+		}
+	}
+}
+
+// minSub e um helper local para limitar indices em msgs de erro.
+func minSub(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
