@@ -23,14 +23,22 @@ import { createContext } from "./lib/context.js";
 import { createConfigRouter } from "./routers/config.js";
 import { createStatsRouter } from "./routers/stats.js";
 import { createCopilotRouter } from "./routers/copilot.js";
+import { createPaymentsRouter } from "./routers/payments.js";
 import { InMemoryConfigAdapter } from "./adapters/in-memory-config.js";
 import { InMemoryStatsAdapter } from "./adapters/in-memory-stats.js";
+import { InMemoryPaymentsAdapter } from "./adapters/in-memory-payments.js";
 
 // ---------------------------------------------------------------------------
 // Adapters — substituir pelos reais em produção
 // ---------------------------------------------------------------------------
 const configAdapter = new InMemoryConfigAdapter();
 const statsAdapter = new InMemoryStatsAdapter();
+/**
+ * K7: adapter de pagamentos in-memory.
+ * Em produção: substituir por PostgresPaymentsAdapter que faz
+ * SET LOCAL adserver.tenant_id e lê ledger.account_balances + journal_entries.
+ */
+const paymentsAdapter = new InMemoryPaymentsAdapter();
 
 // ---------------------------------------------------------------------------
 // App tRPC
@@ -44,6 +52,13 @@ export const appRouter = router({
    * ADR-0003 §C / TX-3 / §2.4.
    */
   copilot: createCopilotRouter(),
+  /**
+   * Rota de pagamentos — K7 (Fase 3).
+   * Status/saldo somente leitura via BFF.
+   * tenant_id injetado por ctx; sem cripto no cliente; sem segredos no payload.
+   * ADR-0004 §C / §E.9 / §H / TX-2 / TX-3.
+   */
+  payments: createPaymentsRouter(paymentsAdapter),
 });
 
 export type AppRouter = typeof appRouter;

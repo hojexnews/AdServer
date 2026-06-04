@@ -69,6 +69,8 @@ function NavLinks() {
     { href: "/rules", label: "Regras de Entrega" },
     { href: "/dashboard", label: "Dashboard" },
     { href: "/copilot", label: "Copiloto IA" },
+    /** K7 — faturamento/pagamentos self-service */
+    { href: "/billing", label: "Faturamento" },
   ];
 
   return (
