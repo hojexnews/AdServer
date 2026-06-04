@@ -90,12 +90,19 @@ app = FastAPI(
     redoc_url=None,
 )
 
-# CORS restrito: apenas o BFF interno pode chamar
+# CORS restrito: apenas o BFF interno pode chamar.
+# L3: allow_headers enumerado explicitamente (não "*") — princípio do menor privilégio.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://bff:3001", "http://localhost:3001"],
     allow_methods=["GET", "POST"],
-    allow_headers=["*"],
+    allow_headers=[
+        "Content-Type",
+        "X-Tenant-ID",
+        "X-Session-ID",
+        "X-Internal-Timestamp",
+        "X-Internal-Signature",
+    ],
 )
 
 
@@ -218,10 +225,21 @@ async def chat(
                         })
                         return  # Encerra o stream aqui; BFF retoma via /hitl endpoint
 
-                # Erro no grafo
+                # Erro no grafo — M4: não vazar detalhes internos ao cliente
                 elif event_name == "on_chain_error":
-                    error = str(event_data.get("error", "Erro interno"))
-                    yield _sse("error", {"message": error})
+                    err_id = str(uuid.uuid4())
+                    internal_error = event_data.get("error", "")
+                    log.error(
+                        "chat.chain_error",
+                        tenant_id=tenant_id,
+                        thread_id=thread_id,
+                        correlation_id=err_id,
+                        error=str(internal_error),
+                    )
+                    yield _sse("error", {
+                        "message": "Erro interno no processamento. Tente novamente.",
+                        "correlation_id": err_id,
+                    })
                     return
 
             # Fim do stream
@@ -261,18 +279,61 @@ async def hitl_approve(
     O BFF chama este endpoint após o usuário clicar em "Aplicar" ou "Cancelar"
     na UI. O grafo retoma a partir do nó hitl_approval_node com a decisão.
 
-    INVARIANTE: o tenant_id da sessão deve coincidir com o thread_id.
-    O BFF garante isso antes de chamar este endpoint.
+    SEGURANÇA (C1 — Anti-IDOR cross-tenant):
+      ANTES de retomar o grafo, carregamos o estado do thread e verificamos que
+      state["tenant_id"] == session.tenant_id. Se não coincidir, 403.
+      Assim um tenant A NÃO pode aprovar a escrita pendente de tenant B.
     """
     tenant_id = session.tenant_id
+    correlation_id = str(uuid.uuid4())
     log.info(
         "hitl_approve",
         tenant_id=tenant_id,
         thread_id=thread_id,
         approved=body.approved,
+        correlation_id=correlation_id,
     )
 
     config = {"configurable": {"thread_id": thread_id}}
+
+    # C1: carrega o estado e verifica posse ANTES de retomar
+    try:
+        existing_state = await graph.aget_state(config)
+    except Exception as exc:
+        log.error(
+            "hitl_approve.get_state_error",
+            tenant_id=tenant_id,
+            thread_id=thread_id,
+            correlation_id=correlation_id,
+            error=str(exc),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro interno ao verificar sessão. ID: {correlation_id}",
+        )
+
+    if existing_state is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Thread '{thread_id}' não encontrado.",
+        )
+
+    # C1: verificação de posse — tenant_id do estado deve coincidir com o da sessão
+    state_values = existing_state.values if hasattr(existing_state, "values") else {}
+    state_tenant_id = state_values.get("tenant_id")
+
+    if state_tenant_id != tenant_id:
+        log.warning(
+            "hitl_approve.tenant_mismatch",
+            session_tenant_id=tenant_id,
+            state_tenant_id=state_tenant_id,
+            thread_id=thread_id,
+            correlation_id=correlation_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Acesso negado: este thread não pertence ao tenant da sessão.",
+        )
 
     try:
         await graph.ainvoke(
@@ -285,10 +346,15 @@ async def hitl_approve(
             "decision": "approved" if body.approved else "rejected",
         }
     except Exception as exc:
-        log.error("hitl_approve.error", tenant_id=tenant_id, error=str(exc))
+        log.error(
+            "hitl_approve.resume_error",
+            tenant_id=tenant_id,
+            correlation_id=correlation_id,
+            error=str(exc),
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Falha ao retomar o grafo: {exc!s}",
+            detail=f"Erro interno ao retomar aprovação. ID: {correlation_id}",
         )
 
 

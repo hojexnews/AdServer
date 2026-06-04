@@ -50,6 +50,7 @@ from tools.schemas import (
     CreateCapDraftInput,
     LinkCampaignZoneDraftInput,
     HaikuJudgeInput,
+    CreativeType,
 )
 from app.model_router import ModelRouter, TaskKind, ModelTier
 
@@ -280,12 +281,52 @@ def make_write_draft_node(gateway: ToolGateway):
     """
     Nó que prepara o WriteDiff para escrita.
     NÃO persiste — apenas cria o draft e aciona HITL.
+
+    SEGURANÇA (M2):
+      Para operações de banner (create/update), roda validate_creative ANTES
+      de gerar o WriteDiff. O resultado da validação é anexado ao diff.
+      Se gate_passed=False, o diff ainda é gerado mas marcado como inválido
+      (permite ao humano ver o problema no HITL antes de bloquear).
     """
+
+    async def _run_creative_validation(
+        tenant_id: str,
+        tool_name: str,
+        tool_input: dict,
+    ) -> dict | None:
+        """
+        Executa validate_creative para operações de banner.
+        Retorna o modelo dump do ValidateCreativeOutput ou None se não aplicável.
+        """
+        banner_ops = {"create_banner_draft", "update_banner_draft"}
+        if tool_name not in banner_ops:
+            return None
+
+        # Extrai campos relevantes do input para validação criativa
+        creative_type_str = tool_input.get("creative_type", "image")
+        try:
+            creative_type = CreativeType(creative_type_str)
+        except ValueError:
+            creative_type = CreativeType.IMAGE
+
+        val_inp = ValidateCreativeInput(
+            creative_type=creative_type,
+            asset_url=tool_input.get("asset_url"),
+            html_content=tool_input.get("html_content"),
+            is_ai_generated=tool_input.get("is_ai_generated", False),
+            ai_generation_tool=tool_input.get("ai_generation_tool"),
+            dest_url=tool_input.get("dest_url"),
+        )
+        val_result = await gateway.validate_creative(tenant_id, val_inp)
+        return val_result.model_dump()
 
     async def write_draft_node(state: CopilotState) -> dict[str, Any]:
         """
         Processa tool_calls de escrita: cria draft, valida schema Pydantic,
         e coloca o WriteDiff em state["pending_diff"] para o HITL.
+
+        M2: validate_creative roda ANTES de gerar WriteDiff para banners.
+        O validation_result é anexado ao diff para visibilidade no HITL.
         """
         tenant_id = state["tenant_id"]
         last_tool_info = state.get("last_tool_result", {}) or {}
@@ -295,6 +336,11 @@ def make_write_draft_node(gateway: ToolGateway):
         log.info("write_draft_node.start", tenant_id=tenant_id, tool=tool_name)
 
         try:
+            # M2: valida criativo ANTES de criar o draft (para banner ops)
+            creative_validation = await _run_creative_validation(
+                tenant_id, tool_name, tool_input
+            )
+
             if tool_name == "create_campaign_draft":
                 inp = CreateCampaignDraftInput(**tool_input)
                 diff = await gateway.create_campaign_draft(tenant_id, inp)
@@ -326,11 +372,25 @@ def make_write_draft_node(gateway: ToolGateway):
             else:
                 raise ValueError(f"Ferramenta de escrita desconhecida: '{tool_name}'")
 
+            # M2: anexa validation_result ao diff se for operação de banner
+            if creative_validation is not None:
+                # Preserva validation_result existente (ex.: segmentation) ou substitui
+                diff = diff.model_copy(update={"validation_result": creative_validation})
+                gate_passed = creative_validation.get("gate_passed", True)
+                if not gate_passed:
+                    log.warning(
+                        "write_draft_node.creative_gate_failed",
+                        tenant_id=tenant_id,
+                        tool=tool_name,
+                        violations=creative_validation.get("violations", []),
+                    )
+                    # Ainda emite o HITL mas marcado como inválido (humano decide)
+
         except Exception as exc:
             log.error("write_draft_node.validation_error", tenant_id=tenant_id, error=str(exc))
             return {
                 "next_action": "error",
-                "error_message": f"Validação do draft falhou: {exc!s}",
+                "error_message": "Validação do draft falhou. Verifique os dados informados.",
                 "pending_diff": None,
             }
 
@@ -406,6 +466,11 @@ def make_apply_write_node(gateway: ToolGateway):
     """
     Nó que aplica o WriteDiff APROVADO pelo humano.
     É o único ponto onde há mutação real no banco.
+
+    SEGURANÇA (C1):
+      Verifica que o tenant_id do estado (dono do diff) coincide com o
+      tenant_id da sessão atual antes de aplicar. Se não coincidirem,
+      retorna erro (proteção dupla — a primeira está no endpoint HITL).
     """
 
     async def apply_write_node(state: CopilotState) -> dict[str, Any]:
@@ -416,6 +481,22 @@ def make_apply_write_node(gateway: ToolGateway):
             log.error("apply_write_node: estado inválido", tenant_id=tenant_id)
             return {"next_action": "error", "error_message": "apply_write sem aprovação HITL."}
 
+        # C1: verifica que o tenant do diff coincide com o tenant do estado
+        # (defesa em profundidade — o endpoint HITL já fez esta verificação)
+        diff_tenant = (diff.after or {}).get("tenant_id") if diff.after else None
+        if diff_tenant is not None and diff_tenant != tenant_id:
+            log.error(
+                "apply_write_node.tenant_mismatch",
+                state_tenant_id=tenant_id,
+                diff_tenant_id=diff_tenant,
+                operation=diff.operation,
+            )
+            return {
+                "next_action": "error",
+                "error_message": "apply_write: divergência de tenant entre diff e estado.",
+                "pending_diff": None,
+            }
+
         log.info(
             "apply_write_node.start",
             tenant_id=tenant_id,
@@ -424,11 +505,13 @@ def make_apply_write_node(gateway: ToolGateway):
 
         try:
             result = await gateway.apply_write(tenant_id, diff)
+            # C1/L2: não incluir tenant_id no resultado retornado ao LLM
+            safe_result = {k: v for k, v in result.items() if k != "tenant_id"}
             tool_msg = ToolMessage(
                 content=json.dumps({
                     "status": "applied",
                     "operation": diff.operation,
-                    "result": result,
+                    "result": safe_result,
                 }, ensure_ascii=False),
                 tool_call_id="apply_write",
             )
@@ -436,14 +519,14 @@ def make_apply_write_node(gateway: ToolGateway):
                 "messages": [tool_msg],
                 "pending_diff": None,
                 "hitl_approved": None,
-                "last_tool_result": result,
+                "last_tool_result": safe_result,
                 "next_action": "respond",
             }
         except Exception as exc:
             log.error("apply_write_node.error", tenant_id=tenant_id, error=str(exc))
             return {
                 "next_action": "error",
-                "error_message": f"Falha ao aplicar escrita: {exc!s}",
+                "error_message": "Falha ao aplicar escrita. Tente novamente.",
                 "pending_diff": None,
             }
 

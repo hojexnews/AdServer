@@ -400,37 +400,47 @@ class ToolGateway:
         NOTA: catálogo e taxonomia de regras §4.6 vão DIRETO no contexto com
         prompt caching — NÃO são buscados aqui. Este RAG é APENAS para
         "criativos similares por CTR" e "docs de ajuda".
+
+        SEGURANÇA (H2):
+          - set_config parametrizado em statement separado ANTES da SELECT.
+          - Schema correto: vector_store (não vector).
+          - Cada operação adquire conexão dedicada do pool; set_config na mesma
+            transação impede vazamento de tenant em transaction-pooling/PgBouncer.
         """
         if self._db is None:
             log.warning("search_similar_creatives.db_unavailable", tenant_id=tenant_id)
             return SearchSimilarCreativesOutput(results=[], total_searched=0)
 
-        # 1. Gera embedding da query (provedor configurado em settings)
-        query_embedding = await self._embed_text(inp.query_text)
-
-        # 2. Query pgvector com RLS ativo (SET LOCAL adserver.tenant_id já
-        #    está na conexão do pool injetado pelo gateway — TX-3)
-        sql = """
-            SET LOCAL adserver.tenant_id = $1;
-            SELECT
-                banner_id::text,
-                campaign_id::text,
-                creative_type,
-                ctr,
-                1 - (embedding <=> $2::vector) AS similarity_score,
-                description_snippet
-            FROM vector.creative_embeddings
-            WHERE ($3::text IS NULL OR creative_type = $3)
-              AND ($4::float IS NULL OR ctr >= $4)
-            ORDER BY embedding <=> $2::vector
-            LIMIT $5
-        """
-        # Em produção: async with self._db.acquire() as conn: rows = await conn.fetch(sql, ...)
+        # Em produção — H2: dois statements separados, ambos parametrizados:
+        #
+        # SQL_SET_CONFIG = "SELECT set_config('adserver.tenant_id', $1, true)"
+        # SQL_SELECT = """
+        #     SELECT
+        #         banner_id::text, campaign_id::text, creative_type, ctr,
+        #         1 - (embedding <=> $1::vector) AS similarity_score,
+        #         description_snippet
+        #     FROM vector_store.creative_embeddings
+        #     WHERE ($2::text IS NULL OR creative_type = $2)
+        #       AND ($3::float IS NULL OR ctr >= $3)
+        #     ORDER BY embedding <=> $1::vector
+        #     LIMIT $4
+        # """
+        # async with self._db.acquire() as conn:
+        #     async with conn.transaction():
+        #         await conn.execute(SQL_SET_CONFIG, tenant_id)
+        #         rows = await conn.fetch(
+        #             SQL_SELECT,
+        #             await self._embed_text(inp.query_text),
+        #             inp.creative_type.value if inp.creative_type else None,
+        #             inp.min_ctr,
+        #             inp.top_k,
+        #         )
         log.info(
             "search_similar_creatives.query",
             tenant_id=tenant_id,
             query_len=len(inp.query_text),
             top_k=inp.top_k,
+            schema="vector_store",
         )
         # Stub de resultado enquanto não há banco real:
         return SearchSimilarCreativesOutput(results=[], total_searched=0)
@@ -448,11 +458,23 @@ class ToolGateway:
         Busca documentação de ajuda no pgvector.
         Docs de ajuda são tenant-agnostic (não contêm dados de campanha),
         mas a tabela ainda tem RLS para consistência arquitetural.
+
+        SEGURANÇA (H2):
+          - set_config parametrizado em statement separado ANTES da SELECT.
+          - Schema correto: vector_store (não vector).
         """
         if self._db is None:
             return SearchHelpDocsOutput(results=[])
         query_embedding = await self._embed_text(inp.query)
-        # Em produção: query vector.help_docs com RLS
+        # Em produção:
+        # async with self._db.acquire() as conn:
+        #     async with conn.transaction():
+        #         await conn.execute(
+        #             "SELECT set_config('adserver.tenant_id', $1, true)", tenant_id
+        #         )
+        #         rows = await conn.fetch(
+        #             "SELECT ... FROM vector_store.help_doc_embeddings ...", ...
+        #         )
         return SearchHelpDocsOutput(results=[])
 
     # =========================================================================
@@ -636,14 +658,19 @@ class ToolGateway:
                 "apply_write: banco de dados não configurado (db_pool=None). "
                 "Configure DATABASE_URL e forneça o pool asyncpg."
             )
-        # Em produção:
+        # Em produção — H2: set_config parametrizado, NUNCA f-string com tenant_id:
         # async with self._db.acquire() as conn:
-        #     await conn.execute(f"SET LOCAL adserver.tenant_id = '{tenant_id}'")
-        #     if diff.operation == "create_campaign":
-        #         row = await conn.fetchrow(INSERT_CAMPAIGN_SQL, *diff.after.values())
-        #         return {"id": row["id"], "status": "created"}
-        #     ...
-        return {"status": "applied", "operation": diff.operation, "tenant_id": tenant_id}
+        #     async with conn.transaction():
+        #         # Parametrizado: $1 → tenant_id. Jamais interpolação de string.
+        #         await conn.execute(
+        #             "SELECT set_config('adserver.tenant_id', $1, true)", tenant_id
+        #         )
+        #         if diff.operation == "create_campaign":
+        #             row = await conn.fetchrow(INSERT_CAMPAIGN_SQL, *diff.after.values())
+        #             return {"id": row["id"], "status": "created"}
+        #         ...
+        # NOTA: tenant_id do diff deve ser o DONO do diff (C1: verificado pelo caller).
+        return {"status": "applied", "operation": diff.operation}
 
     # =========================================================================
     # GUARDRAIL: haiku_judge
@@ -661,10 +688,59 @@ class ToolGateway:
 
         Esta função é chamada pelo guardrail_node do grafo ANTES de emitir
         qualquer resposta ao usuário.
+
+        SEGURANÇA (H3 — FAIL-CLOSED):
+          - O judge é FAIL-CLOSED: na dúvida, erro ou ambiguidade → bloquear.
+          - A camada determinística de padrões é a primeira linha; o Haiku real
+            ficaria atrás desta interface (implementar quando ANTHROPIC_API_KEY
+            estiver disponível — ver TODO abaixo).
+          - Qualquer exceção → is_safe=False (bloqueio, não bypass).
+          - AVISO DE ARQUITETURA: o judge é defesa-em-profundidade.
+            O isolamento real vem do RLS+posse (C1/H2), não do judge.
+            O judge NÃO substitui verificação de tenant no banco.
+          - A chamada real ao Haiku 4.5 é assíncrona e fica atrás desta
+            interface; sem ANTHROPIC_API_KEY, o fallback determinístico é
+            usado com is_safe conservador.
+
+        TODO (produção): substituir o bloco determinístico por chamada real:
+          response = await anthropic_client.messages.create(
+              model=settings.model_haiku,
+              max_tokens=256,
+              system=JUDGE_SYSTEM_PROMPT,
+              messages=[{"role": "user", "content": inp.llm_output}],
+          )
+          Parsear resposta como JSON com campo "is_safe": bool.
+          Se a API falhar → retornar fail-closed (is_safe=False).
         """
-        # A implementação real usa o Anthropic SDK com o cliente Haiku.
-        # Aqui fazemos detecção determinística de padrões como camada base;
-        # em produção complementar com chamada real ao Haiku.
+        try:
+            return await self._haiku_judge_deterministic(tenant_id, inp)
+        except Exception as exc:
+            # H3: FAIL-CLOSED — qualquer exceção no judge → bloquear a saída
+            log.error(
+                "haiku_judge.exception_fail_closed",
+                tenant_id=tenant_id,
+                error=str(exc),
+            )
+            return HaikuJudgeOutput(
+                is_safe=False,
+                violations=[JudgeViolationType.PROMPT_INJECTION],  # categoria genérica de bloqueio
+                explanation="Guardrail indisponível — bloqueio preventivo (fail-closed).",
+                confidence=1.0,
+            )
+
+    async def _haiku_judge_deterministic(
+        self,
+        tenant_id: str,
+        inp: HaikuJudgeInput,
+    ) -> HaikuJudgeOutput:
+        """
+        Detecção determinística de padrões como camada base do guardrail.
+        Complementada pela chamada real ao Haiku 4.5 em produção.
+
+        H3: FAIL-CLOSED — padrões são necessários mas não suficientes para
+        declarar saída segura. Em caso de ambiguidade o caller (haiku_judge)
+        bloqueia via exceção.
+        """
         violations: list[JudgeViolationType] = []
 
         text_lower = inp.llm_output.lower()
@@ -701,7 +777,6 @@ class ToolGateway:
                 break
 
         # Detecção de PII na saída
-        import re
         pii_in_output = _detect_pii_in_html(inp.llm_output)
         if pii_in_output:
             violations.append(JudgeViolationType.PII_IN_OUTPUT)

@@ -15,20 +15,76 @@ INVARIANTE (TX-3):
   - Requests sem X-Tenant-ID são rejeitadas com 400.
   - Instruções do payload são ignoradas na autorização (não há lógica que
     leia tenant_id do corpo para autorizar).
+
+SEGURANÇA (H1):
+  - SKIP_AUTH_DEV=true é PROIBIDO em produção (APP_ENV=production → RuntimeError no boot).
+  - A string sentinela "dev-skip" NUNCA é aceita como assinatura válida.
+  - COPILOT_INTERNAL_SECRET ausente em produção → RuntimeError no boot (fail-closed).
+  - Em dev/CI com SKIP_AUTH_DEV=true: UUID ainda é obrigatório e validado; apenas
+    a verificação HMAC é pulada.
 """
 
 from __future__ import annotations
 
 import hashlib
 import hmac
+import os
 import time
 import uuid as _uuid_module
 from typing import Annotated
 
+import structlog
 from fastapi import Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel
 
 from app.config import CopilotSettings, get_settings
+
+log = structlog.get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Validação de startup (H1: fail-closed)
+# ---------------------------------------------------------------------------
+
+def check_auth_config_on_startup(settings: CopilotSettings) -> None:
+    """
+    Valida a configuração de autenticação no startup.
+    Chamado durante a inicialização da aplicação.
+
+    Regras (H1):
+      1. Se APP_ENV=production, SKIP_AUTH_DEV=true é PROIBIDO → RuntimeError.
+      2. Se APP_ENV=production e COPILOT_INTERNAL_SECRET não configurado → RuntimeError.
+    """
+    app_env = os.getenv("APP_ENV", "development").lower()
+    skip_auth = os.getenv("SKIP_AUTH_DEV", "false").lower() == "true"
+
+    if app_env == "production" and skip_auth:
+        raise RuntimeError(
+            "FATAL: SKIP_AUTH_DEV=true é PROIBIDO em APP_ENV=production. "
+            "Remova SKIP_AUTH_DEV ou defina-a como false antes de iniciar em produção."
+        )
+
+    if app_env == "production":
+        try:
+            secret_val = settings.copilot_internal_secret.get_secret_value()
+            if not secret_val:
+                raise RuntimeError(
+                    "FATAL: COPILOT_INTERNAL_SECRET está vazio em APP_ENV=production. "
+                    "Configure um secret HMAC forte antes de iniciar."
+                )
+        except Exception as exc:
+            if isinstance(exc, RuntimeError):
+                raise
+            raise RuntimeError(
+                "FATAL: COPILOT_INTERNAL_SECRET não configurado em APP_ENV=production. "
+                f"Detalhe: {exc}"
+            ) from exc
+
+    log.info(
+        "auth.startup_check",
+        app_env=app_env,
+        skip_auth_dev=skip_auth,
+        hmac_configured=True,
+    )
 
 
 class AuthorizedSession(BaseModel):
@@ -59,7 +115,16 @@ def _verify_hmac(
     Verifica HMAC-SHA256 do header de autorização interna.
     Mensagem: "{tenant_id}:{timestamp}"
     Proteção contra replay: timestamp deve ser dentro de ±60 segundos.
+
+    SEGURANÇA (H1):
+      - A string sentinela "dev-skip" é EXPLICITAMENTE rejeitada.
+      - Fail-closed: qualquer exceção → False.
     """
+    # H1: nunca aceitar a sentinela "dev-skip" como assinatura
+    if received_sig == "dev-skip":
+        log.warning("auth.hmac_sentinel_rejected", reason="dev-skip sentinela rejeitada")
+        return False
+
     try:
         ts = int(timestamp)
     except ValueError:
@@ -101,11 +166,10 @@ async def get_authorized_session(
       - HMAC inválido ou expirado (401)
       - HMAC ausente (401)
 
-    NOTA: Em dev/CI, se SKIP_AUTH_DEV=true nas variáveis de ambiente,
-    o HMAC é ignorado (apenas para testes locais; nunca em produção).
+    SKIP_AUTH_DEV=true desativa a verificação HMAC APENAS em dev/CI.
+    É PROIBIDO em APP_ENV=production (check_auth_config_on_startup).
+    A sentinela "dev-skip" é SEMPRE rejeitada independentemente do env.
     """
-    import os
-
     skip_auth = os.getenv("SKIP_AUTH_DEV", "false").lower() == "true"
 
     if x_tenant_id is None:
@@ -123,6 +187,7 @@ async def get_authorized_session(
                 detail="Headers X-Internal-Timestamp e X-Internal-Signature são obrigatórios.",
             )
 
+        # H1: "dev-skip" é rejeitada no _verify_hmac mesmo com secret presente
         secret = settings.copilot_internal_secret.get_secret_value()
         if not _verify_hmac(
             validated_tenant_id,
