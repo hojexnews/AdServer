@@ -274,6 +274,7 @@ func TestSubmitPayout_SanctionedDestination_DoesNotBuild(t *testing.T) {
 		Amount:         newTestMoney(10_000_000, "USDC"),
 		ChainID:        1,
 		IdempotencyKey: "pay-sanctions-001",
+		TenantID:       "bbbbbbbb-0000-0000-0000-000000000002",
 	}, conn)
 
 	if err == nil {
@@ -304,6 +305,7 @@ func TestSubmitPayout_ScreenerUnavailable_FailClosed(t *testing.T) {
 		Amount:         newTestMoney(1_000_000, "USDC"),
 		ChainID:        1,
 		IdempotencyKey: "pay-unavail-001",
+		TenantID:       "bbbbbbbb-0000-0000-0000-000000000002",
 	}, conn)
 
 	if err == nil {
@@ -330,6 +332,7 @@ func TestSubmitPayout_AboveThreshold_TravelRuleBlocked(t *testing.T) {
 		Amount:         newTestMoney(1_000_000_000, "USDC"), // 1000 USDC — acima de qualquer limiar razoavel
 		ChainID:        1,
 		IdempotencyKey: "pay-travelrule-001",
+		TenantID:       "bbbbbbbb-0000-0000-0000-000000000002",
 	}, conn)
 
 	if err == nil {
@@ -365,6 +368,7 @@ func TestSubmitPayout_BelowThreshold_Proceeds(t *testing.T) {
 		Amount:         newTestMoney(100_000, "USDC"), // 0.10 USDC — abaixo de qualquer limiar
 		ChainID:        1,
 		IdempotencyKey: "pay-below-threshold-001",
+		TenantID:       "bbbbbbbb-0000-0000-0000-000000000002",
 	}, conn)
 
 	// Deve ter chegado ao BuildPayout (stub retorna nil).
@@ -388,6 +392,7 @@ func TestSubmitPayout_CleanAddress_NoCompliance_Proceeds(t *testing.T) {
 		Amount:         newTestMoney(500_000, "USDC"),
 		ChainID:        1,
 		IdempotencyKey: "pay-no-compliance-001",
+		TenantID:       "bbbbbbbb-0000-0000-0000-000000000002",
 	}, conn)
 
 	if err != nil {
@@ -395,6 +400,29 @@ func TestSubmitPayout_CleanAddress_NoCompliance_Proceeds(t *testing.T) {
 	}
 	if !conn.buildPayoutCalled.Load() {
 		t.Error("BuildPayout deveria ter sido chamado sem compliance")
+	}
+}
+
+// TestSubmitPayout_EmptyTenantID_FailClosed verifica que TenantID vazio bloqueia
+// o payout antes de qualquer screening (TX-3 / fail-closed).
+func TestSubmitPayout_EmptyTenantID_FailClosed(t *testing.T) {
+	h := buildComplianceHandler(t, nil, nil)
+	conn := &stubConnector{}
+
+	err := h.SubmitPayout(context.Background(), chainconnector.PayoutRequest{
+		ToAddress:      "0xany000000000000000000000000000000001",
+		Amount:         newTestMoney(500_000, "USDC"),
+		ChainID:        1,
+		IdempotencyKey: "pay-no-tenant-001",
+		TenantID:       "", // ausente — deve bloquear (TX-3)
+	}, conn)
+
+	if err == nil {
+		t.Fatal("esperava erro para TenantID vazio (TX-3 fail-closed)")
+	}
+	// BuildPayout NAO deve ter sido chamado.
+	if conn.buildPayoutCalled.Load() {
+		t.Error("BuildPayout foi chamado mesmo com TenantID vazio — TX-3 violado")
 	}
 }
 
@@ -411,6 +439,7 @@ func TestSubmitPayout_CleanAddress_FullCompliance_Proceeds(t *testing.T) {
 		Amount:         newTestMoney(2_000_000_000, "USDC"), // 2000 USDC — acima do limiar, mas registro OK
 		ChainID:        1,
 		IdempotencyKey: "pay-full-compliance-001",
+		TenantID:       "bbbbbbbb-0000-0000-0000-000000000002",
 	}, conn)
 
 	if err != nil {
@@ -424,5 +453,39 @@ func TestSubmitPayout_CleanAddress_FullCompliance_Proceeds(t *testing.T) {
 	}
 	if !conn.buildPayoutCalled.Load() {
 		t.Error("BuildPayout deveria ter sido chamado apos compliance passar")
+	}
+}
+
+// TestSubmitPayout_InvalidTenantIDFormat_FailClosed verifica que TenantID com
+// formato nao-UUID bloqueia o payout fail-closed (HIGH-1).
+// O TenantID DEVE vir do contexto autenticado — nunca de payload de cliente.
+// Um valor nao-UUID indica tentativa de injecao ou misconfiguracao.
+func TestSubmitPayout_InvalidTenantIDFormat_FailClosed(t *testing.T) {
+	h := buildComplianceHandler(t, nil, nil)
+	conn := &stubConnector{}
+
+	invalidIDs := []string{
+		"not-a-uuid",
+		"12345678",
+		"../../etc/passwd",
+		"aaaaaaaa-0000-0000-0000-GGGGGGGGGGGG", // hex invalido
+		"aaaaaaaa-0000-0000-0000-00000000000",  // curto
+	}
+
+	for _, tid := range invalidIDs {
+		err := h.SubmitPayout(context.Background(), chainconnector.PayoutRequest{
+			ToAddress:      "0xany000000000000000000000000000000001",
+			Amount:         newTestMoney(500_000, "USDC"),
+			ChainID:        1,
+			IdempotencyKey: "pay-invalid-uuid-001",
+			TenantID:       tid,
+		}, conn)
+
+		if err == nil {
+			t.Errorf("HIGH-1: esperava erro para TenantID invalido %q, got nil", tid)
+		}
+		if conn.buildPayoutCalled.Load() {
+			t.Errorf("HIGH-1: BuildPayout foi chamado com TenantID invalido %q — TX-3 violado", tid)
+		}
 	}
 }

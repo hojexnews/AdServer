@@ -164,6 +164,7 @@ func TestBuildPayout_Valid(t *testing.T) {
 		Amount:         usdcMoney(1_000_000), // 1.000000 USDC
 		ChainID:        1,
 		IdempotencyKey: "evt-123",
+		TenantID:       "aaaaaaaa-0000-0000-0000-000000000001", // TX-3: pseudonimo do contexto autenticado
 	}
 	tx, err := s.BuildPayout(context.Background(), req)
 	if err != nil {
@@ -188,6 +189,7 @@ func TestBuildPayout_ZeroAmount(t *testing.T) {
 		ToAddress: "0xAnyone",
 		Amount:    &moneyv1.Money{AssetCode: "USDC", Amount: 0, Scale: 6},
 		ChainID:   1,
+		TenantID:  "aaaaaaaa-0000-0000-0000-000000000001",
 	}
 	_, err := s.BuildPayout(context.Background(), req)
 	if err == nil {
@@ -202,6 +204,7 @@ func TestBuildPayout_NegativeAmount(t *testing.T) {
 		ToAddress: "0xAnyone",
 		Amount:    &moneyv1.Money{AssetCode: "USDC", Amount: -1_000_000, Scale: 6},
 		ChainID:   1,
+		TenantID:  "aaaaaaaa-0000-0000-0000-000000000001",
 	}
 	_, err := s.BuildPayout(context.Background(), req)
 	if err == nil {
@@ -216,6 +219,7 @@ func TestBuildPayout_NilAmount(t *testing.T) {
 		ToAddress: "0xAnyone",
 		Amount:    nil,
 		ChainID:   1,
+		TenantID:  "aaaaaaaa-0000-0000-0000-000000000001",
 	}
 	_, err := s.BuildPayout(context.Background(), req)
 	if err == nil {
@@ -230,6 +234,7 @@ func TestBuildPayout_UnsupportedChain(t *testing.T) {
 		ToAddress: "0xAnyone",
 		Amount:    usdcMoney(100),
 		ChainID:   42161, // Arbitrum — nao suportado pelo stub desta config
+		TenantID:  "aaaaaaaa-0000-0000-0000-000000000001",
 	}
 	_, err := s.BuildPayout(context.Background(), req)
 	if err == nil {
@@ -348,6 +353,7 @@ func TestBuildPayout_DifferentChainIDs_AreIsolated(t *testing.T) {
 		ToAddress: "0xA",
 		Amount:    usdcMoney(100),
 		ChainID:   1,
+		TenantID:  "aaaaaaaa-0000-0000-0000-000000000001",
 	})
 	if err != nil {
 		t.Fatalf("chain 1: %v", err)
@@ -357,6 +363,7 @@ func TestBuildPayout_DifferentChainIDs_AreIsolated(t *testing.T) {
 		ToAddress: "0xA",
 		Amount:    usdcMoney(100),
 		ChainID:   137,
+		TenantID:  "aaaaaaaa-0000-0000-0000-000000000001",
 	})
 	if err != nil {
 		t.Fatalf("chain 137: %v", err)

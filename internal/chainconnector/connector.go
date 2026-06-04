@@ -141,6 +141,17 @@ type PayoutRequest struct {
 	// PaymentEvent). Custodiantes que suportam idempotencia usam este campo
 	// para evitar duplo-envio.
 	IdempotencyKey string
+
+	// TenantID e o UUID pseudonimo do tenant autenticado (TX-3).
+	// DEVE ser preenchido pelo servico de pagamentos EXCLUSIVAMENTE a partir
+	// do contexto autenticado do servidor (ex.: JWT claim validado, sessao RLS).
+	// NUNCA deve ser lido do payload do custodiante (Safe/Fireblocks webhook),
+	// do corpo da requisicao do cliente externo nem de qualquer dado controlado
+	// pelo anunciante — isso seria uma escalada de privilegios.
+	// Valor vazio OU fora do formato UUID canonico (8-4-4-4-12) faz SubmitPayout
+	// retornar erro fail-closed antes de qualquer operacao downstream.
+	// Alimenta a RLS do cofre de compliance (screening_results) e o log de auditoria.
+	TenantID string
 }
 
 // UnsignedTx e o payload de uma transacao nao-assinada retornado por

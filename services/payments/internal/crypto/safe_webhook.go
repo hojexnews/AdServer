@@ -73,12 +73,19 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/hojex/adserver/internal/chainconnector"
 	"github.com/hojex/adserver/internal/ledger"
 	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// reUUID valida o formato canonico UUID v4 (8-4-4-4-12 hex, case-insensitive).
+// Compilado uma vez na inicializacao do pacote (sem custo no caminho de validacao).
+var reUUID = regexp.MustCompile(
+	`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`,
 )
 
 // ---------------------------------------------------------------------------
@@ -780,10 +787,22 @@ func (h *SafeWebhookHandler) SubmitPayout(ctx context.Context, req chainconnecto
 	if req.Amount == nil || req.Amount.GetAmount() <= 0 {
 		return fmt.Errorf("safe_webhook: SubmitPayout: Amount invalido (TX-2)")
 	}
+	// TX-3: TenantID e o pseudonimo do contexto autenticado — nunca do cliente.
+	// HIGH-1: validacao fail-closed de formato UUID (nao apenas nao-vazio).
+	// TenantID DEVE vir EXCLUSIVAMENTE do contexto autenticado do servidor;
+	// nunca do payload do custodiante, do cliente externo nem de qualquer
+	// dado controlado pelo anunciante. Qualquer valor que nao seja UUID
+	// canonico (8-4-4-4-12) e rejeitado aqui antes de tocar RLS ou auditoria.
+	if req.TenantID == "" {
+		return fmt.Errorf("safe_webhook: SubmitPayout: TenantID obrigatorio (TX-3 — pseudonimo do contexto autenticado)")
+	}
+	if !reUUID.MatchString(req.TenantID) {
+		return fmt.Errorf("safe_webhook: SubmitPayout: TenantID formato UUID invalido (TX-3 — deve ser UUID canonico do contexto autenticado)")
+	}
 
 	// K6 — Passo 1: screening do endereco de destino.
 	// Fail-closed: sancao, risco alto ou screener indisponivel BLOQUEIA o payout.
-	// PII: nao loga to_address nem idempotency_key juntos (DA-11).
+	// PII: nao loga to_address nem tenant_id juntos (DA-11).
 	if h.screener != nil {
 		if req.ToAddress == "" {
 			h.logger.Warn("safe_webhook: SubmitPayout: to_address ausente com screener ativo — payout BLOQUEADO",
@@ -793,9 +812,9 @@ func (h *SafeWebhookHandler) SubmitPayout(ctx context.Context, req chainconnecto
 			return fmt.Errorf("%w: to_address ausente no PayoutRequest", ErrScreeningBlocked)
 		}
 		if err := h.screener.ScreenAddress(ctx, ScreenAddressParams{
-			// TenantID: nao disponivel no PayoutRequest; screener usa address+chain como
-			// identificador principal. Idempotencia por (address, direction, tx_ref).
-			TenantID:  "",
+			// TenantID: pseudonimo do contexto autenticado (TX-3).
+			// Alimenta a RLS do cofre compliance.screening_results.
+			TenantID:  req.TenantID,
 			Address:   req.ToAddress,
 			ChainID:   req.ChainID,
 			Direction: "payout",
@@ -807,7 +826,7 @@ func (h *SafeWebhookHandler) SubmitPayout(ctx context.Context, req chainconnecto
 				"chain_id", req.ChainID,
 				"direction", "payout",
 				"screening_err", err.Error(),
-				// PII: nao loga to_address (DA-11)
+				// DA-11: nao loga to_address nem tenant_id juntos
 			)
 			return fmt.Errorf("%w: %w", ErrScreeningBlocked, err)
 		}
@@ -818,6 +837,7 @@ func (h *SafeWebhookHandler) SubmitPayout(ctx context.Context, req chainconnecto
 	// ErrTravelRuleBelowThreshold nao e bloqueante — prossegue normalmente.
 	if h.travelRecorder != nil {
 		trErr := h.travelRecorder.RecordPayout(ctx, PayoutTravelRuleParams{
+			TenantID:         req.TenantID, // TX-3: pseudonimo do contexto autenticado
 			TxRef:            req.IdempotencyKey,
 			AmountMinorUnits: req.Amount.GetAmount(),
 			AssetCode:        req.Amount.GetAssetCode(),
