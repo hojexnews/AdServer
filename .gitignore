@@ -27,6 +27,7 @@ ml/.venv/
 ml/registry/artifacts/
 ml/registry/mlruns/
 ml/training/testdata/sample_train.parquet
+ml/fraud/testdata/*.parquet
 
 # Binarios Go compilados na raiz (saida de `go build`/`make dev-*-run`), nao versionar
 /decision
