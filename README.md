@@ -119,6 +119,51 @@ CA-1…CA-9→status em [tests/parity/](tests/parity/).
 
 ---
 
+## Estado atual — Fase 2 (otimização por ML + copiloto) **em andamento**
+
+A Fase 2 foi **aberta e sequenciada** em
+[ADR-0003](docs/adr/0003-fase-2-sequenciamento-ml-copiloto.md), que trava o ponto
+de extensão do ML na cascata (re-ranker **dentro** do estrato, fail-open por
+padrão — DA-3 segue autoridade final), o layout (`internal/ranker` + sidecar CPU
+via Unix socket; treino em `ml/`; copiloto em `services/copilot` atrás do BFF),
+resolve a pergunta aberta remanescente (§6.5 identidade cookieless: first-party/edge
+efêmero, sem PII central, fail-safe DA-6 mantido) e define **7 incrementos** (J0…J6).
+Nada de promover modelo sem **prova de uplift A/B + kill-switch**; HITL obrigatório
+em toda escrita do copiloto.
+
+### ✅ Entregue na Fase 2 (código-completo; serving real pende de infra/modelo)
+
+| Inc | Artefato | Local | Cobre |
+|---|---|---|---|
+| **J0** | Instrumentação de propensão no hot path (`propensity`/`exploration_policy`/`candidates[]`/`ml_fail_open`); `decision_id`+`model_version` ponta-a-ponta | [services/decision/](services/decision/) · [internal/cascade/](internal/cascade/) · [services/collector/](services/collector/) | Loop de atribuição (TX-1); pré-requisito de OPE; golden da Fase 1 **intactos** |
+| **—** | Spec única de featurização (anti-skew Go↔Python) + teste de paridade por fixtures gold | [ml/features/](ml/features/) | função única (TX-4/TX-5); 23 features PII-free, `feature_spec_version` |
+| **J1** | Re-ranker `internal/ranker` (featurização Go, IPC UDS, **timeout duro + fail-open**) + `ranker-sidecar` (ONNX, modelo dummy) atrás de `RANKER_ENABLED` (off) | [internal/ranker/](internal/ranker/) · [services/ranker-sidecar/](services/ranker-sidecar/) | TX-4; DA-3 (re-rank só no estrato); eCPM=pCTR×bid em minor-units (TX-2) |
+| **J2** | Treino pCTR LightGBM→ONNX + calibração isotônica (ECE) + MLflow registry | [ml/training/](ml/training/) · [ml/calibration/](ml/calibration/) · [ml/registry/](ml/registry/) | anti-skew; treino lê Iceberg (dados reais pendem de infra) |
+| **J5** | Copiloto LangGraph (HITL obrigatório, ferramentas tipadas server-side, roteamento Haiku/Sonnet/Opus, Haiku-as-judge fail-closed) + RAG pgvector RLS + C2PA; rota BFF + UI (SSE, diff HITL, builder anti-contradição, WCAG 2.2 AA) | [services/copilot/](services/copilot/) · [db/vector/](db/vector/) · [bff/](bff/) · [web/console/](web/console/) | TX-3 (isolamento + HITL); TX-5 (sem PII); EU AI Act Art. 50 |
+
+**Gates verdes (re-auditados):** `security-reviewer` **PASSA** (2 CRITICAL + 4 HIGH
+remediados — IDOR cross-tenant no HITL, XSS do ad tag via iframe sandbox, HMAC
+interno fail-closed no boot+runtime, `set_config` parametrizado + schema RLS, judge
+fail-closed, SSE com tenant server-side + denylist de headers, CSRF no BFF);
+`privacy-compliance-auditor` **APROVADO**; `parity-golden-test-guardian` **PASSA**
+(golden da Fase 1 intactos, ordem stub-idêntica à cascata, DA-3 confinado, paridade
+Go↔Python); `money-ledger-guardian` **PASSA** (eCPM=pCTR×bid em minor-units, sem
+float em dinheiro). `make verify` + `go test ./...` + pytest do copiloto +
+typecheck/build de web/bff **verdes**.
+
+### ⏭️ Pendente para fechar a Fase 2
+
+**Incrementos restantes** (dependem de J1/J2 maduros e de runtime/A-B): **J3** (OPE
+IPS/SNIPS/DR sobre propensão logada + shadow do ranker), **J4** (A/B por
+zona/tenant + kill-switch + promoção de `model_version`), **J6** (pacing
+proporcional DA-4 + fraude/IVT na ingestão). **Pendente de ambiente/modelo:** ONNX
+Runtime nativo no sidecar (hoje stub); dados reais no Iceberg para treinar o pCTR;
+`ANTHROPIC_API_KEY` + pgvector + Langfuse self-hosted para o copiloto vivo; RLS
+executável do RAG + teste de isolamento com Postgres real; `SESSION_SECRET`/OpenBao
+para o fail-closed do middleware Next em produção.
+
+---
+
 ## Layout do repositório
 
 ```text
