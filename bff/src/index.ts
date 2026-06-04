@@ -11,6 +11,10 @@
  *   NUNCA de parâmetros do cliente. Cada query injeta o tenant_id
  *   via SET LOCAL adserver.tenant_id no Postgres (RLS) ou filtro
  *   explícito no ClickHouse.
+ *
+ * CSRF (M1):
+ *   createContext recebe o método HTTP para verificar Origin/X-Requested-With
+ *   em mutations POST (hitlApprove, hitlReject, chat).
  */
 
 import { createHTTPServer } from "@trpc/server/adapters/standalone";
@@ -56,7 +60,16 @@ const server = createHTTPServer({
     for (const [key, value] of Object.entries(req.headers)) {
       headers[key] = value as string | string[] | undefined;
     }
-    return createContext({ req: { headers } });
+    // Passa o método HTTP para que createContext possa verificar CSRF em mutations (M1).
+    // req.method pode ser undefined (Node.js IncomingMessage); passamos condicionalmente
+    // para satisfazer exactOptionalPropertyTypes: method só está presente se não-undefined.
+    const ctxReq: { headers: Record<string, string | string[] | undefined>; method?: string } = {
+      headers,
+    };
+    if (req.method !== undefined) {
+      ctxReq.method = req.method;
+    }
+    return createContext({ req: ctxReq });
   },
 });
 

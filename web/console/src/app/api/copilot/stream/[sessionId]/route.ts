@@ -1,29 +1,39 @@
 /**
  * GET /api/copilot/stream/[sessionId]
  *
- * Rota HTTP raw (App Router) — proxy SSE do BFF para o front.
- * Esta rota NAO é tRPC: SSE exige streaming de resposta que tRPC nao suporta nativamente.
+ * Rota HTTP raw (App Router) — proxy SSE do copiloto para o front.
+ * Esta rota NAO é tRPC: SSE exige streaming de resposta que tRPC não suporta.
  *
  * FLUXO:
- *   Front (EventSource) → esta rota Next.js → BFF standalone (POST /v1/chat ou SSE)
- *   → services/copilot Python → LangGraph
+ *   Front (EventSource) → esta rota Next.js → BFF/serviço copiloto Python
+ *   → LangGraph
  *
- * SEGURANÇA (TX-3 / security-reviewer):
- *   - tenant_id extraído do header de sessão X-Adserver-Session-Tenant (server-side).
- *   - NUNCA lido de query string, body ou cookie enviado pelo cliente.
+ * SEGURANÇA (TX-3 / CA-1 / H4 corrigido):
+ *   - O middleware (src/middleware.ts) REMOVE todos os headers X-Adserver-* e X-Tenant-*
+ *     que venham do browser ANTES de atingir esta rota (denylist).
+ *   - O middleware injeta X-Adserver-Session-Tenant EXCLUSIVAMENTE a partir do
+ *     cookie de sessão HttpOnly verificado criptograficamente.
+ *   - Esta rota lê o tenant_id DE x-adserver-session-tenant que, neste ponto,
+ *     é garantidamente server-side (middleware Edge Runtime, não o browser).
+ *   - Dupla verificação: o header é re-validado como UUID aqui.
  *   - HMAC gerado com COPILOT_INTERNAL_SECRET (OpenBao) — NUNCA exposto ao front.
  *   - A chave ANTHROPIC_API_KEY fica no copiloto Python; este arquivo nunca a lê.
  *   - sessionId da URL é validado como UUID antes de repassar.
  *   - Cache-Control: no-cache + X-Accel-Buffering: no para garantir streaming.
  *
+ * ENDPOINT UPSTREAM (H4 corrigido):
+ *   O services/copilot expõe POST /v1/chat (SSE streaming).
+ *   NÃO existe /v1/stream/:sessionId — endpoint corrigido para POST /v1/chat
+ *   com X-Session-ID no header para checkpointing (retomar grafo pausado).
+ *   Contrato confirmado em services/copilot/app/server.py.
+ *
  * INVARIANTE:
- *   Esta rota apenas faz proxy do stream SSE. Nao inicia escritas, nao aprova HITL.
+ *   Esta rota apenas faz proxy do stream SSE. Não inicia escritas, não aprova HITL.
  *   A aprovação HITL é feita via tRPC copilot.hitlApprove (bff/src/routers/copilot.ts).
  *
- * Para backend vivo:
- *   - COPILOT_SERVICE_URL: URL interna do copiloto (ex.: http://copilot:8001)
- *   - COPILOT_INTERNAL_SECRET: segredo HMAC compartilhado com o copiloto Python
- *   Ambos via OpenBao; ausentes em dev → modo dev-skip (SKIP_AUTH_DEV=true no copiloto).
+ * Variáveis de ambiente (OpenBao):
+ *   COPILOT_SERVICE_URL      — URL interna do copiloto (ex.: http://copilot:8001)
+ *   COPILOT_INTERNAL_SECRET  — segredo HMAC compartilhado com o copiloto Python
  */
 
 import { type NextRequest, NextResponse } from "next/server";
@@ -85,8 +95,16 @@ export async function GET(
     return NextResponse.json({ error: "sessionId inválido" }, { status: 400 });
   }
 
-  // Extrai tenant_id do header de sessão (server-side — NUNCA do cliente)
-  // Em produção: middleware de auth injeta X-Adserver-Session-Tenant
+  // ---------------------------------------------------------------------------
+  // Extrai tenant_id do header injetado pelo middleware (server-side).
+  //
+  // GARANTIA (H4): o middleware (src/middleware.ts) executa antes desta rota e:
+  //   a) Remove todos os headers X-Adserver-* que venham do browser (denylist).
+  //   b) Injeta x-adserver-session-tenant EXCLUSIVAMENTE do cookie HttpOnly
+  //      verificado por HMAC/JWT.
+  // Portanto, este header não pode ser forjado pelo browser.
+  // A re-validação UUID abaixo é defense-in-depth.
+  // ---------------------------------------------------------------------------
   const rawTenant = request.headers.get("x-adserver-session-tenant");
   if (!rawTenant) {
     return NextResponse.json(
@@ -106,25 +124,46 @@ export async function GET(
   const tenantId = tenantParsed.data;
   const internalHeaders = makeInternalHeaders(tenantId);
 
-  // Abre o stream SSE com o copiloto Python via BFF
-  // O copiloto usa X-Session-ID para retomar o grafo pausado (checkpointing)
+  // ---------------------------------------------------------------------------
+  // Abre o stream SSE com o copiloto Python.
+  //
+  // ENDPOINT CORRETO (H4 corrigido):
+  //   O services/copilot expõe POST /v1/chat com SSE streaming.
+  //   O header X-Session-ID permite ao LangGraph retomar o grafo pausado
+  //   (checkpointing por thread_id).
+  //
+  //   NÃO existe /v1/stream/:sessionId no FastAPI — endpoint anterior era inválido.
+  //   Contrato: services/copilot/app/server.py @app.post("/v1/chat")
+  //
+  // NOTA: esta rota SSE retoma uma sessão existente (sessionId já criado pelo
+  //   copilot.chat tRPC mutation). O body é vazio pois a mensagem já foi enviada;
+  //   o copiloto reconhece o thread_id e continua o grafo de onde parou.
+  //   Para a primeira mensagem, o BFF chama POST /v1/chat via tRPC copilot.chat
+  //   e o front usa o streamUrl retornado para abrir este EventSource.
+  // ---------------------------------------------------------------------------
   let upstream: Response;
   try {
-    upstream = await fetch(`${COPILOT_SERVICE_URL}/v1/stream/${parsed.data}`, {
-      method: "GET",
+    upstream = await fetch(`${COPILOT_SERVICE_URL}/v1/chat`, {
+      method: "POST",
       headers: {
         ...internalHeaders,
         "X-Session-ID": parsed.data,
+        "Content-Type": "application/json",
         Accept: "text/event-stream",
         "Cache-Control": "no-cache",
       },
+      // Body mínimo: mensagem vazia sinalizando retomada de sessão existente.
+      // O copiloto identifica a sessão pelo X-Session-ID (thread_id) e retoma
+      // o grafo pausado sem reprocessar a mensagem original.
+      body: JSON.stringify({ message: "", model_tier: null }),
       // Next.js fetch: desabilita cache para streaming
+      // @ts-expect-error — duplex requerido pelo Node.js para streaming POST
+      duplex: "half",
       cache: "no-store",
     });
   } catch {
     // Serviço indisponível — emite evento SSE de erro ao front
-    const errorBody =
-      `event: error\ndata: ${JSON.stringify({ type: "error", message: "Copiloto temporariamente indisponível." })}\n\n`;
+    const errorBody = `event: error\ndata: ${JSON.stringify({ type: "error", message: "Copiloto temporariamente indisponível." })}\n\n`;
     return new Response(errorBody, {
       status: 200, // SSE: status 200 mesmo para erros lógicos
       headers: sseHeaders(),
@@ -132,8 +171,7 @@ export async function GET(
   }
 
   if (!upstream.ok || !upstream.body) {
-    const errorBody =
-      `event: error\ndata: ${JSON.stringify({ type: "error", message: "Erro interno do copiloto." })}\n\n`;
+    const errorBody = `event: error\ndata: ${JSON.stringify({ type: "error", message: "Erro interno do copiloto." })}\n\n`;
     return new Response(errorBody, {
       status: 200,
       headers: sseHeaders(),

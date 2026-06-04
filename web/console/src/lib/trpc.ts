@@ -4,6 +4,11 @@
  * SEGURANÇA (CA-1): o cliente NUNCA envia tenant_id.
  * O BFF resolve tenant_id da sessão HTTP-only server-side.
  *
+ * CSRF (M1): o cliente envia X-Requested-With: XMLHttpRequest em todas as
+ * chamadas tRPC. O BFF (bff/src/lib/context.ts) exige esse header em mutations
+ * POST como segunda linha de defesa CSRF (browsers cross-site não enviam
+ * headers customizados sem preflight CORS).
+ *
  * Money: toda quantia monetária vem do BFF como string DECIMAL + currency.
  * O cliente usa formatMoney() de @/lib/money para exibir — nunca Number().
  */
@@ -19,9 +24,14 @@ export function createTrpcClient() {
     links: [
       httpBatchLink({
         url: "/api/trpc",
-        // Sem envio de tenant_id — resolvido server-side no BFF
         headers() {
-          return {};
+          return {
+            // CSRF defense-in-depth (M1):
+            // browsers cross-site não enviam headers customizados sem CORS preflight.
+            // O BFF rejeita mutations POST que não carreguem este header.
+            "X-Requested-With": "XMLHttpRequest",
+            // Sem envio de tenant_id — resolvido server-side no BFF
+          };
         },
       }),
     ],

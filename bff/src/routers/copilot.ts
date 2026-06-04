@@ -31,6 +31,13 @@
  *   - O body do request do cliente é passado como-está ao copiloto, mas o
  *     copiloto ignora qualquer tenant_id/credencial no body (TX-3).
  *
+ * ESPELHO C1 (defense-in-depth — M1/C1):
+ *   - hitlApprove e hitlReject SEMPRE encaminham ctx.tenantId ao copiloto.
+ *   - O BFF rejeita qualquer threadId que não atenda à validação UUID antes de
+ *     encaminhar ao copiloto (early reject, evita round-trip desnecessário).
+ *   - O check autoritativo de posse thread_id↔tenant é feito pelo copiloto (C1).
+ *     O BFF não enfraquece esse check: nunca aceita tenant_id do body do cliente.
+ *
  * CREDENCIAL NECESSÁRIA:
  *   - COPILOT_SERVICE_URL: URL interna do copiloto (ex.: http://copilot:8001)
  *   - COPILOT_INTERNAL_SECRET: segredo HMAC (mesmo do CopilotSettings Python)
@@ -98,13 +105,19 @@ const ChatInputSchema = z.object({
 });
 
 const HitlApproveInputSchema = z.object({
-  threadId: z.string().min(1),
+  /**
+   * threadId deve ser UUID (alinhado com o sessionId gerado pelo BFF).
+   * Validação UUID aqui é o pré-check de posse do BFF (espelho C1):
+   * rejeita formatos inválidos antes de consultar o copiloto.
+   */
+  threadId: z.string().uuid(),
   approved: z.boolean(),
   reason: z.string().max(500).default(""),
 });
 
 const HitlRejectInputSchema = z.object({
-  threadId: z.string().min(1),
+  /** Mesma validação UUID que hitlApprove (espelho C1). */
+  threadId: z.string().uuid(),
   reason: z.string().max(500),
 });
 
@@ -122,7 +135,7 @@ export function createCopilotRouter() {
      * copilot.chat — Inicia ou continua uma sessão de chat com o copiloto.
      *
      * RETORNO: Este endpoint retorna uma URL de SSE que o front deve consumir.
-     * O streaming real acontece via GET /copilot/stream/{sessionId} (ver abaixo).
+     * O streaming real acontece via GET /api/copilot/stream/{sessionId}.
      *
      * ALTERNATIVA: usar uma subscription tRPC se o BFF evoluir para WebSocket.
      * Por ora SSE é o canal único (§2.5).
@@ -130,7 +143,7 @@ export function createCopilotRouter() {
      * NOTA PARA O FRONTEND-BFF-ENGINEER:
      *   O front deve:
      *   1. Chamar este mutation para obter o sessionId e threadId.
-     *   2. Abrir um EventSource para /copilot/stream/{sessionId}.
+     *   2. Abrir um EventSource para /api/copilot/stream/{sessionId}.
      *   3. Ao receber evento "hitl_required", exibir o diff ao usuário.
      *   4. Chamar copilot.hitlApprove ou copilot.hitlReject com threadId.
      */
@@ -141,11 +154,6 @@ export function createCopilotRouter() {
         const sessionId = input.sessionId ?? crypto.randomUUID();
 
         const internalHeaders = makeInternalHeaders(tenantId);
-
-        // O BFF faz a chamada ao copiloto Python de forma assíncrona
-        // e retorna o sessionId para o front abrir o stream SSE.
-        // Em produção: iniciar o grafo e retornar imediatamente; o stream
-        // é consumido pelo front via /copilot/stream/:sessionId (abaixo).
 
         try {
           // Validação prévia: o copiloto está up?
@@ -182,17 +190,24 @@ export function createCopilotRouter() {
      * Chamado pelo front quando o usuário clica em "Aplicar" no diff review.
      * O BFF encaminha para o copiloto Python que retoma o grafo pausado.
      *
-     * INVARIANTE (TX-3):
-     *   - tenant_id vem de ctx.tenantId (sessão), nunca do body.
-     *   - O BFF valida que o threadId pertence ao tenant da sessão.
-     *     (em produção: verificar no Redis/checkpointer que thread_id.tenant == tenantId)
+     * INVARIANTE (TX-3 / espelho C1):
+     *   - tenant_id vem de ctx.tenantId (sessão), NUNCA do body.
+     *   - threadId é validado como UUID pelo schema Zod (pré-check do BFF).
+     *   - O BFF SEMPRE encaminha ctx.tenantId ao copiloto via X-Tenant-ID (HMAC).
+     *   - O check autoritativo de posse thread_id↔tenant é feito pelo copiloto (C1).
+     *     O BFF não enfraquece esse check; apenas rejeita UUIDs malformados cedo.
+     *   - Em produção: adicionar verificação no Redis/checkpointer que
+     *     thread_id.tenant == tenantId antes de chamar o copiloto.
      */
     hitlApprove: tenantProcedure
       .input(HitlApproveInputSchema)
       .mutation(async ({ ctx, input }) => {
+        // ESPELHO C1: tenantId vem EXCLUSIVAMENTE da sessão autenticada.
+        // Nunca do input do cliente. O copiloto recebe tenantId via HMAC (X-Tenant-ID).
         const tenantId = ctx.tenantId;
+
         const headers = {
-          ...makeInternalHeaders(tenantId),
+          ...makeInternalHeaders(tenantId), // injeta X-Tenant-ID com HMAC
           "Content-Type": "application/json",
           "X-Session-ID": input.threadId,
         };
@@ -232,13 +247,20 @@ export function createCopilotRouter() {
 
     /**
      * copilot.hitlReject — Rejeita a escrita pendente de HITL.
+     *
+     * INVARIANTE (TX-3 / espelho C1): idêntico ao hitlApprove.
+     *   - tenant_id SEMPRE de ctx.tenantId; NUNCA do body.
+     *   - threadId validado como UUID pelo schema.
+     *   - X-Tenant-ID encaminhado ao copiloto via HMAC.
      */
     hitlReject: tenantProcedure
       .input(HitlRejectInputSchema)
       .mutation(async ({ ctx, input }) => {
+        // ESPELHO C1: tenantId vem EXCLUSIVAMENTE da sessão autenticada.
         const tenantId = ctx.tenantId;
+
         const headers = {
-          ...makeInternalHeaders(tenantId),
+          ...makeInternalHeaders(tenantId), // injeta X-Tenant-ID com HMAC
           "Content-Type": "application/json",
           "X-Session-ID": input.threadId,
         };
@@ -310,35 +332,13 @@ export function createCopilotRouter() {
 /**
  * NOTA PARA O FRONTEND-BFF-ENGINEER:
  *
- * O endpoint SSE `/api/copilot/stream/:sessionId` deve ser implementado
- * como uma rota HTTP raw (não tRPC) no Next.js API route ou no servidor
- * standalone do BFF, pois SSE exige streaming de resposta que tRPC não
- * suporta nativamente.
+ * O endpoint SSE `/api/copilot/stream/:sessionId` é implementado como uma
+ * rota HTTP raw (não tRPC) em web/console/src/app/api/copilot/stream/[sessionId]/route.ts.
  *
- * Exemplo de implementação Next.js API route:
- *   // pages/api/copilot/stream/[sessionId].ts
- *   export async function GET(req, { params }) {
- *     const { sessionId } = params;
- *     const tenantId = getTenantFromSession(req); // da sessão autenticada
- *     const headers = makeInternalHeaders(tenantId);
- *
- *     const upstream = await fetch(
- *       `${COPILOT_SERVICE_URL}/v1/chat`,
- *       {
- *         method: "POST",
- *         headers: { ...headers, "Content-Type": "application/json", "X-Session-ID": sessionId },
- *         body: JSON.stringify({ message: req.body.message, model_tier: req.body.modelTier }),
- *       }
- *     );
- *
- *     return new Response(upstream.body, {
- *       headers: {
- *         "Content-Type": "text/event-stream",
- *         "Cache-Control": "no-cache",
- *         "X-Accel-Buffering": "no",
- *       },
- *     });
- *   }
+ * UPSTREAM CORRETO (H4 corrigido):
+ *   O copiloto Python expõe POST /v1/chat com SSE streaming.
+ *   NÃO existe /v1/stream/:sessionId.
+ *   O header X-Session-ID carrega o thread_id para checkpointing LangGraph.
  *
  * EVENTOS SSE EMITIDOS PELO COPILOTO (a UI deve consumir):
  *   event: token     → {"text": "..."}  (streaming de texto do agente)
