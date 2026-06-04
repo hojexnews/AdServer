@@ -23,10 +23,19 @@ ml/.venv/
 
 # Modelos e artefatos binarios de ML — gerenciados pelo MLflow registry, nao pelo git
 # ADR-0003 §F: "Modelos compilados (ONNX/Treelite) NAO sao versionados no git como blobs"
-ml/registry/artifacts/*.onnx
-ml/registry/artifacts/*.lgb
+# Toda a pasta de artefatos de treino e saida gerada (onnx/lgb/calibration/reliability).
+ml/registry/artifacts/
 ml/registry/mlruns/
 ml/training/testdata/sample_train.parquet
+
+# Binarios Go compilados na raiz (saida de `go build`/`make dev-*-run`), nao versionar
+/decision
+/collector
+/adtag
+/ranker-sidecar
+
+# Cache incremental do TypeScript (build artifact, nao versionar)
+*.tsbuildinfo
 
 # Node.js / web e BFF (nunca commitar node_modules)
 node_modules/
