@@ -18,8 +18,12 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Python virtual environment (ml/  usa ml/.venv)
+# Python build/packaging artifacts (gerados por pip install -e / build)
+*.egg-info/
+
+# Python virtual environment (ml/ usa ml/.venv; copilot usa services/copilot/.venv)
 ml/.venv/
+services/copilot/.venv/
 
 # Modelos e artefatos binarios de ML — gerenciados pelo MLflow registry, nao pelo git
 # ADR-0003 §F: "Modelos compilados (ONNX/Treelite) NAO sao versionados no git como blobs"
