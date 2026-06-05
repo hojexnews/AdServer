@@ -286,8 +286,29 @@ externa; CI sem `pull_request_target`, token mínimo, downloads com checksum); `
 ser cosmética); `parity-golden-test-guardian` **PASS** (smoke fora do hot path; golden/dual-run/shadow
 verdes; deep default-off, K8 não promovido). **Sweep pré-go-live verde:** `make verify` (buf TX-1 +
 no-float TX-2) + `go test ./...` (todos os pacotes) + **BFF 51 testes** + **ml/ + data/ 197 pytest** +
-smoke de pagamentos **PASS=20** + RLS do ledger **33 PASS** (2 ciclos up/down/up). *(Coleção do pytest de
-`services/copilot` falha por `pydantic_settings` ausente — gap de ambiente, fora desta onda.)*
+smoke de pagamentos **PASS=20** + RLS do ledger **33 PASS** (2 ciclos up/down/up). *(A coleção do pytest de
+`services/copilot` falhava por `pydantic_settings` ausente — diagnosticado e fechado na 5ª onda abaixo: era
+defeito de empacotamento, não gap de ambiente.)*
+
+### ✅ Entregue na Fase 3 — 5ª onda: build-backend do copiloto (sob ADR-0004, sem ADR novo; gates verdes)
+
+Micro-onda de **uma tarefa**, triada pelo `tech-lead-architect` com veredito de que era o **único item
+código-endereçável genuíno** restante na `main` (todo o resto é infra/spec viva externa — a regra de ouro
+proíbe inventar escopo). O que a 4ª onda registrou como "gap de ambiente: `pydantic_settings` ausente" era,
+na raiz, um **defeito de empacotamento**: [services/copilot/pyproject.toml:3](services/copilot/pyproject.toml#L3)
+declarava `build-backend = "setuptools.backends.legacy:build"` — entry point **inexistente** que fazia
+`pip install -e` falhar na resolução PEP 517 **antes** de instalar qualquer dependência (inclusive a
+`pydantic-settings` já corretamente declarada). `copilot-llm` corrigiu para o canônico `"setuptools.build_meta"`
+(1 linha); prova em venv efêmero: instalação sem erro de backend + **pytest 125 PASS / 0 FAIL** (a coleção
+deixou de falhar). +`.gitignore`: `*.egg-info/` e `services/copilot/.venv/`.
+
+**Gates verdes (5ª onda):** `parity-golden-test-guardian` **PASS** (diff de 1 linha, zero toque no hot
+path/contratos/dinheiro; sweep canônico verde: `make verify` + `go test ./...` + **BFF 51** + **ml/+data/
+197 pytest**); `privacy-compliance-auditor` **APROVADO** (mudança só de build-backend; TX-3/TX-5/DA-11 do
+copiloto intocados; nenhum guardrail relaxado). `security-reviewer`/`money-ledger-guardian` **não acionados**
+— zero superfície de rede/segredo/dinheiro/contrato (a regra de ouro vale para os gates também). Veredito do
+arquiteto após esta onda: **a `main` está genuinamente esgotada em código** — o próximo movimento real é
+infra/spec viva externa.
 
 ### ⏭️ Pendente da Fase 3
 
