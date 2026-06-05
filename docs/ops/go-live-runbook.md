@@ -79,7 +79,7 @@ em conta cloud isolada). Nunca aplicar na mesma instancia dos demais schemas —
 separacao de instancia e parte do isolamento de PII/KYC (ADR-0004 §F / DA-11).
 
 A camada de aplicacao ja esta pronta: cifra KMS-envelope da PII (`v1$` versionado) em
-`services/compliance/internal/pii/envelope.go`. O que falta e a chave real (ver §3).
+`services/payments/internal/kmsenvelope/kmsenvelope.go`. O que falta e a chave real (ver §3).
 
 ### 2.6 ClickHouse (schema de analytics)
 
@@ -104,7 +104,7 @@ arquivo git ou ConfigMap em texto plano. Tudo via OpenBao com Pod Identity (IRSA
 
 | Segredo | Path OpenBao | Observacao |
 |---------|-------------|------------|
-| `PII_ENVELOPE_KEY` | `secret/aml-kyc/pii-envelope-key` | Chave AES-256 para envelope KMS sobre dados KYC/Travel Rule. Deve ser gerada em KMS/HSM real (AWS KMS ou equivalente). A camada de codigo ja usa cifra versionada `v1$` em `services/compliance/internal/pii/envelope.go`. O que falta e substituir o stub local pela chave real. |
+| `PII_ENVELOPE_KEY` | `secret/aml-kyc/pii-envelope-key` | Chave AES-256 para envelope KMS sobre dados KYC/Travel Rule. Deve ser gerada em KMS/HSM real (AWS KMS ou equivalente). A camada de codigo ja usa cifra versionada `v1$` em `services/payments/internal/kmsenvelope/kmsenvelope.go`. O que falta e substituir o stub local pela chave real. |
 
 Rotacao: a chave e versionada (prefixo `v1$`); rotacionar requer re-cifrar os registros
 existentes com a nova chave antes de desabilitar a antiga — procedimento separado de
