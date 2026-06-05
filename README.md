@@ -310,6 +310,29 @@ copiloto intocados; nenhum guardrail relaxado). `security-reviewer`/`money-ledge
 arquiteto após esta onda: **a `main` está genuinamente esgotada em código** — o próximo movimento real é
 infra/spec viva externa.
 
+### ✅ Entregue na Fase 3 — 6ª onda: exatidão de go-live + higiene de repo (sob ADR-0004, sem ADR novo; gate verde)
+
+Micro-onda de **dois itens** (paralelos, donos distintos), triada pelo `tech-lead-architect` numa
+re-triagem fresca da `main` pós-5ª onda. Re-confirmou o veredito de esgotamento para escopo de
+produto/feature, mas encontrou **dois defeitos código-endereçáveis reais** da mesma classe da 5ª onda
+(doc/higiene, não invenção de escopo):
+
+- **Drift de caminho no runbook** (`platform-infra-engineer`): [docs/ops/go-live-runbook.md](docs/ops/go-live-runbook.md)
+  §2.5 e §3.1 apontavam 2× para `services/compliance/internal/pii/envelope.go` — caminho **inexistente** —
+  exatamente no passo mais crítico do cutover (injeção da chave real `PII_ENVELOPE_KEY`). Corrigido para o
+  módulo real [services/payments/internal/kmsenvelope/kmsenvelope.go](services/payments/internal/kmsenvelope/kmsenvelope.go)
+  (cifra `v1$` versionada AES-256-GCM, fail-closed, `amount_minor_units` nunca cifrado), usado por
+  `travelrule.go`/`sumsub.go` antes do INSERT no cofre de compliance.
+- **`.pyc` rastreado** (`data-platform-engineer`): `data/iceberg/jobs/__pycache__/iceberg_sink_job.cpython-312.pyc`
+  estava em HEAD violando o próprio `.gitignore` (linhas 17–18). `git rm --cached` (artefato regenerável).
+
+**Gate verde (6ª onda):** `privacy-compliance-auditor` **APROVADO** — conserto puro de ponteiro; nenhum
+controle (DA-11 isolamento de instância, TX-3 PII cifrada/pseudônima, TX-5 redação OTel, KMS/HSM real,
+allowlist fail-closed) removido ou afrouxado, 0 PII nova. `parity`/`money`/`security` **não acionados** —
+zero superfície de hot path/dinheiro/rede/contrato. Veredito do arquiteto após esta onda: estes dois itens
+eram a **última poeira** do mesmo tipo da 5ª onda; a `main` permanece **genuinamente esgotada em código** e
+o próximo movimento real é exclusivamente **infra/spec viva externa**.
+
 ### ⏭️ Pendente da Fase 3
 
 **K8** (promoção do deep ranking sob **uplift A/B + kill-switch**) segue **gated por
