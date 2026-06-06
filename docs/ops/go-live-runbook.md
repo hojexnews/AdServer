@@ -209,11 +209,21 @@ numa maquina com `npm install` ja executado — ver `make/go.mk`).
 ### Passo 5 — Suites BFF/pytest
 
 ```bash
-# BFF (Node/TypeScript)
-cd bff && npm test
-# ML (pytest)
-cd ml && pytest
+# BFF (Node/TypeScript) — typecheck + lint + 51 testes
+make bff-ci
+
+# ML — OPE, features, training, calibration, promote (make ml-test)
+#      + pacing e fraud (make ml-batch-test)
+#      + DDL/IVT de ClickHouse (make data-validate)
+make ml-test && make ml-batch-test && make data-validate
+
+# Copiloto — sem alvo make proprio; usar diretamente com PYTHONPATH correto
+PYTHONPATH=. ml/.venv/bin/python -m pytest services/copilot/tests/
 ```
+
+Os alvos `make` sao obrigatorios: os de Node filtram `node_modules/` (mesmo motivo do
+Passo 4) e os de Python injetam `PYTHONPATH=.` na raiz do repositorio — sem isso,
+`cd ml && pytest` falha com `ModuleNotFoundError: No module named 'ml'`.
 
 ### Passo 6 — Validacao de plataforma
 
