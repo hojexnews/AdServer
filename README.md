@@ -352,6 +352,36 @@ pelo `go mod tidy` (import é direto em produção).
 confirmada: os índices de feature `geo_country_hash`, `geo_city_hash` e `device_class_hash` produzem os mesmos
 valores antes e após o swap, provado pelos fixtures em `ml/features/testdata/parity_cases.json`.
 
+### ✅ Entregue na Fase 3 — 8ª onda: contrato de paridade sincronizado + higiene de teste do copiloto (sob ADR-0004, sem ADR novo; gates verdes)
+
+Micro-onda de **dois itens** (paralelos, donos distintos), triada pelo `tech-lead-architect` numa
+re-triagem fresca da `main` pós-7ª onda. Sweep de saúde **todo verde com saída real verificada** (Go `-race`
+27 pacotes ok, `buf breaking` BACKWARD ok, `ml/`+`data/` **197 pytest**, copiloto **125 pytest**, BFF **51**);
+veredito de esgotamento de **feature** reconfirmado — e, como nas ondas 5/6/7, a re-triagem achou **dois
+defeitos código-endereçáveis reais** da mesma classe (drift/higiene, não invenção de escopo):
+
+- **Drift do contrato de paridade** (`ml-optimization-engineer`): a 7ª onda trocou a implementação de hash para
+  `twmb/murmur3`, mas o **contrato canônico de paridade cross-language** ainda documentava a lib morta
+  `spaolacci/murmur3` em 4 locais — a spec que **prova** a identidade byte-a-byte do hash Go↔Python mentia
+  sobre qual lib é canônica. Sincronizado em [ml/features/go/parity_contract.go](ml/features/go/parity_contract.go)
+  (bloco "HASH CANONICO"), [ml/features/spec/feature_spec.yaml](ml/features/spec/feature_spec.yaml) (`hash_seed_note`)
+  e [ml/features/README.md](ml/features/README.md) (incl. a instrução acionável "adicionar ao `go.mod`", que
+  apontava para a lib morta). Registros **históricos** do swap em `README.md` (raiz) e
+  [docs/ops/go-live-runbook.md](docs/ops/go-live-runbook.md) foram preservados (são changelog, não spec).
+- **Higiene de teste do copiloto** (`copilot-llm-engineer`): `@pytest.mark.asyncio` em **nível de classe** em
+  `services/copilot/tests/test_security.py` cascateava para métodos síncronos, gerando 5 `PytestWarning`
+  (que o pytest-asyncio promove a erro duro em major futura). Sob `asyncio_mode = "auto"` o mark de classe é
+  redundante para async e errado para síncronos; removido — métodos async seguem autodetectados.
+
+**Gates verdes (8ª onda):** `parity-golden-test-guardian` **APROVADO** (revisão adversarial obrigatória do T1) —
+identidade byte-a-byte **provada** nos 11 pares de fixture (`geo_country_hash`/`geo_city_hash`/`device_class_hash`,
+Go `twmb/murmur3.SeedSum32` ≡ Python `mmh3`), assinatura documentada bate com `featurize.go:328`, **zero** ref
+órfã de `spaolacci` em spec/contrato (só as 3 históricas), escopo doc-only; `go test -count=1 -race ./...`
+(27 pacotes ok) + `make verify` verde. Copiloto: **125 passed, 0 warnings** (5 `PytestWarning` eliminados).
+`privacy`/`money`/`security` **não acionados** — zero superfície de PII/dinheiro/rede/contrato de evento
+(a regra de ouro vale para os gates). Veredito do arquiteto: a `main` permanece **genuinamente esgotada em
+código** para escopo de produto; o próximo movimento real segue sendo exclusivamente **infra/spec viva externa**.
+
 ### ⏭️ Pendente da Fase 3
 
 **K8** (promoção do deep ranking sob **uplift A/B + kill-switch**) segue **gated por
