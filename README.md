@@ -333,6 +333,25 @@ zero superfície de hot path/dinheiro/rede/contrato. Veredito do arquiteto após
 eram a **última poeira** do mesmo tipo da 5ª onda; a `main` permanece **genuinamente esgotada em código** e
 o próximo movimento real é exclusivamente **infra/spec viva externa**.
 
+### ✅ Entregue na Fase 3 — 7ª onda: swap `spaolacci`→`twmb/murmur3` (gate `-race` vermelho; sob ADR-0004, sem ADR novo; gate verde)
+
+Defeito real identificado pelo `tech-lead-architect` na re-triagem: `go test -count=1 -race ./internal/ranker/...`
+falhava com `fatal error: checkptr: pointer arithmetic result points to invalid allocation` em
+`spaolacci/murmur3.Sum32WithSeed` — lib não mantida desde 2018, com aritmética `unsafe` incompatível com
+o `checkptr` do Go 1.26. Sem `-race` passava; o defeito era invisível fora do CI canônico.
+
+Fix: `github.com/spaolacci/murmur3 v1.1.0` → `github.com/twmb/murmur3 v1.1.8` em `internal/ranker/featurize.go`
+e `go.mod`. A nova lib usa `bits.RotateLeft32` (sem `unsafe`), implementa o mesmo MurmurHash3 x86_32 canônico
+e expõe `SeedSum32(seed, data)` — a chamada foi atualizada de `Sum32WithSeed(data, seed)` para `SeedSum32(seed, data)`;
+a lógica de `featureHash` e os seeds não foram tocados. A marca `// indirect` incorreta no `go.mod` foi corrigida
+pelo `go mod tidy` (import é direto em produção).
+
+**Gate verde (7ª onda):** `go build ./...` + `go vet ./...` + `go test -count=1 -race ./internal/ranker/...` (ok) +
+`go test -count=1 -race ./...` (27 pacotes ok, sem checkptr crash) + `make parity-golden-short` (ok) +
+`TestParityFromFixtures` (5/5 casos PASS) — identidade byte-a-byte do hash Go contra o oráculo Python (`mmh3`)
+confirmada: os índices de feature `geo_country_hash`, `geo_city_hash` e `device_class_hash` produzem os mesmos
+valores antes e após o swap, provado pelos fixtures em `ml/features/testdata/parity_cases.json`.
+
 ### ⏭️ Pendente da Fase 3
 
 **K8** (promoção do deep ranking sob **uplift A/B + kill-switch**) segue **gated por

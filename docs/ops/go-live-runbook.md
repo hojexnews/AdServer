@@ -262,8 +262,9 @@ Confirma:
 ### parity-golden-test-guardian
 
 Confirma:
-- [ ] `go test ./...` VERDE incluindo os golden tests de paridade de decisao.
-- [ ] `make parity-check` (se habilitado) VERDE — sem regressao no motor de decisao.
+
+- [ ] `go test -count=1 -race ./...` VERDE incluindo os golden tests de paridade de decisao (gate canonico; toolchain Go 1.26, roda com `-race`; destravado pelo swap `spaolacci`→`twmb/murmur3` na 7a onda).
+- [ ] `make parity-golden-short` VERDE — sem regressao no motor de decisao.
 - [ ] Deep ranking (Triton/GPU) NAO ativo no hot path sem uplift A/B provado (K8 pendente).
 - [ ] Fail-open deterministico do ranker verificado: timeout duro retorna cascata pura.
 

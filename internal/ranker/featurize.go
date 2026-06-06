@@ -26,7 +26,7 @@ import (
 	"math"
 	"time"
 
-	"github.com/spaolacci/murmur3"
+	"github.com/twmb/murmur3"
 )
 
 // FeatureSpecVersion is the version of the feature spec this implementation
@@ -319,13 +319,13 @@ func Featurize(inp FeaturizeInput) [FeatureVectorLength]float32 {
 // featureHash computes murmur3_32(value, seed) % numBuckets.
 // This is the canonical hash function for feature hashing in this spec.
 //
-// Go canonical: murmur3.Sum32WithSeed([]byte(value), uint32(seed)) % uint32(numBuckets)
+// Go canonical: murmur3.SeedSum32(seed, []byte(value)) % uint32(numBuckets)
 // Python canonical: mmh3.hash(value, seed, signed=False) % num_buckets
 //
 // Both produce identical uint32 results for the same (value, seed).
 // Verified by parity_test.go against the gold fixtures in parity_cases.json.
 func featureHash(value string, seed uint32, numBuckets uint32) uint32 {
-	h := murmur3.Sum32WithSeed([]byte(value), seed)
+	h := murmur3.SeedSum32(seed, []byte(value))
 	return h % numBuckets
 }
 
