@@ -382,6 +382,39 @@ Go `twmb/murmur3.SeedSum32` ≡ Python `mmh3`), assinatura documentada bate com 
 (a regra de ouro vale para os gates). Veredito do arquiteto: a `main` permanece **genuinamente esgotada em
 código** para escopo de produto; o próximo movimento real segue sendo exclusivamente **infra/spec viva externa**.
 
+### ✅ Entregue na Fase 3 — 9ª onda: gate canônico no runbook + cabeçalho do contrato de paridade (sob ADR-0004, sem ADR novo; gate verde)
+
+Micro-onda de **dois itens** (paralelos, donos distintos, superfícies disjuntas), triada pelo
+`tech-lead-architect` numa re-triagem fresca da `main` pós-8ª onda. Sweep de saúde **todo verde com
+saída real verificada** (Go `build`/`vet`/`test -race` todos os pacotes ok, `make verify` = buf TX-1 +
+no-float TX-2 verde, `ml/` **176 pytest**, `data/` **21 pytest**, copiloto **125 pytest 0 warn**, BFF **51**,
+web typecheck ok); veredito de esgotamento de **feature** reconfirmado — e, como nas ondas 5/6/7/8, a
+re-triagem achou **dois drifts doc-only reais** da mesma classe ("a spec não mente"), inócuos em runtime:
+
+- **Runbook prescrevia gate Go não-canônico** (`platform-infra-engineer`): o
+  [runbook de go-live](docs/ops/go-live-runbook.md) (rodado pelo operador numa máquina **com** `node_modules`)
+  mandava `go test ./...` cru (Passo 4) e rotulava `go test -count=1 -race ./...` como "gate canônico"
+  (checklist) — mas o gate canônico real são os alvos `make go-build`/`go-vet`/`go-test`, que **filtram
+  `node_modules/`** por design (`make/go.mk`, `GOPKGS`/`GOBUILDPKGS` com `grep -v`) porque deps npm vendoram
+  `.go` benignos. CI mascarava (sem `npm install`); o runbook do operador, não. Alinhado para
+  `make go-build && make go-vet && make go-test` + `make parity-golden-short`, com a justificativa
+  node_modules-safe que o próprio `go.mk` documenta.
+- **Cabeçalho do contrato de paridade mentia sobre a localização do pacote** (`ml-optimization-engineer`):
+  [ml/features/go/parity_contract.go](ml/features/go/parity_contract.go) afirmava "NÃO é pacote Go importável /
+  fica fora do go.mod" — falso: `go list ./ml/features/go` → `github.com/hojex/adserver/ml/features/go`, e ele
+  compila em `make go-build` (o `go.mod` raiz único absorve tudo sob a raiz). Comentário stale de quando `ml/`
+  era pensado fora do módulo. Corrigido (cabeçalho + comentário do pacote) para a verdade: é pacote válido no
+  módulo único, papel **documental/contratual** (spec canônica da featurização anti-skew espelhada Go↔Python),
+  **não** importado pelo hot path. Sem `//go:build ignore` — correção doc-only, zero mudança de comportamento de build.
+
+**Gate verde (9ª onda):** `parity-golden-test-guardian` **APROVADO** (revisão adversarial) — escopo de **2 arquivos
+doc-only** confirmado (zero toque em runtime/`.proto`/hot path/dinheiro/fixtures); os 4 alvos `make` existem e
+filtram `node_modules` (saída real: `go-build` 34 pacotes, `go-test` 22 ok + 13 sem testes com `-race`,
+`parity-golden-short` 3 pacotes ok); `ml/features/go` provadamente no módulo e compilando; **paridade byte-a-byte
+intacta** nos 11 fixtures de hash. `security`/`privacy`/`money` **não acionados** — zero superfície sensível
+(a regra de ouro vale para os gates). Veredito do arquiteto: a `main` permanece **genuinamente esgotada em código**
+para escopo de produto; o próximo movimento real segue sendo exclusivamente **infra/spec viva externa**.
+
 ### ⏭️ Pendente da Fase 3
 
 **K8** (promoção do deep ranking sob **uplift A/B + kill-switch**) segue **gated por
