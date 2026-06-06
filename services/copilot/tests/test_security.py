@@ -318,7 +318,6 @@ class TestH2SqlInjectionAndSchema:
 # H3 — Haiku-as-judge fail-closed
 # =============================================================================
 
-@pytest.mark.asyncio
 class TestH3HaikuJudgeFailClosed:
     """H3: Judge deve ser FAIL-CLOSED — na dúvida/erro → bloquear."""
 
@@ -518,7 +517,6 @@ class TestC1HitlCrossTenantIDOR:
 # M2 — validate_creative gate no caminho de escrita de banner
 # =============================================================================
 
-@pytest.mark.asyncio
 class TestM2CreativeGateInWriteDraft:
     """M2: validate_creative deve rodar dentro de create/update_banner_draft."""
 
