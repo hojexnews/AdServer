@@ -199,10 +199,12 @@ buf TX-1 (contratos Protobuf) + no-float TX-2 (proibicao de float em codigo fina
 ### Passo 4 — Testes Go
 
 ```bash
-go test ./...
+make go-build && make go-vet && make go-test
 ```
 
-Todos os unit/integration tests do monorepo Go.
+Todos os unit/integration tests do monorepo Go. Os alvos `make` filtram `node_modules/`
+(algumas deps npm vendoram arquivos `.go` benignos que quebrariam `go test ./...` cru
+numa maquina com `npm install` ja executado — ver `make/go.mk`).
 
 ### Passo 5 — Suites BFF/pytest
 
@@ -263,7 +265,7 @@ Confirma:
 
 Confirma:
 
-- [ ] `go test -count=1 -race ./...` VERDE incluindo os golden tests de paridade de decisao (gate canonico; toolchain Go 1.26, roda com `-race`; destravado pelo swap `spaolacci`→`twmb/murmur3` na 7a onda).
+- [ ] `make go-test` VERDE — gate canonico: unit tests + golden tests com `-race` (toolchain Go 1.26, filtra `node_modules/`; destravado pelo swap `spaolacci`→`twmb/murmur3` na 7a onda).
 - [ ] `make parity-golden-short` VERDE — sem regressao no motor de decisao.
 - [ ] Deep ranking (Triton/GPU) NAO ativo no hot path sem uplift A/B provado (K8 pendente).
 - [ ] Fail-open deterministico do ranker verificado: timeout duro retorna cascata pura.

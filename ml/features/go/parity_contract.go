@@ -3,8 +3,10 @@
 // Contrato de paridade Go para a spec de featurizacao (J1).
 //
 // ATENCAO: Este arquivo documenta a INTERFACE que internal/ranker/featurize.go
-// (J1) deve implementar. NAO e um pacote Go importavel — ele fica em ml/
-// que e fora do go.mod e serve como referencia para o engenheiro de J1.
+// (J1) deve implementar. E um pacote Go valido dentro do modulo unico
+// (github.com/hojex/adserver/ml/features/go) e compila no gate make go-build.
+// Seu papel e DOCUMENTAL/CONTRATUAL — a spec canonica de featurizacao anti-skew
+// espelhada Go<->Python. NAO deve ser importado pelo hot path do motor de decisao.
 //
 // O teste de paridade Go real fica em:
 //   internal/ranker/parity_test.go  (J1)
@@ -87,5 +89,5 @@
 // -------------------------------------------------------------------
 
 package features_go_contract
-// Este pacote e INTENCIONAL MENTE vazio — serve so como documentacao.
-// Nao importar; nao faz parte do go.mod.
+// Este pacote e intencionalmente vazio — serve so como documentacao/contrato.
+// Nao importar no hot path; ver cabecalho acima.
