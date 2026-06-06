@@ -415,6 +415,37 @@ intacta** nos 11 fixtures de hash. `security`/`privacy`/`money` **não acionados
 (a regra de ouro vale para os gates). Veredito do arquiteto: a `main` permanece **genuinamente esgotada em código**
 para escopo de produto; o próximo movimento real segue sendo exclusivamente **infra/spec viva externa**.
 
+### ✅ Entregue na Fase 3 — 10ª onda: Passo 5 do runbook usa gates `make` canônicos (sob ADR-0004, sem ADR novo; gate verde)
+
+Micro-onda de **um item** (um dono, um arquivo), triada pelo `tech-lead-architect` numa re-triagem fresca da
+`main` pós-9ª onda. Sweep de saúde **todo verde com saída real verificada** (`make go-build` 38 pacotes,
+`make go-vet`, `make go-test` **27 pacotes `-race`**, `make verify` = buf TX-1 + no-float TX-2, `make
+parity-golden-short`, `make ml-test`, `make ml-batch-test`, `make data-validate`, copiloto **125 pytest**, BFF
+**51**, `make db-lint`, `make platform-tofu-validate`); veredito de esgotamento de **feature** reconfirmado — e,
+como nas ondas 5/6/7/8/9, a re-triagem achou **um defeito código-endereçável real** da mesma classe ("a spec não
+mente"), resíduo direto da própria 9ª onda:
+
+- **Passo 5 do runbook ficou com comandos crus** (`platform-infra-engineer`): a 9ª onda padronizou o **Passo 4**
+  e o checklist do [runbook de go-live](docs/ops/go-live-runbook.md) para alvos `make` node_modules-safe, mas
+  deixou o **Passo 5 — Suites BFF/pytest** com comandos crus. `cd bff && npm test` era apenas não-canônico, mas
+  **`cd ml && pytest` estava QUEBRADO**: falha com `ModuleNotFoundError: No module named 'ml'` porque, ao fazer
+  `cd ml`, o CWD deixa de ser a raiz do repo e o import `from ml....` não resolve — todos os alvos `make` de
+  Python injetam `PYTHONPATH=.` na raiz justamente por isso. O passo de smoke pré-cutover, como escrito, **não
+  rodava**. Alinhado para `make bff-ci` (BFF) + `make ml-test && make ml-batch-test && make data-validate`
+  (ml/+data/) + `PYTHONPATH=. ml/.venv/bin/python -m pytest services/copilot/tests/` (copiloto, que não tem alvo
+  `make` próprio), com a justificativa node_modules-safe / `PYTHONPATH=.` explicitada no texto.
+
+**Gate verde (10ª onda):** `parity-golden-test-guardian` **APROVADO** (revisão adversarial) — os 4 alvos `make`
+existem e rodam verde com saída real (`bff-ci` **51**, `ml-test` **90**, `ml-batch-test` **39**, `data-validate`
+12 invariantes, copiloto **125**); `cd ml && pytest` antigo **provadamente** falhava (`ModuleNotFoundError`);
+cobertura **não regrediu**; escopo de **1 arquivo doc-only** (zero toque em runtime/`.proto`/hot path/dinheiro/
+fixtures); **paridade byte-a-byte intacta** (`make parity-golden-short` + `make verify` verdes). Achado **não-
+bloqueante** registrado: `ml/deep/test_deep.py` e `ml/fraud/test_unsup.py` (K1/K2, 47 testes verdes) não têm alvo
+`make` dedicado — lacuna **pré-existente**, candidata a backlog do `decision-engine-engineer`, fora do escopo
+desta onda. `security`/`privacy`/`money` **não acionados** — zero superfície sensível. Veredito do arquiteto: a
+`main` permanece **genuinamente esgotada em código** para escopo de produto; o próximo movimento real segue sendo
+exclusivamente **infra/spec viva externa**.
+
 ### ⏭️ Pendente da Fase 3
 
 **K8** (promoção do deep ranking sob **uplift A/B + kill-switch**) segue **gated por
