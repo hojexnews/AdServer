@@ -684,7 +684,7 @@ metadata:
   hash_seed_note: >
     Seeds documentadas por feature (ver campo seed em cada feature_hash).
     O seed DEVE ser identico em Go (internal/ranker) e Python (ml/features).
-    Usar mmh3 (Python) e github.com/spaolacci/murmur3 (Go) com seed uint32.
+    Usar mmh3 (Python) e github.com/twmb/murmur3 (Go) com seed uint32.
   currency_note: >
     Features monetarias usam minor-units int64 (TX-2) como entrada.
     A transformacao para float32 e apenas para o vetor de ML.

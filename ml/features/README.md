@@ -107,7 +107,7 @@ por feature**. A implementacao DEVE ser identica nas duas linguagens:
 # Python (mmh3)
 mmh3.hash(value: str, seed: int, signed=False) % num_buckets
 
-# Go (github.com/spaolacci/murmur3)
+# Go (github.com/twmb/murmur3)
 # murmur3.SeedSum32(uint32(seed), []byte(value)) % uint32(num_buckets)
 ```
 
@@ -176,7 +176,7 @@ implementacao Python e os fixtures — investigar antes de prosseguir com J2.
    - Verifica `FeatureSpecVersion == fixtures.feature_spec_version`
    - Para cada caso: chama `Featurize(input)` e compara com `expected_vector_computed`
      usando tolerancia `1e-6` para floats, igualdade exata para ints.
-3. Adicionar `github.com/spaolacci/murmur3` ao `go.mod`.
+3. Adicionar `github.com/twmb/murmur3` ao `go.mod`.
 4. O teste de paridade Go e **gate de merge de J1** — nao pode ser pulado.
 
 ---

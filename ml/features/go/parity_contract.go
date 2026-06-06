@@ -17,7 +17,7 @@
 //
 // -------------------------------------------------------------------
 // HASH CANONICO (CRITICO PARA PARIDADE):
-//   Go:     github.com/spaolacci/murmur3
+//   Go:     github.com/twmb/murmur3
 //           murmur3.SeedSum32(uint32(seed), []byte(value)) % uint32(numBuckets)
 //
 //   Python: mmh3
