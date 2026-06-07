@@ -175,10 +175,15 @@ export function createCopilotRouter() {
           });
         }
 
+        // A mensagem é passada como query param porque EventSource não aceita body.
+        // A rota SSE extrai ?message= e encaminha ao POST /v1/chat do copiloto
+        // (ChatRequest exige min_length=1 — body vazio causaria 422).
+        const streamUrl = `/api/copilot/stream/${sessionId}?message=${encodeURIComponent(input.message)}`;
+
         return {
           sessionId,
           // O front usa esta URL para abrir o EventSource SSE
-          streamUrl: `/api/copilot/stream/${sessionId}`,
+          streamUrl,
           // O copiloto Python usa este como thread_id para o checkpointing
           threadId: sessionId,
         };

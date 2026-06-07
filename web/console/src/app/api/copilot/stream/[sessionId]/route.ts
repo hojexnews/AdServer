@@ -125,21 +125,34 @@ export async function GET(
   const internalHeaders = makeInternalHeaders(tenantId);
 
   // ---------------------------------------------------------------------------
+  // Lê a mensagem do usuário passada pelo BFF via query param ?message=.
+  //
+  // FLUXO (1º turno):
+  //   1. Front chama tRPC copilot.chat com a mensagem do usuário.
+  //   2. BFF constrói streamUrl = /api/copilot/stream/{sessionId}?message=<encoded>.
+  //   3. Front abre EventSource para streamUrl.
+  //   4. Esta rota extrai ?message= e encaminha ao POST /v1/chat do copiloto.
+  //
+  // O query param é a única forma de passar dados num GET/EventSource sem body.
+  // O BFF (copilot.chat tRPC) é quem inclui o message na URL — o front nunca
+  // constrói esta URL diretamente; recebe-a como opaque do BFF.
+  //
+  // ChatRequest (server.py) exige min_length=1 — garantido pela validação abaixo.
+  // ---------------------------------------------------------------------------
+  const rawMessage = request.nextUrl.searchParams.get("message");
+  if (!rawMessage || rawMessage.trim().length === 0) {
+    const errorBody = `event: error\ndata: ${JSON.stringify({ type: "error", message: "Parâmetro 'message' ausente ou vazio." })}\n\n`;
+    return new Response(errorBody, { status: 200, headers: sseHeaders() });
+  }
+  // Limita a 10 000 chars (espelho do ChatInput.message.max no BFF/Zod e ChatRequest Python)
+  const message = rawMessage.slice(0, 10_000);
+
+  // ---------------------------------------------------------------------------
   // Abre o stream SSE com o copiloto Python.
   //
-  // ENDPOINT CORRETO (H4 corrigido):
-  //   O services/copilot expõe POST /v1/chat com SSE streaming.
-  //   O header X-Session-ID permite ao LangGraph retomar o grafo pausado
-  //   (checkpointing por thread_id).
-  //
-  //   NÃO existe /v1/stream/:sessionId no FastAPI — endpoint anterior era inválido.
-  //   Contrato: services/copilot/app/server.py @app.post("/v1/chat")
-  //
-  // NOTA: esta rota SSE retoma uma sessão existente (sessionId já criado pelo
-  //   copilot.chat tRPC mutation). O body é vazio pois a mensagem já foi enviada;
-  //   o copiloto reconhece o thread_id e continua o grafo de onde parou.
-  //   Para a primeira mensagem, o BFF chama POST /v1/chat via tRPC copilot.chat
-  //   e o front usa o streamUrl retornado para abrir este EventSource.
+  // ENDPOINT: POST /v1/chat (ChatRequest: message obrigatório, min_length=1).
+  // O header X-Session-ID carrega o thread_id para checkpointing LangGraph.
+  // Contrato: services/copilot/app/server.py @app.post("/v1/chat")
   // ---------------------------------------------------------------------------
   let upstream: Response;
   try {
@@ -152,10 +165,7 @@ export async function GET(
         Accept: "text/event-stream",
         "Cache-Control": "no-cache",
       },
-      // Body mínimo: mensagem vazia sinalizando retomada de sessão existente.
-      // O copiloto identifica a sessão pelo X-Session-ID (thread_id) e retoma
-      // o grafo pausado sem reprocessar a mensagem original.
-      body: JSON.stringify({ message: "", model_tier: null }),
+      body: JSON.stringify({ message, model_tier: null }),
       // Next.js fetch: desabilita cache para streaming
       // @ts-expect-error — duplex requerido pelo Node.js para streaming POST
       duplex: "half",
