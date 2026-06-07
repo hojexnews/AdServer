@@ -13,8 +13,11 @@ COMO EXECUTAR:
     pytest test_parity_cases.py -v
 
 TOLERANCIA (da spec):
-  - float: abs(go_value - py_value) <= 1e-9
-  - int: igualdade exata (comparados como float32, diff <= 1e-9)
+  - float: abs(go_value - py_value) <= 1e-6
+    (vetor e float32; cast float32<->float64 introduz ruido ~1.19e-7;
+     1e-6 captura bugs reais absorvendo esse ruido; 1e-9 e impossivel
+     de satisfazer consistentemente com float32.)
+  - int: igualdade exata (comparados como float32, diff <= 1e-6)
 
 BOOTSTRAP DE HASH:
   Na primeira execucao, os valores de hash em expected_vector_computed que

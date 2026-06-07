@@ -33,23 +33,48 @@
 //
 // package ranker
 //
-// import (
-//     "time"
-//     "github.com/hojex/adserver/gen/go/adserver/common/v1"
-//     "github.com/hojex/adserver/internal/cascade"
-//     "github.com/hojex/adserver/internal/snapshot"
-// )
+// import "time"
 //
 // const FeatureSpecVersion = "1.0.0"
 // const FeatureVectorLength = 23
 //
 // type FeaturizeInput struct {
-//     Zone            *snapshot.Zone
-//     RequestTime     time.Time           // UTC
-//     Geo             *commonv1.Geo       // pais+cidade, sem IP (TX-5)
-//     DeviceClass     string              // useragent.Classify() output
-//     Candidate       *cascade.Candidate
-//     CandidateCount  uint32
+//     // Zone dimensions (snapshot.Zone — campos planos, sem dependencia externa).
+//     ZoneWidth  int32
+//     ZoneHeight int32
+//
+//     // Request time (UTC).
+//     RequestTime time.Time
+//
+//     // Geo: country (ISO 3166-1 alpha-2) e city name. Vazio = ausente.
+//     // IP bruto NUNCA presente aqui (TX-5/DA-11).
+//     GeoCountry string
+//     GeoCity    string
+//
+//     // DeviceClass e a classe grosseira de useragent.Classify.
+//     // UA bruto descartado upstream (TX-5/DA-11).
+//     DeviceClass string
+//
+//     // Candidate fields (cascade.Candidate — campos planos).
+//     CandidateTier    int     // 1=Override, 2=Contract, 3=Remnant
+//     CampaignPriority int32
+//     PacingDeficit    float64 // [0,1]; 0 para nao-Contract
+//
+//     // ECPMMinorUnits e o eCPM em minor-units (int64, TX-2).
+//     // 0 para Override/Contract.
+//     ECPMMinorUnits int64
+//
+//     // Banner dimensions.
+//     BannerWidth  int32
+//     BannerHeight int32
+//
+//     // CreativeType: "image", "html", "video", ou "unknown".
+//     CreativeType string
+//
+//     // CandidateCount e o total de candidatos elegiveis no estrato.
+//     CandidateCount uint32
+//
+//     // Historico de campanha (contadores aproximados do snapshot).
 //     CampaignDeliveredImpressions int64
 //     CampaignGoalImpressions      int64
 //     CampaignDeliveredClicks      int64
@@ -59,9 +84,12 @@
 // // REGRAS:
 // //   - Sem alocacao de rede; todas as fontes sao in-memory (TX-4).
 // //   - ecpm_minor_units entra como int64, nao float (TX-2/DA-10).
-// //   - Geo deriva do commonv1.Geo — IP bruto nunca entra aqui (TX-5/DA-11).
+// //   - Geo: campos GeoCountry/GeoCity — IP bruto nunca entra aqui (TX-5/DA-11).
 // //   - Hash: murmur3.SeedSum32(seed, []byte(value)) % numBuckets
-// //   - Tolerancia de paridade com Python: abs(go - py) <= 1e-9
+// //   - Tolerancia de paridade com Python: abs(go - py) <= 1e-6
+// //     (vetor e float32; cast float32<->float64 introduz ruido ~1.19e-7;
+// //      1e-6 captura bugs reais absorvendo esse ruido; 1e-9 e impossivel de
+// //      satisfazer consistentemente com float32.)
 // //
 // func Featurize(inp FeaturizeInput) [FeatureVectorLength]float32 {
 //     // ... implementacao em J1 ...
@@ -80,7 +108,7 @@
 //         expected := tc.ExpectedVectorComputed
 //         for i := 0; i < FeatureVectorLength; i++ {
 //             diff := math.Abs(float64(actual[i]) - expected[i])
-//             require.LessOrEqual(t, diff, 1e-9,
+//             require.LessOrEqual(t, diff, 1e-6,
 //                 "caso %s indice %d: got %v want %v diff %v",
 //                 tc.ID, i, actual[i], expected[i], diff)
 //         }
