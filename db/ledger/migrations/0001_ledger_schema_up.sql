@@ -244,9 +244,11 @@ BEGIN
     WHERE journal_entry_id = v_entry_id
       AND asset_code = v_asset_code;
 
-    -- Se algum lado ficou diferente de zero no balanço, falha
-    -- (0 = 0 é estado intermediário válido durante INSERT em lote da mesma TX)
-    IF v_debit_sum <> 0 AND v_credit_sum <> 0 AND v_debit_sum <> v_credit_sum THEN
+    -- Falha se débito e crédito não baterem (double-entry). O trigger é
+    -- DEFERRABLE INITIALLY DEFERRED: dispara no COMMIT (sem estado intermediário),
+    -- então ambos-zero (sem postings do ativo) passa, mas débito-só ou crédito-só
+    -- (posting unilateral) dispara — fechando o backstop de balanço.
+    IF v_debit_sum <> v_credit_sum THEN
         RAISE EXCEPTION
             'Ledger desbalanceado: entry_id=% asset=% debit=% credit=%',
             v_entry_id, v_asset_code, v_debit_sum, v_credit_sum;
