@@ -71,6 +71,16 @@
 --       startsWith() = false -> NULL -> zero rows (nao tem tenant_role, mas
 --       mesmo se tivesse: fail-closed).
 
+-- =============================================================================
+-- ROLES: criacao ANTES das ROW POLICY que as referenciam (Code 511 UNKNOWN_ROLE)
+-- =============================================================================
+-- tenant_role e adserver_admin_role devem existir antes das ROW POLICY TO <role>.
+-- Os usuarios concretos (adserver_ingest, adserver_billing, adserver_admin) sao
+-- pre-existentes via IaC/OpenBao; esta migration nao cria usuarios com credenciais
+-- (ver secao USUARIOS no final deste arquivo).
+CREATE ROLE IF NOT EXISTS tenant_role ON CLUSTER '{cluster}';
+CREATE ROLE IF NOT EXISTS adserver_admin_role ON CLUSTER '{cluster}';
+
 -- Politica para stats_hourly_state (tabela base dos rollups)
 CREATE ROW POLICY IF NOT EXISTS rp_stats_hourly_state_tenant
 ON adserver.stats_hourly_state
@@ -164,29 +174,30 @@ TO tenant_role;
 -- =============================================================================
 -- ROW POLICY — administrador (bypass para ingestao e billing batch)
 -- =============================================================================
--- O usuario 'adserver_ingest' (Kafka engine consumer) e 'adserver_billing'
--- (job de billing batch) precisam acessar todos os tenants.
+-- Os usuarios 'adserver_ingest', 'adserver_billing' e 'adserver_admin' sao
+-- criados pelo IaC (OpenBao/OpenTofu) com GRANT adserver_admin_role.
+-- A ROW POLICY referencia a ROLE, nao os usuarios diretamente, para que a
+-- migration seja self-contained (sem depender de usuarios pre-existentes).
+-- Em producao: IaC faz `GRANT adserver_admin_role TO adserver_ingest` etc.
 
 CREATE ROW POLICY IF NOT EXISTS rp_stats_hourly_state_admin
 ON adserver.stats_hourly_state
 FOR SELECT USING 1 = 1
-TO adserver_ingest, adserver_billing, adserver_admin;
+TO adserver_admin_role;
 
 CREATE ROW POLICY IF NOT EXISTS rp_raw_impression_admin
 ON adserver.raw_impression
 FOR SELECT USING 1 = 1
-TO adserver_ingest, adserver_billing, adserver_admin;
+TO adserver_admin_role;
 
 CREATE ROW POLICY IF NOT EXISTS rp_raw_conversion_admin
 ON adserver.raw_conversion
 FOR SELECT USING 1 = 1
-TO adserver_ingest, adserver_billing, adserver_admin;
+TO adserver_admin_role;
 
 -- =============================================================================
--- ROLE: tenant_role (SELECT em tabelas analiticas; sem INSERT/ALTER/DROP)
+-- GRANTS: tenant_role (SELECT em tabelas analiticas; sem INSERT/ALTER/DROP)
 -- =============================================================================
-CREATE ROLE IF NOT EXISTS tenant_role ON CLUSTER '{cluster}';
-
 GRANT SELECT ON adserver.stats_hourly        TO tenant_role;
 GRANT SELECT ON adserver.live_stats_exact    TO tenant_role;
 GRANT SELECT ON adserver.live_stats_fast     TO tenant_role;
@@ -196,9 +207,8 @@ GRANT SELECT ON adserver.raw_conversion      TO tenant_role;
 -- Nao conceder SELECT em raw_decision para tenants (propensity e dado interno de ML)
 
 -- =============================================================================
--- ROLE: adserver_admin (acesso total, para manutencao e billing)
+-- GRANTS: adserver_admin_role (acesso total, para manutencao e billing)
 -- =============================================================================
-CREATE ROLE IF NOT EXISTS adserver_admin_role ON CLUSTER '{cluster}';
 GRANT ALL ON adserver.* TO adserver_admin_role;
 
 -- =============================================================================
@@ -219,7 +229,9 @@ FOR INTERVAL 3600 SECOND
     MAX execution_time = 300             -- max 5min por query
 TO tenant_role;
 
--- Quota para adserver_billing (sem limite operacional; billing e batch controlado)
+-- Quota para adserver_admin_role (billing + ingestao; sem limite operacional).
+-- Em producao, o IaC atribui adserver_admin_role aos usuarios adserver_billing
+-- e adserver_ingest; a quota e herdada via role.
 CREATE QUOTA IF NOT EXISTS quota_billing_unlimited ON CLUSTER '{cluster}'
 KEYED BY user_name
 FOR INTERVAL 3600 SECOND
@@ -227,22 +239,38 @@ FOR INTERVAL 3600 SECOND
     MAX read_rows = 0,
     MAX result_rows = 0,
     MAX execution_time = 0
-TO adserver_billing;
+TO adserver_admin_role;
 
 -- =============================================================================
--- USUARIOS: criacao de placeholder (em producao, via IaC/Argo CD)
+-- USUARIOS: EXCLUSIVAMENTE responsabilidade do IaC/OpenBao (no-static-creds)
 -- =============================================================================
--- Criar usuario de ingestao e billing com senhas via secrets manager.
--- Nao armazenar senhas neste arquivo; usar variavel de ambiente ou OpenBao.
+-- Esta migration NAO cria usuarios nem executa GRANT <role> TO <usuario>.
+-- Criacao de usuarios com credenciais reais e o GRANT da role sao feitos
+-- EXCLUSIVAMENTE pelo IaC (OpenTofu/Argo CD) + OpenBao, fora do versionamento
+-- git, antes de as migrations serem aplicadas.
 --
--- Exemplo (parametrizado pelo IaC):
---   CREATE USER adserver_ingest IDENTIFIED BY '${INGEST_PASSWORD}';
+-- RAZAO: criar usuarios privilegiados (adserver_admin_role = ALL ON adserver.*)
+-- dentro de uma migration versionada feriria a regra no-static-creds: qualquer
+-- usuario com autenticacao fraca ou sem autenticacao no git seria um vetor de
+-- elevacao de privilegio. Mesmo no_password nao e aceitavel para contas que
+-- herdam ALL ON adserver.*.
+--
+-- O QUE ESTA MIGRATION FAZ (apenas ROLES — sem usuarios, sem credenciais):
+--   CREATE ROLE tenant_role        — rol dos tenants (ROW POLICY + SELECT)
+--   CREATE ROLE adserver_admin_role — rol de plataforma (ALL ON adserver.*)
+--   ROW POLICY admin referencia adserver_admin_role (nao usuarios diretamente)
+--   GRANTS de SELECT e ALL sao concedidos as roles
+--   QUOTAS sao concedidas as roles
+--
+-- O QUE O IaC FAZ (fora desta migration, com secrets reais do OpenBao):
+--   CREATE USER adserver_ingest  IDENTIFIED BY '${SECRET_INGEST}';
+--   CREATE USER adserver_billing IDENTIFIED BY '${SECRET_BILLING}';
+--   CREATE USER adserver_admin   IDENTIFIED BY '${SECRET_ADMIN}';
 --   GRANT adserver_admin_role TO adserver_ingest;
---
---   CREATE USER adserver_billing IDENTIFIED BY '${BILLING_PASSWORD}';
 --   GRANT adserver_admin_role TO adserver_billing;
+--   GRANT adserver_admin_role TO adserver_admin;
 --
---   -- Por tenant (gerado pelo IaC para cada tenant_id):
+-- Por tenant (gerado pelo IaC para cada tenant_id — nao criar aqui):
 --   CREATE USER tenant_{id} IDENTIFIED BY '${TENANT_PASSWORD}';
 --   GRANT tenant_role TO tenant_{id};
 --
