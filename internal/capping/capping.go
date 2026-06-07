@@ -162,7 +162,9 @@ func (c *Capper) Allowed(userID string, camp *snapshot.Campaign, ban *snapshot.B
 	// return false (fail-safe — cannot guarantee cap).
 	if capTotal > 0 {
 		key := capKey(userID, salt, camp.ID, ban.ID, "total", 0)
-		ok, err := c.checkAndIncr(ctx, key, int64(capTotal), 0) // 0 = no TTL (permanent counter)
+		// TTL bounded by campaign end date and privacy ceiling (DA-6/TX-5).
+		// Keys must never be permanent — see campaignTotalTTL.
+		ok, err := c.checkAndIncr(ctx, key, int64(capTotal), campaignTotalTTL(camp))
 		if err != nil {
 			// Redis down on a capped campaign → fail-safe abort.
 			return false, nil //nolint:nilerr // fail-safe documented above
@@ -245,6 +247,40 @@ func capKey(userID, salt, campaignID, bannerID, scope string, windowSec int32) s
 		return fmt.Sprintf("cap:%s:%s:%s:%s:%d", hx, scope, campaignID, bannerID, windowSec)
 	}
 	return fmt.Sprintf("cap:%s:%s:%s:%s", hx, scope, campaignID, bannerID)
+}
+
+// campaignTotalTTL computes the TTL for the campaign_total capping key.
+//
+// Privacy invariant (DA-6 / TX-5): campaign_total keys MUST expire.  A
+// permanent counter (TTL=0) would retain pseudonymised user data beyond the
+// campaign lifetime, violating the ephemeral-key contract stated in the
+// package doc.
+//
+// The TTL is the MINIMUM of:
+//   - remaining campaign lifetime (EndAt − now), if EndAt is set and in the
+//     future; OR
+//   - a hard privacy ceiling of 90 days.
+//
+// Edge cases:
+//   - EndAt is zero (unset): apply the 90-day ceiling.
+//   - EndAt is in the past: the campaign is already over; use a short grace
+//     TTL (1 hour) so the key expires promptly — never return 0 (permanent).
+//   - EndAt is set and remaining > 90 days: clamp to 90 days.
+func campaignTotalTTL(camp *snapshot.Campaign) time.Duration {
+	const maxRetention = 90 * 24 * time.Hour // privacy ceiling
+	const graceTTL = 1 * time.Hour           // minimum: already-expired campaigns
+
+	if camp.EndAt.IsZero() {
+		return maxRetention
+	}
+	remaining := time.Until(camp.EndAt)
+	if remaining <= 0 {
+		return graceTTL
+	}
+	if remaining > maxRetention {
+		return maxRetention
+	}
+	return remaining
 }
 
 // effectiveCaps resolves the active cap values for each scope.

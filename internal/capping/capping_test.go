@@ -25,11 +25,15 @@ var errDown = errors.New("redis: connection refused")
 
 type fakeRedis struct {
 	counters map[string]int64
+	ttls     map[string]time.Duration // key → TTL set via Expire
 	down     bool
 }
 
 func newFakeRedis() *fakeRedis {
-	return &fakeRedis{counters: make(map[string]int64)}
+	return &fakeRedis{
+		counters: make(map[string]int64),
+		ttls:     make(map[string]time.Duration),
+	}
 }
 
 func (f *fakeRedis) Get(ctx context.Context, key string) *redis.StringCmd {
@@ -55,6 +59,7 @@ func (f *fakeRedis) Expire(ctx context.Context, key string, expiration time.Dura
 	if f.down {
 		return redis.NewBoolResult(false, errDown)
 	}
+	f.ttls[key] = expiration
 	return redis.NewBoolResult(true, nil)
 }
 
@@ -87,6 +92,15 @@ func makeBan(capTotal, capSession, capClock, clockWindowSec int32) *snapshot.Ban
 		CapClock:          capClock,
 		CapClockWindowSec: clockWindowSec,
 		Active:            true,
+	}
+}
+
+func makeCampWithEnd(capTotal int32, endAt time.Time) *snapshot.Campaign {
+	return &snapshot.Campaign{
+		ID:       "camp-ttl",
+		TenantID: "t1",
+		CapTotal: capTotal,
+		EndAt:    endAt,
 	}
 }
 
@@ -289,4 +303,71 @@ func TestNew_EmptySalt_Panics(t *testing.T) {
 	}()
 	// This must panic — not silently use a default salt.
 	_ = capping.New(r, "")
+}
+
+// DA-6 / TX-5: campaign_total counter must never be permanent (TTL=0).
+// The key must receive a positive Expire after the first impression.
+func TestCapper_CampaignTotal_TTLIsPositive(t *testing.T) {
+	tests := []struct {
+		name    string
+		endAt   time.Time
+		wantMin time.Duration
+		wantMax time.Duration
+	}{
+		{
+			name:    "EndAt zero — applies 90-day ceiling",
+			endAt:   time.Time{},
+			wantMin: 89 * 24 * time.Hour,
+			wantMax: 91 * 24 * time.Hour,
+		},
+		{
+			name:    "EndAt in 7 days — bounded by campaign end",
+			endAt:   time.Now().Add(7 * 24 * time.Hour),
+			wantMin: 6 * 24 * time.Hour,
+			wantMax: 8 * 24 * time.Hour,
+		},
+		{
+			name:    "EndAt in 180 days — clamped to 90-day ceiling",
+			endAt:   time.Now().Add(180 * 24 * time.Hour),
+			wantMin: 89 * 24 * time.Hour,
+			wantMax: 91 * 24 * time.Hour,
+		},
+		{
+			name:    "EndAt in the past — grace TTL (1h), never 0",
+			endAt:   time.Now().Add(-24 * time.Hour),
+			wantMin: 1 * time.Second, // strictly positive
+			wantMax: 2 * time.Hour,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newFakeRedis()
+			c := capping.New(r, "test-salt")
+			camp := makeCampWithEnd(1, tc.endAt)
+			ban := makeBan(0, 0, 0, 0)
+
+			ok, err := c.Allowed("user-ttl", camp, ban)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !ok {
+				t.Fatal("expected allowed on first impression")
+			}
+
+			// Find the total key in the TTL map — it is the only key that
+			// Expire should have been called on (no session/clock cap active).
+			if len(r.ttls) == 0 {
+				t.Fatal("Expire was never called — campaign_total key has no TTL (permanent counter — DA-6 violation)")
+			}
+			for key, ttl := range r.ttls {
+				if ttl == 0 {
+					t.Errorf("key %q has TTL=0 (permanent) — DA-6/TX-5 violation", key)
+				}
+				if ttl < tc.wantMin || ttl > tc.wantMax {
+					t.Errorf("key %q: TTL=%v, want [%v, %v]", key, ttl, tc.wantMin, tc.wantMax)
+				}
+			}
+		})
+	}
 }
