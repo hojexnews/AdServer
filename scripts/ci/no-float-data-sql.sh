@@ -36,6 +36,24 @@ check_sql_no_monetary_float() {
         echo "$hits"
         return 1
     fi
+
+    # Detecta pow() em contexto de MATERIALIZED/coluna monetaria (TX-2).
+    # pow() retorna Float64 e contamina billing quando usado em MATERIALIZED
+    # de colunas como conversion_value_decimal/_amount (ex.: pow(10, scale)).
+    # Usos legítimos de pow() em contexto nao-monetario (propensity, score)
+    # sao excluidos pelo grep -vE abaixo.
+    local pow_hits
+    pow_hits=$(grep -inE 'MATERIALIZED.*pow\s*\(|pow\s*\(.*conversion_value' "$f" \
+               | grep -vE '^\s*--' \
+               | grep -vE 'propensity|score|epsilon|pct|probability' \
+               || true)
+    if [ -n "$pow_hits" ]; then
+        echo "ERRO no-float-data-sql: pow() em contexto MATERIALIZED/billing em $f (retorna Float64, TX-2):"
+        echo "$pow_hits"
+        echo "  Use multiIf dispatch com literais inteiros 10^N em vez de pow()."
+        return 1
+    fi
+
     return 0
 }
 

@@ -168,10 +168,37 @@ CREATE TABLE IF NOT EXISTS adserver.raw_conversion ON CLUSTER '{cluster}'
     conversion_value_scale      UInt32,
     -- Decimal derivado: amount / 10^scale. Calculado na ingestao para
     -- facilitar somas analiticas. Decimal(38,18) cobre todos os ativos
-    -- incluindo ERC-20 (scale=18). Nunca Float.
+    -- incluindo ERC-20 (scale=18). Nunca Float (TX-2).
+    --
+    -- FORMULA: toDecimal128(amount, 18) / divisor_inteiro
+    --   onde divisor_inteiro = 10^scale (literal inteiro por ramo).
+    --   CH 24.8 nao aceita scale dinamico em toDecimal128 em MATERIALIZED (Code 44),
+    --   e pow() retorna Float64 contaminando billing (TX-2). Solucao: multiIf dispatch
+    --   com 19 ramos (scale 0..18). Divisao Decimal(38,18)/Int64 e exata (sem float).
+    --   Scales>18 sao impossíveis em Decimal(_,18); o default (scale=0) trata
+    --   valores fora de intervalo de forma conservadora (nao-silenciosa via divisor=1).
     conversion_value_decimal    Decimal(38, 18)
-        MATERIALIZED toDecimal256(conversion_value_amount, 0)
-                     / pow(10, conversion_value_scale),
+        MATERIALIZED toDecimal128(conversion_value_amount, 18) / multiIf(
+            conversion_value_scale =  0,                    1,
+            conversion_value_scale =  1,                   10,
+            conversion_value_scale =  2,                  100,
+            conversion_value_scale =  3,                 1000,
+            conversion_value_scale =  4,                10000,
+            conversion_value_scale =  5,               100000,
+            conversion_value_scale =  6,              1000000,
+            conversion_value_scale =  7,             10000000,
+            conversion_value_scale =  8,            100000000,
+            conversion_value_scale =  9,           1000000000,
+            conversion_value_scale = 10,          10000000000,
+            conversion_value_scale = 11,         100000000000,
+            conversion_value_scale = 12,        1000000000000,
+            conversion_value_scale = 13,       10000000000000,
+            conversion_value_scale = 14,      100000000000000,
+            conversion_value_scale = 15,     1000000000000000,
+            conversion_value_scale = 16,    10000000000000000,
+            conversion_value_scale = 17,   100000000000000000,
+            conversion_value_scale = 18,  1000000000000000000,
+            1),  -- default: trata como scale=0; scales>18 impossíveis em Decimal(_,18)
     attribution_decision_id     String,
     deduplicated                UInt8
 )
