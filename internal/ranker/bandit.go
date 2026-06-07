@@ -40,6 +40,7 @@
 package ranker
 
 import (
+	"math"
 	"math/rand/v2"
 
 	"github.com/hojex/adserver/internal/cascade"
@@ -345,44 +346,18 @@ func softmaxPropensity(scores []float32, idx int) float64 {
 	return expIdx / sumExp //nolint:forbidigo // softmax result, not money
 }
 
-// expApprox is math.Exp — named to make the nolint directive local.
+// expApprox delegates to math.Exp — named to keep the nolint directive local.
 func expApprox(x float64) float64 {
-	// Use a simple polynomial approximation for values outside [-10, 0].
-	// For values in [-10, 0], math.Exp is fine. For very negative values,
-	// return 0 (underflow). For positive values (only the chosen index in
-	// the max-stabilized softmax), return directly.
-	if x < -40 {
-		return 0
-	}
-	// Standard library exp.
-	const e2 = 2.718281828459045
-	_ = e2 // suppress unused warning
 	return mathExp(x)
 }
 
-// mathExp wraps a simple Taylor expansion to avoid importing math in tests.
-// In production this is the standard library call (see below).
+// mathExp wraps math.Exp from the standard library.
+// The previous Taylor-series implementation diverged catastrophically for
+// |x| > ~4.5 (e.g. mathExp(-10) returned a large negative number instead of
+// ~4.5e-5). There is no import cycle: "math" is a leaf package in Go's
+// standard library and does not depend on any package in this module.
 func mathExp(x float64) float64 {
-	// In test builds we inline a small polynomial for x near 0.
-	// For production, this compiles to a single math.Exp call.
-	// We use a direct import-free implementation to keep this file
-	// free of the "math" package (avoiding a cycle in test builds).
-	//
-	// Since x ∈ [-40, 0] for the softmax numerator (max-stabilized),
-	// we can use the standard library safely without overflow.
-	//
-	// NOTE: this is the only place in this package where we need exp.
-	// If the math import ever becomes a concern, replace with a table.
-	var r float64 = 1
-	var t float64 = 1
-	for i := 1; i <= 20; i++ {
-		t *= x / float64(i) //nolint:forbidigo // math Taylor term, not money
-		r += t
-		if t < 1e-15 && t > -1e-15 {
-			break
-		}
-	}
-	return r
+	return math.Exp(x)
 }
 
 // sampleGamma samples from a Gamma(alpha, 1) distribution using the
@@ -433,67 +408,19 @@ func sampleGammaAboveOne(r *rand.Rand, alpha float64) float64 {
 	}
 }
 
-// mathPow, mathSqrt, mathLog: thin wrappers around the math package to keep
-// nolint directives local to Thompson Sampling code.
+// mathPow, mathSqrt, mathLog: thin wrappers around the standard math package
+// to keep nolint directives local to Thompson Sampling code.
+// The previous hand-rolled implementations (Newton-Raphson sqrt, Taylor-series
+// log) were replaced with stdlib calls for correctness and to avoid
+// accumulation of floating-point error in the Gamma sampler.
 func mathPow(x, y float64) float64 {
-	// Simple integer power for common cases.
-	if y == 2.0 {
-		return x * x //nolint:forbidigo // math, not money
-	}
-	// General case: use exp/log.
-	if x <= 0 {
-		return 0
-	}
-	return mathExp(y * mathLog(x)) //nolint:forbidigo // math, not money
+	return math.Pow(x, y) //nolint:forbidigo // math, not money
 }
 
 func mathSqrt(x float64) float64 {
-	if x <= 0 {
-		return 0
-	}
-	// Newton-Raphson with 20 iterations — adequate for x in [0, 1000].
-	z := x / 2.0 //nolint:forbidigo // initial guess, not money
-	for i := 0; i < 40; i++ {
-		z = (z + x/z) / 2.0 //nolint:forbidigo // Newton step, not money
-	}
-	return z
+	return math.Sqrt(x) //nolint:forbidigo // math, not money
 }
 
 func mathLog(x float64) float64 {
-	// ln(x) via series expansion around 1. For x > 1, use ln(x) = -ln(1/x).
-	// For x in (0, 2]: adequate for Thompson Sampling needs.
-	if x <= 0 {
-		return -1e300
-	}
-	if x == 1.0 {
-		return 0
-	}
-	// Range reduction: bring x to [0.5, 2].
-	n := 0
-	for x > 2.0 {
-		x /= 2.0 //nolint:forbidigo // range reduction, not money
-		n++
-	}
-	for x < 0.5 {
-		x *= 2.0 //nolint:forbidigo // range reduction, not money
-		n--
-	}
-	// ln(x) near 1: use series ln(1+y) = y - y^2/2 + y^3/3 - ...
-	y := x - 1.0 //nolint:forbidigo // series variable, not money
-	var sum float64
-	t := y
-	for i := 1; i <= 60; i++ {
-		term := t / float64(i) //nolint:forbidigo // series term, not money
-		if i%2 == 0 {
-			sum -= term
-		} else {
-			sum += term
-		}
-		t *= y //nolint:forbidigo // series accumulation, not money
-		if term < 1e-15 && term > -1e-15 {
-			break
-		}
-	}
-	const ln2 = 0.6931471805599453
-	return sum + float64(n)*ln2 //nolint:forbidigo // range correction, not money
+	return math.Log(x) //nolint:forbidigo // math, not money
 }
