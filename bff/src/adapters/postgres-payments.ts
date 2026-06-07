@@ -96,12 +96,24 @@ export function createPgPool(): Pool | undefined {
  * Os serviços Go gravam os minor-units como inteiros (ex.: 150000 para 1500.00 BRL),
  * armazenados como NUMERIC(40,18) = "150000.000000000000000000".
  * Precisamos pegar a parte inteira e dividir por 10^scale.
+ *
+ * Fix-6 (Money MEDIUM): scale null/undefined indica ativo não registrado ou disabled
+ * no asset_registry. Falhar alto em vez de assumir scale=2 silenciosamente (TX-2).
  */
-function minorUnitsToDecimalStr(pgNumericStr: string, scale: number): string {
+function minorUnitsToDecimalStr(pgNumericStr: string, scale: number | null | undefined, assetCode?: string): string {
   if (typeof pgNumericStr !== "string") {
     throw new TypeError(
       `minorUnitsToDecimalStr: esperava string NUMERIC do Postgres, recebeu ${typeof pgNumericStr}. ` +
         "Nunca use Number para money (TX-2)."
+    );
+  }
+
+  // Fix-6 (Money MEDIUM): scale ausente = ativo não registrado ou disabled.
+  // Nunca assumir scale=2; falhar explicitamente para evitar representação errada.
+  if (scale === null || scale === undefined || !Number.isInteger(scale)) {
+    throw new Error(
+      `minorUnitsToDecimalStr: scale ausente no Asset Registry para asset_code=${assetCode ?? "desconhecido"}. ` +
+        "Ativo não registrado ou disabled — impossível converter minor-units sem scale autoritativo (TX-2/DA-10)."
     );
   }
 
@@ -206,7 +218,9 @@ export class PostgresPaymentsAdapter implements PaymentsAdapter {
       // Agrega saldo por ativo: soma (debit - credit) de postings por conta do tenant.
       // A view account_balances já faz isso por conta; aqui somamos por asset_code.
       // Filtramos kind = 'liability' para pegar apenas as contas do anunciante.
-      // JOIN com asset_registry para obter scale e name autoritativos (TX-2/DA-10).
+      // INNER JOIN com asset_registry: todo ativo com saldo DEVE estar registrado (TX-2/DA-10).
+      // Se o JOIN não achar o ativo, a query retorna zero linhas para esse ativo —
+      // preferível a representar com scale errado (Fix-6).
       const result = await client.query<{
         asset_code: string;
         balance: string;       // NUMERIC retorna como string no driver pg
@@ -218,11 +232,12 @@ export class PostgresPaymentsAdapter implements PaymentsAdapter {
            -- Agrega saldo de TODAS as contas do tenant neste ativo (liability).
            -- NUMERIC::text preserva a precisão sem perda de float (TX-2).
            SUM(ab.balance)::text               AS balance,
-           COALESCE(ar.name, ab.asset_code)    AS name,
-           -- Fix-6: ::int uniformiza o cast (igual a listPaymentStatus/getPaymentDetail).
-           COALESCE(ar.scale::int, 2)          AS scale
+           ar.name                             AS name,
+           -- Fix-6 (Money MEDIUM): sem COALESCE — scale NULL indica ativo não registrado.
+           -- INNER JOIN garante que só ativos registrados chegam aqui.
+           ar.scale::int                       AS scale
          FROM ledger.account_balances ab
-         LEFT JOIN asset_registry.assets ar ON ar.code = ab.asset_code
+         INNER JOIN asset_registry.assets ar ON ar.code = ab.asset_code
          WHERE ab.kind = 'liability'
            AND ab.tenant_id = NULLIF(current_setting('adserver.tenant_id', true), '')::uuid
          GROUP BY ab.asset_code, ar.name, ar.scale
@@ -233,14 +248,15 @@ export class PostgresPaymentsAdapter implements PaymentsAdapter {
 
       return result.rows.map((row) => {
         // TX-2: converte NUMERIC (minor-units) para string DECIMAL via scale.
-        const scale = row.scale as number;
-        const decimalStr = minorUnitsToDecimalStr(row.balance, scale);
+        // Fix-6: INNER JOIN garante que scale nunca é null aqui; minorUnitsToDecimalStr
+        // lançaria erro auditável como defesa em profundidade se ocorresse.
+        const decimalStr = minorUnitsToDecimalStr(row.balance, row.scale, row.asset_code);
         // pgNumericToWire valida que o resultado é string DECIMAL válida.
         const wire = pgNumericToWire(decimalStr, row.asset_code);
         return {
           asset_code: row.asset_code,
           amount: wire.amount,
-          scale,
+          scale: row.scale,
           label: row.name,
         };
       });
@@ -363,7 +379,7 @@ export class PostgresPaymentsAdapter implements PaymentsAdapter {
         status: string;
         asset_code: string;
         amount_minor: string;   // SUM(debit_amount)::text — NUMERIC como string
-        scale: number;          // COALESCE(ar.scale, 2) — SMALLINT
+        scale: number | null;   // Fix-6: null se ativo não registrado (sem COALESCE)
         created_at: string;     // TIMESTAMPTZ como string ISO-8601
         pix_e2e_id: string | null;
         tx_hash: string | null;
@@ -377,8 +393,10 @@ export class PostgresPaymentsAdapter implements PaymentsAdapter {
            MIN(p.asset_code)                        AS asset_code,
            -- Soma debit_amount (lado plataforma recebeu) — NUMERIC::text (TX-2).
            SUM(p.debit_amount)::text                AS amount_minor,
-           -- Scale autoritativo do ativo (asset_registry — DA-10).
-           COALESCE(MAX(ar.scale)::int, 2)          AS scale,
+           -- Fix-6 (Money MEDIUM): sem COALESCE — scale NULL propagado explicitamente.
+           -- LEFT JOIN preservado: entries com asset desconhecido chegam com scale=NULL
+           -- e minorUnitsToDecimalStr lançará erro auditável (TX-2/DA-10).
+           MAX(ar.scale)::int                       AS scale,
            je.created_at::text                      AS created_at,
            -- pix_e2e_id: apenas para trilho fiat_asaas — opaco, sem PII.
            je.metadata->>'pix_e2e_id'               AS pix_e2e_id,
@@ -405,8 +423,8 @@ export class PostgresPaymentsAdapter implements PaymentsAdapter {
           continue;
         }
 
-        const scale = row.scale as number;
-        const decimalStr = minorUnitsToDecimalStr(row.amount_minor, scale);
+        // Fix-6 (Money MEDIUM): scale null → minorUnitsToDecimalStr lança erro auditável.
+        const decimalStr = minorUnitsToDecimalStr(row.amount_minor, row.scale, row.asset_code);
         const wire = pgNumericToWire(decimalStr, row.asset_code);
 
         const item: PaymentStatusItem = {
@@ -498,7 +516,7 @@ export class PostgresPaymentsAdapter implements PaymentsAdapter {
         status: string;
         asset_code: string;
         amount_minor: string;
-        scale: number;
+        scale: number | null;  // Fix-6: null se ativo não registrado (sem COALESCE)
         created_at: string;
         pix_e2e_id: string | null;
         tx_hash: string | null;
@@ -509,7 +527,10 @@ export class PostgresPaymentsAdapter implements PaymentsAdapter {
            je.status::text,
            MIN(p.asset_code)                        AS asset_code,
            SUM(p.debit_amount)::text                AS amount_minor,
-           COALESCE(MAX(ar.scale)::int, 2)          AS scale,
+           -- Fix-6 (Money MEDIUM): sem COALESCE — scale NULL propagado explicitamente.
+           -- LEFT JOIN preservado: entries com asset desconhecido chegam com scale=NULL
+           -- e minorUnitsToDecimalStr lançará erro auditável (TX-2/DA-10).
+           MAX(ar.scale)::int                       AS scale,
            je.created_at::text                      AS created_at,
            je.metadata->>'pix_e2e_id'               AS pix_e2e_id,
            je.metadata->>'tx_hash'                  AS tx_hash
@@ -542,8 +563,8 @@ export class PostgresPaymentsAdapter implements PaymentsAdapter {
         return null;
       }
 
-      const scale = row.scale as number;
-      const decimalStr = minorUnitsToDecimalStr(row.amount_minor, scale);
+      // Fix-6 (Money MEDIUM): scale null → minorUnitsToDecimalStr lança erro auditável.
+      const decimalStr = minorUnitsToDecimalStr(row.amount_minor, row.scale, row.asset_code);
       const wire = pgNumericToWire(decimalStr, row.asset_code);
 
       const item: PaymentStatusItem = {

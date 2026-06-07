@@ -142,6 +142,36 @@ describe("Conversão NUMERIC → string DECIMAL (TX-2)", () => {
     // "150000.000000000000000000" — zeros à direita → OK (padrão NUMERIC(40,18)).
     expect(() => localMinorUnitsToDecimalStr("150000.000000000000000000", 2)).not.toThrow();
   });
+
+  // Fix-6 (Money MEDIUM): scale ausente/null deve lançar erro auditável com asset_code.
+  // Nunca assumir scale=2 — falhar alto e claro (TX-2/DA-10).
+  test("lança erro auditável quando scale é null (Fix-6 — ativo não registrado)", () => {
+    expect(() => localMinorUnitsToDecimalStr("1000000", null, "USDC")).toThrow(
+      /scale ausente no Asset Registry para asset_code=USDC/
+    );
+    expect(() => localMinorUnitsToDecimalStr("1000000000000000000", null, "AEV")).toThrow(
+      /scale ausente no Asset Registry para asset_code=AEV/
+    );
+    // asset_code desconhecido — mensagem menciona "desconhecido"
+    expect(() => localMinorUnitsToDecimalStr("500", null)).toThrow(
+      /scale ausente no Asset Registry para asset_code=desconhecido/
+    );
+  });
+
+  test("lança erro auditável quando scale é undefined (Fix-6 — ativo disabled/TBD)", () => {
+    expect(() => localMinorUnitsToDecimalStr("1000000", undefined, "BND")).toThrow(
+      /scale ausente no Asset Registry para asset_code=BND/
+    );
+  });
+
+  test("scale=6 (USDC) e scale=18 (ERC-20) nunca são tratados como scale=2 (Fix-6)", () => {
+    // Garante que ativos crypto com scale correto convertem sem erro.
+    expect(localMinorUnitsToDecimalStr("1000000", 6, "USDC")).toBe("1.000000");
+    expect(localMinorUnitsToDecimalStr("1000000000000000000", 18, "AEV")).toBe("1.000000000000000000");
+    // E que scale=2 não seria o resultado de um fallback silencioso para esses valores.
+    // 1000000 minor-units com scale=2 seria "10000.00" — errado para USDC.
+    expect(localMinorUnitsToDecimalStr("1000000", 6, "USDC")).not.toBe("10000.00");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -502,7 +532,15 @@ describe("Fix-3 (LOW-1): isolamento por tenant — transação + set_config (CRI
 // porque são funções de módulo não exportadas)
 // ---------------------------------------------------------------------------
 
-function localMinorUnitsToDecimalStr(pgNumericStr: string, scale: number): string {
+function localMinorUnitsToDecimalStr(pgNumericStr: string, scale: number | null | undefined, assetCode?: string): string {
+  // Fix-6 (Money MEDIUM): scale ausente → erro auditável (espelha o adapter).
+  if (scale === null || scale === undefined || !Number.isInteger(scale)) {
+    throw new Error(
+      `minorUnitsToDecimalStr: scale ausente no Asset Registry para asset_code=${assetCode ?? "desconhecido"}. ` +
+        "Ativo não registrado ou disabled — impossível converter minor-units sem scale autoritativo (TX-2/DA-10)."
+    );
+  }
+
   const dotIdx = pgNumericStr.indexOf(".");
   const intPart = dotIdx >= 0 ? pgNumericStr.slice(0, dotIdx) : pgNumericStr;
 
