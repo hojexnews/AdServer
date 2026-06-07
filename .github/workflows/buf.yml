@@ -40,3 +40,9 @@ jobs:
           breaking_against: "https://github.com/${{ github.repository }}.git#branch=main,subdir=proto"
           # nao publicamos no BSR a partir da CI (sem token); so validamos.
           push: false
+
+      # Verifica que gen/ esta em sync com os .proto atuais (TX-1 / staleness gate).
+      # Usa o mesmo alvo do Makefile para manter fonte unica de verdade.
+      # buf ja esta no PATH do runner via buf-action.
+      - name: gen/ staleness check (proto-gen-check)
+        run: make proto-gen-check

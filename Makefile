@@ -53,6 +53,37 @@ proto-build:
 proto-gen:
 	cd proto && $(BUF) generate
 
+## proto-gen-check: verifica que gen/ esta em sync com os .proto atuais (requer rede)
+# Regenera em tmpdir isolado e compara com gen/ via diff -rq.
+# Detecta arquivos novos, modificados e removidos sem tocar o working tree.
+# NAO entra no alvo verify (verify e offline/hermetico; proto-gen-check depende de rede).
+proto-gen-check:
+	@set -eo pipefail; \
+	REPO_ROOT="$(CURDIR)"; \
+	TMPDIR_GEN=$$(mktemp -d); \
+	TMPDIR_PROTO=$$(mktemp -d); \
+	trap 'rm -rf "$$TMPDIR_GEN" "$$TMPDIR_PROTO"' EXIT; \
+	echo "proto-gen-check: preparando tmpdir ..."; \
+	mkdir -p "$$TMPDIR_GEN/go" "$$TMPDIR_GEN/ts"; \
+	TEMPLATE="$$TMPDIR_PROTO/buf.gen.yaml"; \
+	sed \
+	  "s|out: ../gen/go|out: $$TMPDIR_GEN/go|; s|out: ../gen/ts|out: $$TMPDIR_GEN/ts|" \
+	  "$$REPO_ROOT/proto/buf.gen.yaml" > "$$TEMPLATE"; \
+	echo "proto-gen-check: regenerando ..."; \
+	cd "$$REPO_ROOT/proto" && $(BUF) generate --template "$$TEMPLATE"; \
+	echo "proto-gen-check: comparando go/ ..."; \
+	DIFF_GO=$$(diff -rq "$$REPO_ROOT/gen/go" "$$TMPDIR_GEN/go" 2>&1 || true); \
+	echo "proto-gen-check: comparando ts/ ..."; \
+	DIFF_TS=$$(diff -rq "$$REPO_ROOT/gen/ts" "$$TMPDIR_GEN/ts" 2>&1 || true); \
+	if [ -n "$$DIFF_GO" ] || [ -n "$$DIFF_TS" ]; then \
+	  echo "FAIL — gen/ diverge do proto/ atual:"; \
+	  [ -n "$$DIFF_GO" ] && echo "  Go:" && echo "$$DIFF_GO" | sed 's/^/    /'; \
+	  [ -n "$$DIFF_TS" ] && echo "  TS:" && echo "$$DIFF_TS" | sed 's/^/    /'; \
+	  echo "Execute 'make proto-gen' e commit os arquivos gerados."; \
+	  exit 1; \
+	fi; \
+	echo "OK — gen/ esta em sync com proto/."
+
 ## no-float: roda os guards anti-float (TX-2) se os scripts existirem
 no-float:
 	@failed=0; for s in scripts/ci/no-float-*.sh; do [ -f "$$s" ] && { echo "== $$s"; bash "$$s" || failed=1; }; done; exit $$failed
@@ -61,4 +92,4 @@ no-float:
 verify: proto-lint proto-format-check proto-build proto-breaking no-float
 	@echo "OK — contratos validados (TX-1/TX-2)."
 
-.PHONY: help tools proto-lint proto-format proto-format-check proto-breaking proto-build proto-gen no-float verify
+.PHONY: help tools proto-lint proto-format proto-format-check proto-breaking proto-build proto-gen proto-gen-check no-float verify
