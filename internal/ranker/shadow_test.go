@@ -391,3 +391,31 @@ func TestShadowParityGate(t *testing.T) {
 		t.Errorf("expected 1 shadow record to be emitted, got %d", len(sink.records))
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Concurrency tests (Defeito 2 — race detector must report ZERO races)
+// ---------------------------------------------------------------------------
+
+// TestBanditRanker_ConcurrentRankAndLastResult spawns N goroutines that call
+// Rank + LastResult + WithConfig in parallel on the same BanditRanker instance.
+// Under -race, this would trigger a data race on .last and .cfg before the
+// sync.Mutex fix.
+func TestBanditRanker_ConcurrentRankAndLastResult(t *testing.T) {
+	const goroutines = 20
+	inner := New("/tmp/bandit-race-test-noexist.sock", 5*time.Millisecond, nil)
+	br := NewBanditRanker(inner, BanditConfig{BanditEnabled: false}, nil)
+
+	done := make(chan struct{})
+	for i := 0; i < goroutines; i++ {
+		go func(n int) {
+			defer func() { done <- struct{}{} }()
+			candidates := makeShadowCandidates("a", "b", "c")
+			br.WithConfig(BanditConfig{BanditEnabled: false, Epsilon: float64(n) * 0.01})
+			br.Rank(candidates)
+			_ = br.LastResult()
+		}(i)
+	}
+	for i := 0; i < goroutines; i++ {
+		<-done
+	}
+}

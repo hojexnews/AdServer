@@ -30,6 +30,7 @@ package ranker
 
 import (
 	"math/rand/v2"
+	"sync"
 
 	"github.com/hojex/adserver/internal/cascade"
 )
@@ -60,9 +61,11 @@ type BanditRankerResult struct {
 // Instantiate with NewBanditRanker. The zero value is not usable.
 type BanditRanker struct {
 	inner  *MLRanker
-	cfg    BanditConfig
 	rng    *rand.Rand // nil → fresh source per call
-	last   BanditRankerResult
+
+	mu   sync.Mutex
+	cfg  BanditConfig
+	last BanditRankerResult
 }
 
 // NewBanditRanker creates a BanditRanker.
@@ -79,10 +82,12 @@ func NewBanditRanker(inner *MLRanker, cfg BanditConfig, rng *rand.Rand) *BanditR
 	}
 }
 
-// WithConfig atomically replaces the bandit configuration.
+// WithConfig replaces the bandit configuration under the mutex.
 // Used by the decision handler to update epsilon from the A/B config each request.
 func (b *BanditRanker) WithConfig(cfg BanditConfig) {
+	b.mu.Lock()
 	b.cfg = cfg
+	b.mu.Unlock()
 }
 
 // Rank implements cascade.Ranker.
@@ -91,14 +96,21 @@ func (b *BanditRanker) WithConfig(cfg BanditConfig) {
 // Exploration: applies ExploreRank with the current BanditConfig.
 // Fail-open: if inner.Rank fails, returns the original slice (TX-4).
 func (b *BanditRanker) Rank(candidates []*cascade.Candidate) []*cascade.Candidate {
-	// Step 1: ML scoring.
+	// Step 1: read cfg under lock before releasing it for the (possibly slow)
+	// ML scoring call. This prevents a concurrent WithConfig from racing with
+	// the cfg read inside ExploreRank.
+	b.mu.Lock()
+	cfg := b.cfg
+	b.mu.Unlock()
+
+	// Step 2: ML scoring (inner.Rank is independently safe via its own mutex).
 	ranked := b.inner.Rank(candidates)
 	rankResult := b.inner.LastResult()
 
 	if rankResult.FailOpen {
 		// Sidecar unavailable — fail-open: return the original unmodified slice.
 		// ExploreResult.Propensity = 1.0 (deterministic fallback).
-		b.last = BanditRankerResult{
+		res := BanditRankerResult{
 			RankResult: rankResult,
 			ExploreResult: ExploreResult{
 				Ordered:    candidates,
@@ -107,24 +119,31 @@ func (b *BanditRanker) Rank(candidates []*cascade.Candidate) []*cascade.Candidat
 				Explored:   false,
 			},
 		}
+		b.mu.Lock()
+		b.last = res
+		b.mu.Unlock()
 		return candidates
 	}
 
-	// Step 2: Bandit exploration over the ML-ranked candidates.
+	// Step 3: Bandit exploration over the ML-ranked candidates.
 	// ExploreRank is a no-op when cfg.BanditEnabled=false (control / disabled).
-	exploreRes := ExploreRank(b.cfg, ranked, rankResult.Scores, b.rng)
+	exploreRes := ExploreRank(cfg, ranked, rankResult.Scores, b.rng)
 
-	b.last = BanditRankerResult{
+	res := BanditRankerResult{
 		RankResult:    rankResult,
 		ExploreResult: exploreRes,
 	}
+	b.mu.Lock()
+	b.last = res
+	b.mu.Unlock()
 
 	return exploreRes.Ordered
 }
 
 // LastResult returns the BanditRankerResult from the most recent Rank call.
-// Must be called on the same goroutine immediately after the cascade.Decide
-// that invoked Rank.
+// Safe for concurrent callers: the result is copied under the mutex.
 func (b *BanditRanker) LastResult() BanditRankerResult {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	return b.last
 }
