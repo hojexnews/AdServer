@@ -1,0 +1,112 @@
+# ml — testes Python para ML pipeline (J3/J4/J6) e services/copilot (J5).
+#
+# Jobs:
+#   ml-fast      — make ml-test-fast  (OPE + features + promote, ~10 s)
+#   ml-batch     — make ml-batch-test (pacing + fraud + unsup, ~30 s)
+#   copilot-test — make copilot-test  (125 testes HITL/gateway/security, ~5 s)
+#
+# ml-training e ml-deep ficam fora deste workflow por custo (PyTorch/ONNX).
+# Podem ser acionados manualmente via workflow_dispatch ou scheduled.
+#
+# Instalacao de dependencias: setup-python + pip install direto dos
+# pyproject.toml/requirements existentes — nao depende do venv commitado.
+name: ml
+
+on:
+  pull_request:
+    paths:
+      - "ml/**"
+      - "services/copilot/**"
+      - "make/ml.mk"
+      - "make/ml-batch.mk"
+      - "make/copilot.mk"
+      - ".github/workflows/ml.yml"
+  push:
+    branches: [main]
+    paths:
+      - "ml/**"
+      - "services/copilot/**"
+      - "make/ml.mk"
+      - "make/ml-batch.mk"
+      - "make/copilot.mk"
+      - ".github/workflows/ml.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  # -----------------------------------------------------------------------
+  # ml-fast: gate rapido de CI (OPE + featurizacao + promote).
+  # Nao inclui treino nem deep ranker — sem PyTorch.
+  # -----------------------------------------------------------------------
+  ml-fast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: instalar dependencias ML (core)
+        run: |
+          pip install --quiet \
+            numpy \
+            pandas \
+            scipy \
+            scikit-learn \
+            lightgbm \
+            mlflow-skinny \
+            pytest \
+            pytest-asyncio \
+            pytest-cov
+
+      - name: ml-test-fast (OPE + features + promote)
+        run: make ml-test-fast
+
+  # -----------------------------------------------------------------------
+  # ml-batch: testes de pacing + fraud supervisionado + fraude nao-supervisionada.
+  # -----------------------------------------------------------------------
+  ml-batch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: instalar dependencias ML batch (pacing + fraud)
+        run: |
+          pip install --quiet \
+            numpy \
+            pandas \
+            scipy \
+            scikit-learn \
+            lightgbm \
+            pytest \
+            pytest-asyncio \
+            pytest-cov
+
+      - name: ml-batch-test (pacing + fraud + unsup)
+        run: make ml-batch-test
+
+  # -----------------------------------------------------------------------
+  # copilot-test: 125 testes de services/copilot/ (J5 — HITL, gateway,
+  # model-router, schemas, security). Aciona tambem em paths de copilot.
+  # -----------------------------------------------------------------------
+  copilot-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: instalar adserver-copilot[dev]
+        working-directory: services/copilot
+        run: pip install --quiet -e ".[dev]"
+
+      - name: copilot-test (J5 — 125 testes)
+        run: PYTHONPATH=. python -m pytest services/copilot/tests/ -v
