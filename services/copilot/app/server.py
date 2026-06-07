@@ -586,6 +586,23 @@ async def get_session_state(
 
         values = state.values if hasattr(state, "values") else {}
 
+        # C1: verificação de posse — tenant_id do estado deve coincidir com o da sessão
+        state_tenant_id = values.get("tenant_id")
+        tenant_id = session.tenant_id
+        if state_tenant_id != tenant_id:
+            correlation_id = str(uuid.uuid4())
+            log.warning(
+                "get_session_state.tenant_mismatch",
+                session_tenant_id=tenant_id,
+                state_tenant_id=state_tenant_id,
+                thread_id=session_id,
+                correlation_id=correlation_id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Acesso negado: este thread não pertence ao tenant da sessão.",
+            )
+
         # Filtra campos internos/sensíveis antes de expor
         safe_state = {
             "session_id": session_id,

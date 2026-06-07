@@ -512,6 +512,49 @@ class TestC1HitlCrossTenantIDOR:
         # Não deve vir de body
         assert "tenant_id = body." not in source
 
+    def test_get_session_state_source_has_tenant_check(self) -> None:
+        """
+        C1: server.py/get_session_state deve conter verificação de posse
+        (state_tenant_id != tenant_id → 403) antes de expor safe_state.
+        Tenant B NÃO pode ler o estado de um thread criado pelo tenant A.
+        """
+        with open(
+            os.path.join(os.path.dirname(__file__), "../app/server.py"),
+            encoding="utf-8",
+        ) as f:
+            source = f.read()
+
+        # Isola a função get_session_state
+        fn_start = source.index("async def get_session_state(")
+        fn_section = source[fn_start:]
+        # Próxima definição de nível de módulo delimita o fim (@app. ou def _sse)
+        for marker in ("\n\n@app.", "\n\ndef _sse(", "\n\n# ---"):
+            idx = fn_section.find(marker, 1)
+            if idx != -1:
+                fn_section = fn_section[:idx]
+                break
+
+        # Deve ter a verificação de posse C1
+        assert "state_tenant_id != tenant_id" in fn_section, (
+            "get_session_state deve verificar state_tenant_id != tenant_id (C1 IDOR)"
+        )
+        # Deve retornar 403 no mismatch
+        assert "HTTP_403_FORBIDDEN" in fn_section, (
+            "get_session_state deve retornar 403 quando tenants não coincidem"
+        )
+        # O check deve ocorrer ANTES de expor safe_state
+        tenant_check_pos = fn_section.index("state_tenant_id != tenant_id")
+        safe_state_pos = fn_section.index("safe_state")
+        assert tenant_check_pos < safe_state_pos, (
+            "Verificação de tenant deve ocorrer ANTES da montagem de safe_state"
+        )
+        # Não deve vazar dados do outro tenant: tenant_id em safe_state usa session,
+        # mas o check bloqueia antes de chegar lá — confirmado pela ordem acima.
+        # Adicionalmente: log estruturado de tenant_mismatch deve estar presente.
+        assert "get_session_state.tenant_mismatch" in fn_section, (
+            "get_session_state deve logar tenant_mismatch com log estruturado"
+        )
+
 
 # =============================================================================
 # M2 — validate_creative gate no caminho de escrita de banner
