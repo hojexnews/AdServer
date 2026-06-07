@@ -74,12 +74,12 @@ VALUES
     (toStartOfHour(now()), '11111111-1111-4111-a111-111111111111',
      'camp-a', 'banner-a', 'zone-a', 'BRL',
      uniqState('evt-req-a'), uniqState('evt-imp-a'), uniqState('evt-clk-a'),
-     uniqState('evt-cvr-a'), sumState(toDecimal256(100, 18))),
+     uniqState('evt-cvr-a'), sumState(toDecimal128(100, 18))),
     -- Tenant B
     (toStartOfHour(now()), '22222222-2222-4222-a222-222222222222',
      'camp-b', 'banner-b', 'zone-b', 'USD',
      uniqState('evt-req-b'), uniqState('evt-imp-b'), uniqState('evt-clk-b'),
-     uniqState('evt-cvr-b'), sumState(toDecimal256(200, 18)));
+     uniqState('evt-cvr-b'), sumState(toDecimal128(200, 18)));
 
 INSERT INTO adserver.raw_impression
     (tenant_id, event_id, decision_id, model_version, occurred_at,

@@ -89,12 +89,12 @@ SELECT
     ''                             AS currency,
     uniqState(event_id)            AS requests_state,
     -- impressions/clicks/conversions nao se originam de ad_request:
-    -- inicializar com estado vazio via uniqState de string constante vazia
-    -- (estado zero; sera mesclado com zeros nas outras MVs).
-    uniqState(toNullable(''))      AS impressions_state,
-    uniqState(toNullable(''))      AS clicks_state,
-    uniqState(toNullable(''))      AS conversions_state,
-    sumState(toDecimal256(0, 18))  AS conversion_value_state
+    -- estado zero via uniqStateIf com condicao impossivel (1=0 nunca e verdadeiro);
+    -- produz AggregateFunction(uniq, String) com contagem zero (sem +1 fantasma).
+    uniqStateIf(event_id, 1 = 0)  AS impressions_state,
+    uniqStateIf(event_id, 1 = 0)  AS clicks_state,
+    uniqStateIf(event_id, 1 = 0)  AS conversions_state,
+    sumState(toDecimal128(0, 18))  AS conversion_value_state
 FROM adserver.raw_ad_request
 GROUP BY hour_bucket, tenant_id, campaign_id, banner_id, zone_id, currency;
 
@@ -118,9 +118,9 @@ SELECT
     -- Impressoes validas: nao-blank E clean (sem IVT)
     uniqStateIf(event_id, blank = 0 AND ivt_status = '' AND billable = 1)
                                    AS impressions_state,
-    uniqState(toNullable(''))      AS clicks_state,
-    uniqState(toNullable(''))      AS conversions_state,
-    sumState(toDecimal256(0, 18))  AS conversion_value_state
+    uniqStateIf(event_id, 1 = 0)  AS clicks_state,
+    uniqStateIf(event_id, 1 = 0)  AS conversions_state,
+    sumState(toDecimal128(0, 18))  AS conversion_value_state
 FROM adserver.raw_impression
 GROUP BY hour_bucket, tenant_id, campaign_id, banner_id, zone_id, currency;
 
@@ -138,11 +138,11 @@ SELECT
     banner_id,
     zone_id,
     ''                             AS currency,
-    uniqState(toNullable(''))      AS requests_state,
-    uniqState(toNullable(''))      AS impressions_state,
+    uniqStateIf(event_id, 1 = 0)  AS requests_state,
+    uniqStateIf(event_id, 1 = 0)  AS impressions_state,
     uniqState(event_id)            AS clicks_state,
-    uniqState(toNullable(''))      AS conversions_state,
-    sumState(toDecimal256(0, 18))  AS conversion_value_state
+    uniqStateIf(event_id, 1 = 0)  AS conversions_state,
+    sumState(toDecimal128(0, 18))  AS conversion_value_state
 FROM adserver.raw_click
 GROUP BY hour_bucket, tenant_id, campaign_id, banner_id, zone_id, currency;
 
@@ -162,9 +162,9 @@ SELECT
     banner_id,
     ''                                 AS zone_id,      -- zone_id nao existe em Conversion
     conversion_value_asset_code        AS currency,
-    uniqState(toNullable(''))          AS requests_state,
-    uniqState(toNullable(''))          AS impressions_state,
-    uniqState(toNullable(''))          AS clicks_state,
+    uniqStateIf(event_id, 1 = 0)      AS requests_state,
+    uniqStateIf(event_id, 1 = 0)      AS impressions_state,
+    uniqStateIf(event_id, 1 = 0)      AS clicks_state,
     -- Apenas conversions validas (nao-deduplicated)
     uniqStateIf(event_id, deduplicated = 0)
                                        AS conversions_state,
