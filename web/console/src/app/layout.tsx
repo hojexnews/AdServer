@@ -5,12 +5,30 @@
  */
 
 import type { Metadata } from "next";
+import Link from "next/link";
 import "./globals.css";
 import { Providers } from "@/components/providers";
+import { Logo } from "@/components/logo";
 
 export const metadata: Metadata = {
-  title: "AdServer Console",
+  metadataBase: new URL(
+    process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000",
+  ),
+  title: {
+    default: "AdServer Console",
+    template: "%s · AdServer Console",
+  },
   description: "Console self-service do anunciante — Hojex AdServer",
+  applicationName: "Hojex AdServer",
+  // favicon/icon/apple-icon/opengraph-image são resolvidos pelas convenções de
+  // arquivo do App Router (src/app/icon.png, apple-icon.png, opengraph-image.png).
+  openGraph: {
+    type: "website",
+    siteName: "Hojex AdServer",
+    title: "AdServer Console",
+    description: "Console self-service do anunciante — Hojex AdServer",
+    locale: "pt_BR",
+  },
 };
 
 export default function RootLayout({
@@ -37,9 +55,9 @@ export default function RootLayout({
               className="w-64 shrink-0 border-r border-gray-200 bg-white"
             >
               <div className="flex h-16 items-center border-b border-gray-200 px-6">
-                <span className="text-lg font-semibold text-brand-700">
-                  AdServer Console
-                </span>
+                <Link href="/" aria-label="Hojex AdServer — início" className="rounded focus-visible:ring-2 focus-visible:ring-brand-500">
+                  <Logo markSize={28} />
+                </Link>
               </div>
               <NavLinks />
             </nav>

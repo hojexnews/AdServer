@@ -294,7 +294,9 @@ export const config = {
      * - _next/static (assets estáticos)
      * - _next/image (otimização de imagem)
      * - favicon.ico, robots.txt, etc.
+     * - ícones/OG do App Router (icon.png, apple-icon.png, opengraph-image.png),
+     *   que o <head> referencia mesmo em páginas não autenticadas.
      */
-    "/((?!_next/static|_next/image|favicon.ico|robots.txt|sitemap.xml).*)",
+    "/((?!_next/static|_next/image|favicon.ico|icon.png|apple-icon.png|opengraph-image.png|robots.txt|sitemap.xml).*)",
   ],
 };
