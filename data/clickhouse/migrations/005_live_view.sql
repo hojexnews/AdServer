@@ -91,7 +91,19 @@ LEFT JOIN (SELECT * FROM adserver.raw_click FINAL) ck
     AND r.zone_id    = ck.zone_id
     AND toStartOfMinute(r.occurred_at) = toStartOfMinute(ck.occurred_at)
     AND r.tenant_id = ck.tenant_id
-LEFT JOIN (SELECT * FROM adserver.raw_conversion FINAL) cv
+LEFT JOIN (
+    -- Projecao explicita: SELECT * exclui colunas MATERIALIZED no CH 24.x (Code 47).
+    -- conversion_value_decimal e MATERIALIZED em raw_conversion; deve ser listada.
+    SELECT
+        tenant_id, event_id, decision_id, model_version, occurred_at,
+        schema_version, source, ingested_at,
+        campaign_id, banner_id,
+        conversion_value_amount, conversion_value_asset_code,
+        conversion_value_scale,
+        conversion_value_decimal,
+        attribution_decision_id, deduplicated
+    FROM adserver.raw_conversion FINAL
+) cv
     ON r.campaign_id = cv.campaign_id
     AND r.banner_id  = cv.banner_id
     AND toStartOfMinute(r.occurred_at) = toStartOfMinute(cv.occurred_at)
