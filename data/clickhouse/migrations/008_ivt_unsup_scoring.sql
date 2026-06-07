@@ -124,7 +124,7 @@ TO tenant_role;
 CREATE ROW POLICY IF NOT EXISTS rp_raw_ivt_unsup_score_admin
 ON adserver.raw_ivt_unsup_score
 FOR SELECT USING 1 = 1
-TO adserver_ingest, adserver_billing, adserver_admin;
+TO adserver_admin_role;
 
 -- Conceder SELECT em raw_ivt_unsup_score para tenant_role
 -- (permite auditoria do scoring nao-supervisionado do proprio tenant)

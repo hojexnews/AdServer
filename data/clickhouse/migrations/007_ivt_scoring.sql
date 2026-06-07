@@ -227,7 +227,7 @@ TO tenant_role;
 CREATE ROW POLICY IF NOT EXISTS rp_raw_ivt_score_admin
 ON adserver.raw_ivt_score
 FOR SELECT USING 1 = 1
-TO adserver_ingest, adserver_billing, adserver_admin;
+TO adserver_admin_role;
 
 -- Conceder SELECT em raw_ivt_score para tenant_role (auditoria de scoring do proprio tenant)
 -- e para raw_impression_clean (alias de leitura, view, usa policy de raw_impression)
