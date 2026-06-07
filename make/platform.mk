@@ -27,6 +27,12 @@ KYVERNO_CLI   := $(shell command -v kyverno 2>/dev/null || echo $(BIN)/kyverno)
 KUBECONFORM_VER := 0.7.0
 KYVERNO_CLI_VER := 1.13.4
 
+# SHA256 dos tarballs de instalacao local (sincronizado com .github/workflows/platform.yml).
+# Fonte autoritativa: .github/workflows/platform.yml (env: KUBECONFORM_SHA256 / KYVERNO_SHA256).
+# Atualizar aqui ao bumpar KUBECONFORM_VER / KYVERNO_CLI_VER acima.
+KUBECONFORM_SHA256 := c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3
+KYVERNO_SHA256     := abd318dbb971ab6de2bbe3b7226f4a03230d5c9c651df8a29b6b5e085a55aeeb
+
 # Imagem do OTel Collector contrib para validacao semantica da config TX-5.
 # Espelha OTELCOL_IMAGE em .github/workflows/platform.yml — manter em sincronia.
 OTELCOL_IMAGE := otel/opentelemetry-collector-contrib:0.123.0
@@ -53,26 +59,31 @@ KYVERNO_TEST_DIRS := \
   platform/cells/aml-kyc/policy
 
 ## platform-tools: instala kubeconform e kyverno CLI localmente em .bin/
+##   Verifica SHA256 antes de extrair (sincronizado com M-1 do CI).
+##   Fonte autoritativa dos hashes: .github/workflows/platform.yml
 platform-tools:
 	@mkdir -p $(BIN)
 	@if ! command -v kubeconform >/dev/null 2>&1 && [ ! -x "$(BIN)/kubeconform" ]; then \
 	  echo "== platform-tools: baixando kubeconform $(KUBECONFORM_VER) ->  $(BIN)/kubeconform"; \
 	  curl -fsSL -o /tmp/kubeconform.tar.gz \
 	    "https://github.com/yannh/kubeconform/releases/download/v$(KUBECONFORM_VER)/kubeconform-linux-amd64.tar.gz"; \
+	  echo "$(KUBECONFORM_SHA256)  /tmp/kubeconform.tar.gz" | sha256sum -c - || { \
+	    echo "ERRO: sha256sum kubeconform nao confere — remova /tmp/kubeconform.tar.gz e tente novamente"; \
+	    rm -f /tmp/kubeconform.tar.gz; exit 1; }; \
 	  tar -xzf /tmp/kubeconform.tar.gz -C $(BIN) kubeconform; \
 	  chmod +x $(BIN)/kubeconform; \
 	  rm -f /tmp/kubeconform.tar.gz; \
 	fi
 	@if ! command -v kyverno >/dev/null 2>&1 && [ ! -x "$(BIN)/kyverno" ]; then \
 	  echo "== platform-tools: baixando kyverno CLI $(KYVERNO_CLI_VER) -> $(BIN)/kyverno"; \
-	  curl -fsSL -o $(BIN)/kyverno \
-	    "https://github.com/kyverno/kyverno/releases/download/v$(KYVERNO_CLI_VER)/kyverno-cli_v$(KYVERNO_CLI_VER)_linux_x86_64.tar.gz" \
-	    | tar -xzO kyverno > $(BIN)/kyverno 2>/dev/null || \
-	  ( curl -fsSL -o /tmp/kyverno.tar.gz \
-	      "https://github.com/kyverno/kyverno/releases/download/v$(KYVERNO_CLI_VER)/kyverno-cli_v$(KYVERNO_CLI_VER)_linux_x86_64.tar.gz" && \
-	    tar -xzf /tmp/kyverno.tar.gz -C $(BIN) kyverno && \
-	    rm -f /tmp/kyverno.tar.gz ); \
+	  curl -fsSL -o /tmp/kyverno.tar.gz \
+	    "https://github.com/kyverno/kyverno/releases/download/v$(KYVERNO_CLI_VER)/kyverno-cli_v$(KYVERNO_CLI_VER)_linux_x86_64.tar.gz"; \
+	  echo "$(KYVERNO_SHA256)  /tmp/kyverno.tar.gz" | sha256sum -c - || { \
+	    echo "ERRO: sha256sum kyverno nao confere — remova /tmp/kyverno.tar.gz e tente novamente"; \
+	    rm -f /tmp/kyverno.tar.gz; exit 1; }; \
+	  tar -xzf /tmp/kyverno.tar.gz -C $(BIN) kyverno; \
 	  chmod +x $(BIN)/kyverno; \
+	  rm -f /tmp/kyverno.tar.gz; \
 	fi
 	@$(KUBECONFORM) --version 2>/dev/null || $(BIN)/kubeconform --version
 	@$(KYVERNO_CLI) version 2>/dev/null || $(BIN)/kyverno version
