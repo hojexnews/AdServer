@@ -26,21 +26,21 @@ ml-batch-test: ml-batch-test-pacing ml-batch-test-fraud ml-batch-test-unsup
 ## ml-batch-test-pacing: pytest de ml/pacing/ (controlador proporcional DA-4)
 ml-batch-test-pacing:
 	@echo "== ml-batch-test-pacing =="
-	$(ML_VENV) -m pytest $(ML_PACING_DIR)/test_pacing.py -v \
+	@set -o pipefail; $(ML_VENV) -m pytest $(ML_PACING_DIR)/test_pacing.py -v \
 		--tb=short -q 2>&1 | tail -20
 	@echo "ml-batch-test-pacing: OK"
 
 ## ml-batch-test-fraud: pytest de ml/fraud/ (classificador IVT TX-6)
 ml-batch-test-fraud:
 	@echo "== ml-batch-test-fraud =="
-	$(ML_VENV) -m pytest $(ML_FRAUD_DIR)/test_fraud.py -v \
+	@set -o pipefail; $(ML_VENV) -m pytest $(ML_FRAUD_DIR)/test_fraud.py -v \
 		--tb=short -q 2>&1 | tail -30
 	@echo "ml-batch-test-fraud: OK"
 
 ## ml-batch-test-unsup: pytest de ml/fraud/test_unsup.py (IVT nao-supervisionado K2: IF + AE)
 ml-batch-test-unsup:
 	@echo "== ml-batch-test-unsup (K2 — IF + Autoencoder) =="
-	PYTHONPATH=. $(ML_VENV) -m pytest $(ML_FRAUD_DIR)/test_unsup.py -v \
+	@set -o pipefail; PYTHONPATH=. $(ML_VENV) -m pytest $(ML_FRAUD_DIR)/test_unsup.py -v \
 		--tb=short -q 2>&1 | tail -40
 	@echo "ml-batch-test-unsup: OK"
 

@@ -55,7 +55,7 @@ proto-gen:
 
 ## no-float: roda os guards anti-float (TX-2) se os scripts existirem
 no-float:
-	@for s in scripts/ci/no-float-*.sh; do [ -f "$$s" ] && { echo "== $$s"; bash "$$s"; }; done; true
+	@failed=0; for s in scripts/ci/no-float-*.sh; do [ -f "$$s" ] && { echo "== $$s"; bash "$$s" || failed=1; }; done; exit $$failed
 
 ## verify: lint + format-check + build + breaking + no-float (espelha a CI)
 verify: proto-lint proto-format-check proto-build proto-breaking no-float

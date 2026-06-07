@@ -37,8 +37,7 @@ ml-ope-test:
 
 ## ml-features-test: paridade de featurizacao Python/Go
 ml-features-test:
-	PYTHONPATH=. $(PYTEST_ML) ml/features/ -v 2>/dev/null || \
-	PYTHONPATH=. $(PYTEST_ML) ml/features/python/ -v 2>/dev/null || true
+	PYTHONPATH=. $(PYTEST_ML) ml/features/ -v
 
 ## ml-training-test: pipeline de treino com dados sinteticos
 ml-training-test:

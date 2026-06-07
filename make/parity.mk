@@ -38,7 +38,7 @@ GOFLAGS :=
 ##                shadow harness, dual-run spec) — sem infra externa.
 ##                É o gate mínimo de CI antes do cutover.
 parity-golden:
-	$(GO) test $(GOFLAGS) -count=1 -race -v \
+	@set -o pipefail; $(GO) test $(GOFLAGS) -count=1 -race -v \
 		./tests/parity/... \
 		2>&1 | tee /tmp/parity-golden-$(shell date +%Y%m%d-%H%M%S).log
 	@echo ""
