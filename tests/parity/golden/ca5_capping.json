@@ -80,6 +80,22 @@
     }
   },
   {
+    "id": "CA5-005b",
+    "description": "Sem user_id + campanha SEM cap (cookieless): deve ser servido — fail-safe aplica apenas a campanhas capeadas (DA-6)",
+    "ca": "CA-5",
+    "sub": "no-userid-uncapped-allows",
+    "input": {
+      "user_id": "",
+      "campaign": {"id": "camp-1", "cap_total": 0, "cap_session": 0, "cap_clock": 0},
+      "banner": {"id": "ban-1", "cap_total": 0, "cap_session": 0, "cap_clock": 0},
+      "calls": 1
+    },
+    "expect": {
+      "results": [true],
+      "comment": "user_id vazio em campanha SEM cap: fast-path retorna true sem tocar Redis (fill cookieless, DA-6 fail-safe escopo apenas capeadas)"
+    }
+  },
+  {
     "id": "CA5-006",
     "description": "Redis indisponivel em campanha capeada: fail-safe nega entrega",
     "ca": "CA-5",

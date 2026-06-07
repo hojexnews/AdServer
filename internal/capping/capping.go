@@ -32,15 +32,20 @@
 //
 // # Fail-safe (DA-6)
 //
-// 1. No stable identifier (userID == ""): Allowed returns false immediately —
-//    silence is preferred to over-delivery.
+// 1. Uncapped campaigns (all three scopes == 0) are allowed immediately without
+//    any Redis round-trip and without requiring a stable user identifier.  An
+//    anonymous visitor (userID == "") on an uncapped campaign MUST be served —
+//    the fail-safe below applies ONLY to capped campaigns.
 //
-// 2. Redis is down / returns an error: for CAPPED campaigns, Allowed returns
+// 2. No stable identifier (userID == "") on a CAPPED campaign: Allowed returns
+//    false — silence is preferred to over-delivery on a capped campaign (DA-6).
+//
+// 3. Redis is down / returns an error: for CAPPED campaigns, Allowed returns
 //    false (fail-safe: we cannot guarantee the cap so we refuse delivery).
 //    Uncapped campaigns (all three scopes == 0) are not checked against Redis
 //    at all, so they are unaffected by Redis unavailability.
 //
-// 3. Best-effort semantics (ADR-0002 B.3): slight sub/over-delivery across
+// 4. Best-effort semantics (ADR-0002 B.3): slight sub/over-delivery across
 //    replicas is acceptable; Redis is NOT the billing source of truth.
 package capping
 
@@ -120,25 +125,30 @@ func (c *Capper) SetSalt(salt string) {
 // Allowed reports whether the given user may see the ad.
 //
 // Decision tree:
-//  1. userID == "" → false (fail-safe: no stable identifier → abort, DA-6).
+//  1. Resolve effective caps (banner overrides campaign when non-zero — DA-6).
 //  2. Campaign has no caps AND banner has no caps → true (fast path, no Redis).
-//  3. For each active scope (campaign_total, session, clock):
-//     - compute the effective cap (banner overrides campaign when non-zero).
+//     Anonymous visitors (userID == "") are served on uncapped campaigns.
+//  3. userID == "" on a CAPPED campaign → false (fail-safe: no stable identifier
+//     → abort delivery rather than risk over-counting, DA-6).
+//  4. For each active scope (campaign_total, session, clock):
 //     - increment the Redis counter; set TTL on first write.
 //     - if counter > cap → rollback the increment and return false.
 //     - if Redis errors → return false for capped campaigns (fail-safe, DA-6).
 func (c *Capper) Allowed(userID string, camp *snapshot.Campaign, ban *snapshot.Banner) (bool, error) {
-	// FAIL-SAFE (DA-6): no stable identifier → abort.
-	if userID == "" {
-		return false, nil
-	}
-
 	// Resolve effective caps (banner overrides campaign when non-zero — DA-6).
 	capTotal, capSession, capClock, clockWindowSec := effectiveCaps(camp, ban)
 
 	// Fast path: no caps active → allow without any Redis round-trip.
+	// Anonymous visitors (userID == "") are served on uncapped campaigns — the
+	// fail-safe below applies ONLY when at least one cap scope is active.
 	if capTotal == 0 && capSession == 0 && capClock == 0 {
 		return true, nil
+	}
+
+	// FAIL-SAFE (DA-6): capped campaign with no stable identifier → abort.
+	// Silence is preferred to over-delivery on a capped campaign.
+	if userID == "" {
+		return false, nil
 	}
 
 	c.mu.RLock()

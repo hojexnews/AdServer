@@ -192,6 +192,24 @@ func TestCapper_NoUserID_AbortsSilently(t *testing.T) {
 	}
 }
 
+// CA5-005b / DA-6: anonymous user (userID="") on an UNCAPPED campaign must be
+// served. The fail-safe abort applies only to capped campaigns; the uncapped
+// fast-path must short-circuit before the userID check so cookieless fill works.
+func TestCapper_AnonymousUncapped_Allowed(t *testing.T) {
+	r := newFakeRedis()
+	c := newCapper(r)
+	camp := makeCamp(0, 0, 0, 0) // no caps at all
+	ban := makeBan(0, 0, 0, 0)
+
+	ok, err := c.Allowed("", camp, ban)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected allow for anonymous user on uncapped campaign (cookieless fill), got deny — DA-6 fail-safe must not fire before uncapped fast-path")
+	}
+}
+
 // DA-6: Redis down on a capped campaign → fail-safe deny.
 func TestCapper_RedisDown_CappedCampaign_Denies(t *testing.T) {
 	r := newFakeRedis()
