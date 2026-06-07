@@ -363,3 +363,28 @@ func TestFeaturizeVectorLength(t *testing.T) {
 		t.Errorf("FeatureVectorLength = %d, want 23", FeatureVectorLength)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Concurrency tests (Defeito 1 — race detector must report ZERO races)
+// ---------------------------------------------------------------------------
+
+// TestMLRanker_ConcurrentRankAndLastResult spawns N goroutines that call
+// Rank + LastResult in parallel on the same MLRanker instance.
+// Under -race, this would trigger a data race before the sync.Mutex fix.
+func TestMLRanker_ConcurrentRankAndLastResult(t *testing.T) {
+	const goroutines = 20
+	r := New("/tmp/ranker-race-test-noexist.sock", 5*time.Millisecond, nil)
+
+	done := make(chan struct{})
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			candidates := makeCandidates("x", "y", "z")
+			r.Rank(candidates)
+			_ = r.LastResult()
+		}()
+	}
+	for i := 0; i < goroutines; i++ {
+		<-done
+	}
+}

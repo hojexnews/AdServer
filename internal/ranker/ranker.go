@@ -67,6 +67,7 @@ import (
 	"context"
 	"log/slog"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/hojex/adserver/internal/cascade"
@@ -117,11 +118,11 @@ type MLRanker struct {
 	budget       time.Duration
 	logger       *slog.Logger
 
+	mu   sync.Mutex
 	// last is the most recent RankResult from the last Rank call.
-	// This is a simple field (not channel) because Rank is called serially
-	// within a single hot-path request. It is NOT safe for concurrent calls to
-	// the same MLRanker instance; each request must use its own instance or
-	// the caller must serialize.
+	// Protected by mu: Rank (writer) and LastResult (reader) may be called
+	// from concurrent goroutines when the same MLRanker instance is shared
+	// across HTTP request handlers (RANKER_ENABLED=true, Fase 2+).
 	last RankResult
 }
 
@@ -164,13 +165,17 @@ func (r *MLRanker) WithModelVersion(v string) *MLRanker {
 // context.Background with a deadline derived from the budget.
 func (r *MLRanker) Rank(candidates []*cascade.Candidate) []*cascade.Candidate {
 	result := r.rankInternal(candidates)
+	r.mu.Lock()
 	r.last = result
+	r.mu.Unlock()
 	return result.Ordered
 }
 
 // LastResult returns the RankResult from the most recent Rank call.
-// Must be called on the same goroutine immediately after Rank returns.
+// Safe for concurrent callers: the result is copied under the mutex.
 func (r *MLRanker) LastResult() RankResult {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return r.last
 }
 
