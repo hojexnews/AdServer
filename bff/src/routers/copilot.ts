@@ -231,9 +231,15 @@ export function createCopilotRouter() {
 
         if (!resp.ok) {
           const body = await resp.text().catch(() => "");
+          const corrId = crypto.randomUUID();
+          console.error("hitlApprove.upstream_error", {
+            corrId,
+            status: resp.status,
+            body,
+          });
           throw new TRPCError({
             code: "INTERNAL_SERVER_ERROR",
-            message: `Falha ao processar aprovação HITL: ${body}`,
+            message: `Falha ao processar aprovação HITL. ID: ${corrId}`,
           });
         }
 
