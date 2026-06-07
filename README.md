@@ -446,6 +446,60 @@ desta onda. `security`/`privacy`/`money` **não acionados** — zero superfície
 `main` permanece **genuinamente esgotada em código** para escopo de produto; o próximo movimento real segue sendo
 exclusivamente **infra/spec viva externa**.
 
+### ✅ Entregue na Fase 3 — 11ª onda: gates de IaC/OTel que mentiam + malha de gate ML furada (sob ADR-0004, sem ADR novo; gates verdes)
+
+Micro-onda de **três itens** (paralelos, donos distintos, superfícies disjuntas), triada pelo
+`tech-lead-architect` numa re-triagem fresca da `main` pós-10ª onda. Sweep de saúde **todo verde com
+saída real verificada** (`make go-build` 38 pacotes, `make go-vet`, `make go-test` **27 pacotes `-race`**
+sem corrida, `make verify` = buf TX-1 BACKWARD + no-float TX-2 Go/Py/SQL/data, `make parity-golden-short`
+3 pacotes ok, `make ml-test` **90** inalterado, `make data-validate` 12 invariantes, copiloto **125 pytest**,
+BFF **51**, `make db-lint`); veredito de esgotamento de **feature** reconfirmado — e, como nas ondas
+5/6/7/8/9/10, a re-triagem achou **três defeitos código-endereçáveis reais** da mesma classe ("a spec não
+mente"): gates de CI que reportavam verde sem verificar de fato. Desta vez os defeitos eram **mais sérios**
+que drift doc-only — eram gates que **mascaravam falha**:
+
+- **`platform-tofu-validate` reportava verde com falha de validação** (`platform-infra-engineer`): dois
+  defeitos no alvo [make/platform.mk](make/platform.mk) (~86-104). (1) A guarda de skip (`@if … exit 0`)
+  ficava num bloco de recipe **separado** do uso da ferramenta; como em Make cada linha roda em shell próprio,
+  o `exit 0` encerrava só aquele shell e a linha seguinte morria com `Error 127` quando `tofu` ausente, em vez
+  de skip graceful. Fix: guarda+uso unificados num **único bloco encadeado** (mesmo padrão dos irmãos
+  `platform-kubeconform`/`platform-kyverno-test`). (2) — **achado HIGH do `security-reviewer` que BLOQUEOU** —
+  o pipeline `tofu init … | grep -v "^$$"` **sem `set -o pipefail`** engolia a falha do `init` (exit do
+  `grep`=0), imprimindo "OK"/EXIT 0 mesmo com IaC que nem inicializa: furo de invariante de CI sob
+  `PLATFORM_STRICT=1`. Fix: `@set -eo pipefail` no início do bloco ([make/platform.mk:88](make/platform.mk)).
+- **`platform-otel-validate` não passava o `otelcol validate`** (`platform-infra-engineer`): com Docker
+  presente, o `otelcol validate` da distro contrib falhava `at least one endpoint must be specified` porque os
+  exporters `otlphttp/tempo`/`otlphttp/loki`/`prometheusremotewrite` usam `endpoint: ${env:TEMPO_OTLP_URL/…}`
+  e essas vars não eram definidas — CI verde por **não-acionamento** (workflow só dispara em `platform/**`),
+  não por sucesso real. Fix: injeção de endpoints **placeholder** (`http://localhost:4318`,
+  `…:9090/api/v1/write`) via `-e` no `docker run` **somente** para o validate, doc espelhada em
+  [.github/workflows/platform.yml](.github/workflows/platform.yml) ([make/platform.mk](make/platform.mk)
+  ~218-225). O `otel-collector.yaml` **não foi tocado** — a verificação estrutural TX-5 (grep
+  `transform/redact-pii` + allowlists `allow_all_keys:false`) roda **antes** do Docker e permanece fail-closed.
+- **Suites K1/K2 fora de qualquer alvo `make`** (`ml-optimization-engineer`): `ml/deep/test_deep.py` (K1, 22
+  testes) e `ml/fraud/test_unsup.py` (K2, 25 testes) estavam **fora da malha de gate** — exatamente o achado
+  não-bloqueante registrado na 10ª onda. Fix: novo alvo `ml-deep-test` em [make/ml.mk](make/ml.mk) (~74),
+  **fora** do agregado rápido `ml-test` (custo PyTorch+ONNX ~6s) mas **mandatório pré-K8 no runbook**; novo
+  `ml-batch-test-unsup` em [make/ml-batch.mk](make/ml-batch.mk) (~41), **dentro** do agregado `ml-batch-test`
+  (perfil numpy/sklearn). Passo 5 e checklist §6 do [runbook](docs/ops/go-live-runbook.md) atualizados para
+  listar `make ml-deep-test`.
+
+**Gates verdes (11ª onda):** `security-reviewer` **BLOQUEOU → remediou → APROVADO** no item A — bloqueio
+levantado, vetor de mascaramento fechado, provado com binário `tofu` fake em 5 casos (skip graceful EXIT 0,
+strict falha EXIT≠0, caminho feliz "OK" EXIT 0, **init falha → EXIT≠0 sem "OK"**, validate falha → EXIT≠0).
+`privacy-compliance-auditor` **APROVADO** no item B — provado adversarialmente que a verificação estrutural
+TX-5 roda antes do Docker e permanece fail-closed (afrouxar a redação ainda barra o alvo), placeholders não
+vazam p/ produção/imagem/git, `make platform-otel-validate` **VERDE EXIT 0 com Docker**.
+`parity-golden-test-guardian` **APROVADO** no item C — paridade/golden intacta (`make parity-golden-short`
+verde), deep **default-off preservado** (`DEEP_ENABLED=false`, `test_default_model_version_is_not_deep` verde),
+zero toque em runtime/`.proto`/hot path/dinheiro/fixtures; números reais: `make ml-deep-test` **22 passed**,
+`make ml-batch-test` agora **64** (18 pacing + 21 fraud + 25 unsup, era 39), `make ml-test` **90** inalterado.
+Achados **LOW não-bloqueantes** registrados p/ backlog: `| grep -v "^$$"` no `tofu-validate` pode dar
+falso-negativo se o `init` emitir só linhas vazias — pré-existente e inalcançável na prática (tofu real sempre
+imprime texto), candidato a `| { grep -v "^$$" || true; }` numa próxima onda. `money` **não acionado** — zero
+superfície de dinheiro. Veredito do arquiteto: a `main` permanece **genuinamente esgotada em código** para
+escopo de produto; o próximo movimento real segue sendo exclusivamente **infra/spec viva externa**.
+
 ### ⏭️ Pendente da Fase 3
 
 **K8** (promoção do deep ranking sob **uplift A/B + kill-switch**) segue **gated por
