@@ -9,7 +9,7 @@
 #   4. otelcol validate --config platform/observability/otel-collector.yaml
 #      + verificacao estrutural dos processadores de redacao de PII (TX-5)
 #
-# Aciona em PR/push apenas quando platform/ for alterado.
+# Aciona em PR/push apenas quando platform/ ou make/platform.mk forem alterados.
 # Nao exige aprovacao cloud — tudo estatico.
 name: platform-validate
 
@@ -23,6 +23,8 @@ on:
     branches: [main]
     paths:
       - "platform/**"
+      - "make/platform.mk"
+      - ".github/workflows/platform.yml"
 
 permissions:
   contents: read
