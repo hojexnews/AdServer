@@ -17,7 +17,7 @@ BROKERS="${REDPANDA_BROKERS:-redpanda:9092}"
 
 for f in $(ls /repo/ch/*.sql | sort); do
   echo "[ch-init] applying $(basename "$f")"
-  sed -e "s/ ON CLUSTER '{cluster}'//g" \
+  sed -e "s/[[:space:]]*ON CLUSTER '{cluster}'//g" \
       -e "s|\${REDPANDA_BROKERS}|${BROKERS}|g" "$f" \
     | awk 'BEGIN{skip=0}
            /^COMMENT ON/{skip=1}
