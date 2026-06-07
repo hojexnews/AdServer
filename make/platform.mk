@@ -78,18 +78,26 @@ platform-tools:
 	@$(KYVERNO_CLI) version 2>/dev/null || $(BIN)/kyverno version
 
 ## platform-tofu-validate: tofu init -backend=false && tofu validate (sem credenciais)
+# FIX (11a onda): guarda de skip e uso de ferramenta unificados num unico bloco de
+# shell (mesmo padrao de platform-kubeconform / platform-kyverno-test). O bug
+# anterior separava os dois em linhas de recipe distintas; em Make cada linha roda
+# em shell proprio, entao o "exit 0" da guarda encerrava apenas aquele shell e a
+# linha seguinte tentava executar o binario inexistente (Error 127).
 platform-tofu-validate:
 	@echo "== platform-tofu-validate: OpenTofu schema check (sem backend/credenciais) =="
-	@if ! command -v tofu >/dev/null 2>&1 && [ ! -x "$(HOME)/.local/bin/tofu" ]; then \
-	  if [ "$(PLATFORM_STRICT)" = "1" ]; then \
-	    echo "ERRO: tofu nao encontrado no PATH. Instale em https://opentofu.org/docs/intro/install/"; \
-	    exit 1; \
-	  else \
-	    echo "AVISO: tofu nao encontrado — pulando platform-tofu-validate. (PLATFORM_STRICT=1 para falhar)"; \
-	    exit 0; \
-	  fi; \
-	fi
-	@_TOFU=$$(command -v tofu 2>/dev/null || echo "$(HOME)/.local/bin/tofu"); \
+	@set -eo pipefail; _TOFU=""; \
+	 if command -v tofu >/dev/null 2>&1; then _TOFU=tofu; \
+	 elif [ -x "$(HOME)/.local/bin/tofu" ]; then _TOFU="$(HOME)/.local/bin/tofu"; \
+	 fi; \
+	 if [ -z "$$_TOFU" ]; then \
+	   if [ "$(PLATFORM_STRICT)" = "1" ]; then \
+	     echo "ERRO: tofu nao encontrado no PATH. Instale em https://opentofu.org/docs/intro/install/"; \
+	     exit 1; \
+	   else \
+	     echo "AVISO: tofu nao encontrado — pulando platform-tofu-validate. (PLATFORM_STRICT=1 para falhar)"; \
+	     exit 0; \
+	   fi; \
+	 fi; \
 	 cd $(TOFU_ROOT) && \
 	   $$_TOFU init -backend=false -input=false 2>&1 | grep -v "^$$" && \
 	   $$_TOFU validate && \
@@ -164,6 +172,14 @@ platform-kyverno-test:
 #   2. Os pipelines traces e logs contem redaction/allowlist-* (fail-closed).
 #   3. Nenhum pipeline usa allow_all_keys: true (abre a allowlist — quebra TX-5).
 #
+# FIX (11a onda): o "docker run" injeta as tres env-vars de endpoint com valores
+# placeholder/dummy SOMENTE para a etapa de validacao estrutural do otelcol.
+# Os exporters usam ${env:VAR} — o validate exige que as vars estejam definidas
+# e que resultem em string nao-vazia; o valor dummy satisfaz essa exigencia sem
+# alterar a semantica de producao nem relaxar nenhuma das verificacoes de PII.
+# INVARIANTE: a verificacao estrutural de redacao TX-5 (grep) permanece intacta
+# e fail-closed — os endpoints dummy nao interferem nela.
+#
 # Convencao de ausencia de ferramenta:
 #   Local sem Docker: avisa e pula.
 #   CI (PLATFORM_STRICT=1): falha se Docker nao estiver disponivel.
@@ -201,6 +217,9 @@ platform-otel-validate:
 	 echo "-- otel: rodando otelcol validate --config via Docker ($(OTELCOL_IMAGE))..."; \
 	 docker run --rm \
 	   -v "$(CURDIR)/$$CONFIG:/etc/otel/config.yaml:ro" \
+	   -e TEMPO_OTLP_URL=http://localhost:4318 \
+	   -e LOKI_OTLP_URL=http://localhost:4318 \
+	   -e METRICS_REMOTE_WRITE_URL=http://localhost:9090/api/v1/write \
 	   $(OTELCOL_IMAGE) \
 	   validate --config /etc/otel/config.yaml; \
 	 echo "== platform-otel-validate: OK =="

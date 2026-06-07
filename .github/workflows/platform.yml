@@ -109,6 +109,12 @@ jobs:
       # Roda otelcol validate --config via Docker (imagem pinada OTELCOL_IMAGE)
       # + verificacao estrutural dos processadores de redacao de PII.
       # Docker esta disponivel em ubuntu-latest por padrao.
+      #
+      # FIX (11a onda): os exporters usam ${env:VAR} para endpoints; o make
+      # injeta TEMPO_OTLP_URL / LOKI_OTLP_URL / METRICS_REMOTE_WRITE_URL como
+      # valores placeholder via "-e" no "docker run" somente para a etapa de
+      # validate. A verificacao estrutural de redacao de PII (grep TX-5) roda
+      # ANTES do docker e permanece fail-closed e intacta.
       # ------------------------------------------------------------------
       - name: otel-validate (config TX-5 — redacao PII + otelcol validate)
         run: PLATFORM_STRICT=1 make platform-otel-validate

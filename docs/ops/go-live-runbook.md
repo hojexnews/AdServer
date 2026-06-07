@@ -213,9 +213,14 @@ numa maquina com `npm install` ja executado — ver `make/go.mk`).
 make bff-ci
 
 # ML — OPE, features, training, calibration, promote (make ml-test)
-#      + pacing e fraud (make ml-batch-test)
+#      + pacing, fraud supervisionado e fraud nao-supervisionado K2 (make ml-batch-test)
 #      + DDL/IVT de ClickHouse (make data-validate)
 make ml-test && make ml-batch-test && make data-validate
+
+# Deep ranker K1 (TwoTowerDCNv2 + paridade ONNX) — alvo dedicado, ~43 s.
+# Obrigatorio antes de ativar DEEP_ENABLED / promover qualquer versao "deep-*".
+# Fora do agregado ml-test para nao inflar o gate rapido de CI.
+make ml-deep-test
 
 # Copiloto — sem alvo make proprio; usar diretamente com PYTHONPATH correto
 PYTHONPATH=. ml/.venv/bin/python -m pytest services/copilot/tests/
@@ -224,6 +229,10 @@ PYTHONPATH=. ml/.venv/bin/python -m pytest services/copilot/tests/
 Os alvos `make` sao obrigatorios: os de Node filtram `node_modules/` (mesmo motivo do
 Passo 4) e os de Python injetam `PYTHONPATH=.` na raiz do repositorio — sem isso,
 `cd ml && pytest` falha com `ModuleNotFoundError: No module named 'ml'`.
+
+`make ml-batch-test` agora inclui `ml-batch-test-unsup` (K2: Isolation Forest + Autoencoder
+nao-supervisionado). `make ml-deep-test` cobre o K1 (TwoTowerDCNv2); deep permanece
+default-off — DEEP_ENABLED=false ate uplift A/B provado (K8 gate, ADR-0004).
 
 ### Passo 6 — Validacao de plataforma
 
@@ -277,6 +286,7 @@ Confirma:
 
 - [ ] `make go-test` VERDE — gate canonico: unit tests + golden tests com `-race` (toolchain Go 1.26, filtra `node_modules/`; destravado pelo swap `spaolacci`→`twmb/murmur3` na 7a onda).
 - [ ] `make parity-golden-short` VERDE — sem regressao no motor de decisao.
+- [ ] `make ml-deep-test` VERDE — K1 deep ranker (22 testes: TwoTowerDCNv2 + paridade ONNX) + invariante default-off (DEEP_ENABLED=false ate uplift A/B provado — K8 gate, ADR-0004).
 - [ ] Deep ranking (Triton/GPU) NAO ativo no hot path sem uplift A/B provado (K8 pendente).
 - [ ] Fail-open deterministico do ranker verificado: timeout duro retorna cascata pura.
 

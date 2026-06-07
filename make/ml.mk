@@ -67,5 +67,14 @@ ml-test: ml-ope-test ml-features-test ml-training-test ml-calibration-test ml-pr
 	@echo ""
 	@echo "ml-test: COMPLETO. Todos os testes ML passaram (J3+J4)."
 
+## ml-deep-test: pytest do deep ranker K1 (TwoTowerDCNv2 + paridade ONNX)
+## NOTA DE CUSTO: ~43 s (PyTorch + ONNX export). Alvo dedicado, fora do
+## agregado ml-test, para nao inflar o gate rapido de CI. Obrigatorio no
+## Passo 5 do runbook antes de ativar DEEP_ENABLED (K8 gate).
+ml-deep-test:
+	@echo "== ml-deep-test (K1 — TwoTowerDCNv2, ~43s) =="
+	PYTHONPATH=. $(PYTEST_ML) ml/deep/test_deep.py -v
+	@echo "ml-deep-test: OK"
+
 .PHONY: ml-ope-test ml-features-test ml-training-test ml-calibration-test \
-        ml-promote-test ml-j4-test ml-test-fast ml-test
+        ml-promote-test ml-j4-test ml-test-fast ml-test ml-deep-test

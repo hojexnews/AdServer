@@ -15,12 +15,13 @@ ML_FRAUD_DIR    := ml/fraud
 ML_REGISTRY_URI := file:$(ML_ROOT)/registry/mlruns
 
 .PHONY: ml-batch-test ml-batch-test-pacing ml-batch-test-fraud \
+        ml-batch-test-unsup \
         ml-batch-train-ivt ml-batch-pacing-dryrun ml-batch-help \
         ml-batch-no-float
 
-## ml-batch-test: roda todos os testes de pacing + fraude (gate J6)
-ml-batch-test: ml-batch-test-pacing ml-batch-test-fraud
-	@echo "ml-batch-test: OK — pacing e fraud passaram."
+## ml-batch-test: roda todos os testes de pacing + fraude supervisionada + fraude nao-supervisionada (gate J6/K2)
+ml-batch-test: ml-batch-test-pacing ml-batch-test-fraud ml-batch-test-unsup
+	@echo "ml-batch-test: OK — pacing, fraud e unsup passaram."
 
 ## ml-batch-test-pacing: pytest de ml/pacing/ (controlador proporcional DA-4)
 ml-batch-test-pacing:
@@ -35,6 +36,13 @@ ml-batch-test-fraud:
 	$(ML_VENV) -m pytest $(ML_FRAUD_DIR)/test_fraud.py -v \
 		--tb=short -q 2>&1 | tail -30
 	@echo "ml-batch-test-fraud: OK"
+
+## ml-batch-test-unsup: pytest de ml/fraud/test_unsup.py (IVT nao-supervisionado K2: IF + AE)
+ml-batch-test-unsup:
+	@echo "== ml-batch-test-unsup (K2 — IF + Autoencoder) =="
+	PYTHONPATH=. $(ML_VENV) -m pytest $(ML_FRAUD_DIR)/test_unsup.py -v \
+		--tb=short -q 2>&1 | tail -40
+	@echo "ml-batch-test-unsup: OK"
 
 ## ml-batch-train-ivt: treina o classificador IVT e registra no MLflow
 ml-batch-train-ivt:
