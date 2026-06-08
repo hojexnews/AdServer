@@ -5,8 +5,10 @@
 #   ml-batch     — make ml-batch-test (pacing + fraud + unsup, ~30 s)
 #   copilot-test — make copilot-test  (126 testes HITL/gateway/security, ~5 s)
 #
-# ml-training e ml-deep ficam fora deste workflow por custo (PyTorch/ONNX).
-# Podem ser acionados manualmente via workflow_dispatch ou scheduled.
+# ml-training e ml-deep ficam fora do caminho de PR/push por custo (PyTorch/ONNX).
+# Acionamento manual via workflow_dispatch (botao "Run workflow" no GitHub Actions).
+# A job ml-deep-gate roda SOMENTE quando acionada por workflow_dispatch
+# (if: github.event_name == 'workflow_dispatch') — nao dispara em PR nem push.
 #
 # Instalacao de dependencias: setup-python + pip install direto dos
 # pyproject.toml/requirements existentes — nao depende do venv commitado.
@@ -30,6 +32,12 @@ on:
       - "make/ml-batch.mk"
       - "make/copilot.mk"
       - ".github/workflows/ml.yml"
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Motivo do acionamento (ex: pre-K8 gate, release candidate)"
+        required: false
+        default: "manual"
 
 permissions:
   contents: read
@@ -110,3 +118,36 @@ jobs:
 
       - name: copilot-test (J5 — 126 testes)
         run: PYTHONPATH=. python -m pytest services/copilot/tests/ -v
+
+  # -----------------------------------------------------------------------
+  # ml-deep-gate: gate mandatorio pre-K8 com PyTorch + ONNX.
+  # SOMENTE workflow_dispatch — nao roda em PR nem push.
+  # Acionamento: botao "Run workflow" em Actions > ml > Run workflow.
+  # -----------------------------------------------------------------------
+  ml-deep-gate:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: instalar dependencias ML deep (PyTorch + ONNX)
+        run: |
+          pip install --quiet \
+            numpy \
+            pandas \
+            scipy \
+            scikit-learn \
+            lightgbm \
+            pytest \
+            pytest-asyncio \
+            pytest-cov \
+            torch --index-url https://download.pytorch.org/whl/cpu \
+            onnx \
+            onnxruntime
+
+      - name: ml-deep-test (mandatorio pre-K8)
+        run: make ml-deep-test
