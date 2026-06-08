@@ -571,6 +571,60 @@ travados). Veredito do arquiteto após bootar e corrigir o caminho Docker/stream
 **genuinamente esgotada em código de produto** — o próximo movimento real é exclusivamente **infra/spec viva
 externa**.
 
+### ✅ Entregue na Fase 3 — 13ª onda: gates TX-2/CI que reportavam verde sem verificar (sob ADR-0004, sem ADR novo; gates verdes)
+
+Micro-onda de **três itens** (paralelos, donos disjuntos), triada pelo `tech-lead-architect` numa
+re-triagem fresca da `main` pós-12ª onda. Sweep de saúde **todo verde com saída real verificada**
+(`make go-build` 38 pacotes, `make go-vet`, `make go-test` **28 pacotes `-race`** sem corrida, `make verify`
+= buf TX-1 BACKWARD + no-float TX-2, `make proto-gen-check`, `make parity-golden-short` 3 pacotes, `make
+ml-test` **29**, `make ml-deep-test` **22**, `make ml-batch-test`, `make data-validate` 12 invariantes,
+`make copilot-test` **126**, `make bff-ci` **54**, `make web-ci`, `make db-lint`; `-race -count=10` em
+ranker/capping/telemetry/clicktoken **0 flakes**); veredito de esgotamento de **feature** reconfirmado — e,
+como nas ondas 5–11, a re-triagem achou **três defeitos código-endereçáveis reais** da classe "a spec/gate
+não mente": gates que reportavam verde sem verificar de fato (o filão mais sério, igual à 11ª onda):
+
+- **Gate canônico TX-2 Python varria ZERO arquivos** (`ml-optimization-engineer`): o
+  [no-float-py.sh](scripts/ci/no-float-py.sh) — invocado por `make verify` e por
+  [no-float.yml](.github/workflows/no-float.yml) — usava o glob nominal `'*money*/*.py' '*ledger*/*.py'
+  '*billing*/*.py' '*payments*/*.py'`, que casava **0 arquivos** e imprimia "ok" sem varrer nada. Mas
+  [ml/fraud/train_ivt.py](ml/fraud/train_ivt.py) e [train_unsup.py](ml/fraud/train_unsup.py) **declaram
+  "TX-2 (dinheiro em minor-units int64)"** — código financeiro Python fora do glob; e `ml-batch-no-float`
+  (único alvo que olhava `ml/fraud`) era **órfão** (fora de todo agregado). Proteção TX-2 **ilusória** (verde
+  por não-acionamento). Fix: glob ampliado p/ `ml/fraud/*.py`+`ml/pacing/*.py` (**14 arquivos** varridos) com
+  detector **conjuntivo** `line_has_monetary_float()` (nome financeiro `amount|price|cpm|cpc|cpa|bid|budget|
+  revenue|cost|minor_units|money|spend|payout|charge` **E** `float()` cast/literal) — não flagra o `float32`
+  legítimo de vetor de feature ONNX/LightGBM ([no-float-py.sh](scripts/ci/no-float-py.sh)); `ml-batch-no-float`
+  com regex monetária melhorada + plugado como 1ª dependência de `ml-batch-test` ([ml-batch.mk](make/ml-batch.mk)).
+- **`ml-calibration-test` mascarava falha com `|| echo OK`** (`ml-optimization-engineer`): o `cmd || echo OK`
+  engolia qualquer `exit≠0` ([ml.mk](make/ml.mk) ~47); hoje código morto (sem testes em `ml/calibration/`,
+  pytest sai 0), mas no dia em que um teste falhar lá, `ml-test` (que depende deste alvo) reportaria verde.
+  Fix: captura o rc — `rc=5` (no-tests) → ok, qualquer outro `≠0` → propaga `exit rc`.
+- **`ml.yml` prometia acionamento inexistente** (`platform-infra-engineer`): o comentário dizia que
+  `ml-deep`/`ml-training` eram acionáveis via `workflow_dispatch`/`scheduled`, mas o `on:` só tinha
+  `pull_request`/`push` — o `ml-deep-test` ("mandatório pré-K8" desde a 11ª onda) **não rodava em nenhum CI**.
+  Fix: adicionado `workflow_dispatch:` + job `ml-deep-gate` (gateada por `if: github.event_name ==
+  'workflow_dispatch'`, instala PyTorch CPU+ONNX, roda `make ml-deep-test`) — não dispara em PR/push, alinha
+  spec↔realidade ([ml.yml](.github/workflows/ml.yml)).
+- **Backlog tofu fechado corretamente** (`platform-infra-engineer`): o LOW registrado na 11ª onda
+  (`tofu init … | grep -v "^$$"` podia dar falso-negativo). O fix sugerido lá (`| { grep -v … || true; }`)
+  foi **provado errado** sob `set -o pipefail` (rc do `grep` avaliado individualmente). Forma correta:
+  `grep -v "^$$"` → `sed '/^$$/d'` (sempre sai 0), **preservando** a propagação da falha do `init` sob
+  `pipefail` — o vetor de mascaramento que o `security-reviewer` bloqueou na 11ª onda **não** reabre
+  ([platform.mk](make/platform.mk):113).
+
+**Gates verdes (13ª onda):** `money-ledger-guardian` **PASS** (revisão adversarial obrigatória — gate TX-2 agora
+varre **14 arquivos** reais antes invisíveis, sem falso-positivo na featurização ML, plugado em
+`ml-batch-test`/`verify`; catalogou 4 vetores de evasão estruturais ao design conjuntivo intra-linha
+— `np.float64()`, alias intra-linha, pandas `.mean()`, divisão implícita — **nenhum material hoje** pois
+`ml/fraud`/`ml/pacing` não manuseiam dinheiro real, e o TX-2 canônico é o tipo `Money` no fio, não este piso de
+lint; ressalva registrada p/ quando uma feature consumir `minor_units` direto); `parity-golden-test-guardian`
+**PASS** (escopo 100% gate/CI, zero toque em runtime/`.proto`/hot path/dinheiro/fixtures; paridade Go↔Python
+byte-a-byte intacta; `make parity-golden-short` verde; `ml-batch-test` com o novo gate não quebra o agregado;
+deep default-off preservado, `ml-deep-gate` gateada por `workflow_dispatch`). `security`/`privacy` **não
+acionados** no fechamento — superfície de gate de lint/CI (a regra de ouro vale para os gates). Veredito do
+arquiteto: a `main` permanece **genuinamente esgotada em código de produto**; o próximo movimento real segue
+sendo exclusivamente **infra/spec viva externa**.
+
 ### ⏭️ Pendente da Fase 3
 
 **K8** (promoção do deep ranking sob **uplift A/B + kill-switch**) segue **gated por
