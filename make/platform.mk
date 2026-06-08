@@ -110,7 +110,7 @@ platform-tofu-validate:
 	   fi; \
 	 fi; \
 	 cd $(TOFU_ROOT) && \
-	   $$_TOFU init -backend=false -input=false 2>&1 | grep -v "^$$" && \
+	   $$_TOFU init -backend=false -input=false 2>&1 | sed '/^$$/d' && \
 	   $$_TOFU validate && \
 	   echo "== platform-tofu-validate: OK =="
 
