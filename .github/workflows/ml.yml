@@ -3,7 +3,7 @@
 # Jobs:
 #   ml-fast      — make ml-test-fast  (OPE + features + promote, ~10 s)
 #   ml-batch     — make ml-batch-test (pacing + fraud + unsup, ~30 s)
-#   copilot-test — make copilot-test  (125 testes HITL/gateway/security, ~5 s)
+#   copilot-test — make copilot-test  (126 testes HITL/gateway/security, ~5 s)
 #
 # ml-training e ml-deep ficam fora deste workflow por custo (PyTorch/ONNX).
 # Podem ser acionados manualmente via workflow_dispatch ou scheduled.
@@ -92,7 +92,7 @@ jobs:
         run: make ml-batch-test
 
   # -----------------------------------------------------------------------
-  # copilot-test: 125 testes de services/copilot/ (J5 — HITL, gateway,
+  # copilot-test: 126 testes de services/copilot/ (J5 — HITL, gateway,
   # model-router, schemas, security). Aciona tambem em paths de copilot.
   # -----------------------------------------------------------------------
   copilot-test:
@@ -108,5 +108,5 @@ jobs:
         working-directory: services/copilot
         run: pip install --quiet -e ".[dev]"
 
-      - name: copilot-test (J5 — 125 testes)
+      - name: copilot-test (J5 — 126 testes)
         run: PYTHONPATH=. python -m pytest services/copilot/tests/ -v
