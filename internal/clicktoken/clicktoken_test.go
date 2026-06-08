@@ -1,6 +1,7 @@
 package clicktoken_test
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 	"time"
@@ -72,19 +73,27 @@ func TestValidate_TamperedMAC(t *testing.T) {
 	expiry := time.Now().Add(clicktoken.DefaultTTL)
 	tok := s.Sign("dec-003", "ban-003", "https://example.com/ok", expiry)
 
-	// Flip one character in the MAC portion (after last ".").
+	// Isolate the MAC segment (after the last ".").
 	lastDot := strings.LastIndex(tok, ".")
-	mac := tok[lastDot+1:]
-	if len(mac) == 0 {
+	macB64 := tok[lastDot+1:]
+	if len(macB64) == 0 {
 		t.Fatal("token has no MAC portion")
 	}
-	// Replace last char of MAC.
-	tampered := tok[:lastDot+1] + mac[:len(mac)-1] + "X"
-	if tampered[len(tampered)-1] == mac[len(mac)-1] {
-		tampered = tok[:lastDot+1] + mac[:len(mac)-1] + "A"
-	}
 
-	_, _, _, err := s.Validate(tampered, time.Now())
+	// Decode → flip byte[0] with XOR 0xFF (guaranteed bit-level corruption,
+	// deterministic regardless of base64 alphabet alignment) → re-encode.
+	// This avoids the flakiness of mutating a single base64 char: the last
+	// char of a 43-char RawURLEncoding MAC encodes only 4 useful bits, so
+	// a char swap can silently decode to the same 32-byte value.
+	macBytes, err := base64.RawURLEncoding.DecodeString(macB64)
+	if err != nil {
+		t.Fatalf("base64 decode of MAC: %v", err)
+	}
+	macBytes[0] ^= 0xFF
+	tamperedMAC := base64.RawURLEncoding.EncodeToString(macBytes)
+	tampered := tok[:lastDot+1] + tamperedMAC
+
+	_, _, _, err = s.Validate(tampered, time.Now())
 	if err == nil {
 		t.Fatal("expected HMAC mismatch error for tampered token, got nil")
 	}
