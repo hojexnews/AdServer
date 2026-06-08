@@ -43,10 +43,15 @@ ml-features-test:
 ml-training-test:
 	PYTHONPATH=. $(PYTEST_ML) ml/training/test_training_parity.py -v
 
-## ml-calibration-test: calibracao isotonica (sem dados reais — usa sinteticos)
+## ml-calibration-test: calibracao isotonica (sem dados reais — usa sinteticos).
+## exit 5 = pytest "no tests collected" -> OK; qualquer outro exit != 0 = falha real -> propaga.
 ml-calibration-test:
-	PYTHONPATH=. $(PYTEST_ML) ml/calibration/ -v 2>/dev/null || \
-	echo "[ml-calibration-test] nenhum pytest encontrado em ml/calibration/ — OK (sem testes independentes)"
+	@PYTHONPATH=. $(PYTEST_ML) ml/calibration/ -v; rc=$$?; \
+	if [ $$rc -eq 0 ] || [ $$rc -eq 5 ]; then \
+		echo "[ml-calibration-test] OK (rc=$$rc)"; \
+	else \
+		echo "[ml-calibration-test] FALHOU (rc=$$rc)"; exit $$rc; \
+	fi
 
 ## ml-promote-test: gate de promocao J4 (recusa sem uplift; aceita com uplift valido)
 ## INVARIANTE: deve ser verde antes de ativar AB_ENABLED=true em producao.
