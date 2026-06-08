@@ -500,6 +500,77 @@ imprime texto), candidato a `| { grep -v "^$$" || true; }` numa próxima onda. `
 superfície de dinheiro. Veredito do arquiteto: a `main` permanece **genuinamente esgotada em código** para
 escopo de produto; o próximo movimento real segue sendo exclusivamente **infra/spec viva externa**.
 
+### ✅ Entregue na Fase 3 — 12ª onda: caminho Docker/streaming bootado + correções de bugs latentes (sob ADR-0004, sem ADR novo; gates verdes)
+
+Onda **larga** (24 commits, donos múltiplos), triada pelo `tech-lead-architect` após **bootar pela 1ª vez
+os caminhos que o README admitia nunca terem rodado** ("boote-o antes de confiar nele"). Diferente das ondas
+5–11 (drift doc-only), esta achou **defeitos de runtime reais** no caminho Docker/streaming, mais um lote de
+endurecimento de CI/contratos/concorrência da mesma classe. Os dois itens registrados como **known-issues**
+(capper→BLANK e DDL 004 do ClickHouse) ficam **declarados RESOLVIDOS** aqui.
+
+- **ClickHouse / streaming** (`data-platform-engineer` / `platform-infra-engineer`): as **8 migrations agora
+  aplicam limpo em CH 24.8** (verificado). (a) **004** `zero-init` dos `AggregateFunction` —
+  `uniqState(toNullable(''))` (Code 70) → `uniqStateIf(event_id, 1=0)` e `sumState(toDecimal256(0,18))` →
+  `toDecimal128(0,18)` (bate `Decimal(38,18)`): **destrava as MVs de billing** ([004_stats_hourly.sql](data/clickhouse/migrations/004_stats_hourly.sql)).
+  (b) **002** `conversion_value_decimal` sem `pow()`/Float — `multiIf` com divisores inteiros 10^scale (0..18),
+  preservando `amount/10^scale` sem float (TX-2) ([002_raw_tables.sql](data/clickhouse/migrations/002_raw_tables.sql)).
+  (c) **005** projeta colunas `MATERIALIZED` explicitamente no JOIN (`SELECT *` as excluía em CH 24.x)
+  ([005_live_view.sql](data/clickhouse/migrations/005_live_view.sql)). (d) **006** cria `ROLE` antes das `ROW
+  POLICY`, admin via `adserver_admin_role` (role-only, sem `CREATE USER` em migration) ([006_access_control.sql](data/clickhouse/migrations/006_access_control.sql));
+  **007/008** alinhados ao mesmo role. (e) **ch-init** [10-ddl.sh](deploy/local/clickhouse/10-ddl.sh): strip de
+  `;` robusto a `;` dentro de comentário SQL (bug só do strip local; produção usa `--multiquery`).
+  `no-float-data-sql.sh` ganhou detector de `pow()` em billing ([scripts/ci/no-float-data-sql.sh](scripts/ci/no-float-data-sql.sh)).
+  → **Known-issue "DDL 004 do ClickHouse" RESOLVIDO.**
+- **Capping** (`decision-engine-engineer`): (a) **fast-path uncapped antes do check de userID** — o `Capper`
+  real retornava `false` p/ qualquer campanha com `userID` vazio (fail-safe DA-6) **antes** do fast-path "sem
+  cap", então o decision em Docker servia **sempre BLANK** cookieless; `Allowed()` agora resolve `effectiveCaps`
+  → fast-path uncapped (serve anônimo) → só então o check de userID (só p/ campanhas capeadas), DA-6/CA-5
+  ([capping.go](internal/capping/capping.go)); golden CA5-005b cobre ([ca5_capping.json](tests/parity/golden/ca5_capping.json)).
+  (b) **TTL limitado** no contador `campaign_total` — sem chave permanente por usuário (privacidade DA-6/TX-5).
+  → **Known-issue "capper→BLANK" RESOLVIDO.**
+- **Ledger** (`money-ledger-guardian` / `decision-engine-engineer`): trigger de balanço dispara também em
+  **posting unilateral** — backstop double-entry que rejeita débito/crédito sem par
+  ([0001_ledger_schema_up.sql](db/ledger/migrations/0001_ledger_schema_up.sql)).
+- **Copiloto** (`copilot-llm-engineer`): (a) **IDOR cross-tenant** em `GET /v1/session/{id}/state` → check de
+  posse + **403** ([server.py](services/copilot/app/server.py), cobertura em [test_security.py](services/copilot/tests/test_security.py));
+  (b) rota SSE encaminha a **mensagem do usuário no 1º turno** sem **422** vazio ([stream route](web/console/src/app/api/copilot/stream/[sessionId]/route.ts));
+  (c) `hitlApprove` do BFF **não vaza corpo da resposta interna** no erro (só `correlation_id`) ([copilot.ts](bff/src/routers/copilot.ts)).
+- **BFF** (`bff-platform-engineer`): **scale monetário sem fallback silencioso** — `INNER JOIN asset_registry`
+  + erro explícito quando o ativo não tem `scale` (em vez de assumir um default e mentir sobre o dinheiro),
+  TX-2/DA-10 ([postgres-payments.ts](bff/src/adapters/postgres-payments.ts)).
+- **Ranker** (`ml-optimization-engineer`): (a) **mutex** em `MLRanker.last` (data race com handlers
+  concorrentes sob `RANKER_ENABLED`) ([ranker.go](internal/ranker/ranker.go)) e em `BanditRanker` cfg/last
+  (+ remoção do comentário "atomically" falso) ([bandit_ranker.go](internal/ranker/bandit_ranker.go));
+  (b) **math caseiro → stdlib** — Taylor/Newton próprio divergia da `math` da stdlib p/ `|x|>4.5` no
+  `mathExp`; trocado por `math.Exp`/`math.Log`, com teste de fronteira ([bandit.go](internal/ranker/bandit.go), [bandit_math_test.go](internal/ranker/bandit_math_test.go)).
+- **CI / contratos** (`platform-infra-engineer` / `schema-contracts-steward`): (a) **proto-gen-check** fecha
+  o **gate cego de staleness** do `gen/` (TX-1) — regenera e falha se o commitado divergir ([buf.yml](.github/workflows/buf.yml), [Makefile](Makefile));
+  (b) versiona o `gen` **go+ts** de `payments/v1` (artefatos gerados que faltavam, TX-1) ([payments.pb.go](gen/go/adserver/payments/v1/payments.pb.go), [payments_pb.ts](gen/ts/adserver/payments/v1/payments_pb.ts));
+  (c) testes **Python ML e `services/copilot`** passam a rodar em CI (gate ausente) ([ml.yml](.github/workflows/ml.yml), [make/copilot.mk](make/copilot.mk));
+  (d) gates de teste **propagam exit code** (`pipefail` nos pipes + fim de `;true`/`||true`);
+  (e) **platform-tools verifica SHA256** de kubeconform/kyverno (espelha M-1 do CI) ([make/platform.mk](make/platform.mk)).
+- **Console** (`web-console-engineer`): **logo Hojex** no header + favicon + apple-icon + OG — origem do nome
+  da branch `feat/console-brand-logo`.
+- **Paridade** (`ml-optimization-engineer`): `parity_contract` sincroniza **tolerância 1e-6** e a **assinatura
+  com o `featurize` real** ([parity_contract.go](ml/features/go/parity_contract.go), [test_parity_cases.py](ml/features/python/test_parity_cases.py)).
+
+**Gates verdes (12ª onda) — números reais re-triados:** `make go-build` + `make go-vet` + `make go-test`
+(**28 pacotes**, `-race` clean) + `make verify` (buf TX-1 BACKWARD + no-float TX-2) + `make proto-gen-check` +
+`make parity-golden-short` (3 pacotes) + `make ml-test` (**29**) + `make ml-deep-test` (**22**) +
+`make ml-batch-test` (**25**) + `make data-validate` (12 invariantes) + `make copilot-test` (**126**) +
+`make bff-ci` (**54**) + `make web-ci` + `make db-lint` — **todos verdes**. `parity-golden-test-guardian`
+**PASS** (golden/shadow/dual-run intactos; o fix de capping serve uncapped sem alterar a autoridade da cascata
+DA-3; deep default-off preservado, K8 não promovido); `money-ledger-guardian` **PASS** (trigger double-entry
+reforçado, scale do Asset Registry sem fallback, 0 float); `privacy-compliance-auditor` **APROVADO** (IDOR do
+copiloto fechado, TTL do contador de capping sem chave permanente DA-6/TX-5, 0 PII nova); `security-reviewer`
+**PASS** (403 cross-tenant, sem vazamento de corpo interno, SHA256 nos downloads de CLI).
+
+**Regra de ouro mantida:** nenhuma tecnologia pesada entrou sem gatilho mensurável (Flink/Triton/GPU/TigerBeetle/
+Fireblocks seguem deferidos); nada foi promovido sem **uplift A/B + kill-switch** (deep/K8 e AEV/BND seguem
+travados). Veredito do arquiteto após bootar e corrigir o caminho Docker/streaming: a `main`/branch permanece
+**genuinamente esgotada em código de produto** — o próximo movimento real é exclusivamente **infra/spec viva
+externa**.
+
 ### ⏭️ Pendente da Fase 3
 
 **K8** (promoção do deep ranking sob **uplift A/B + kill-switch**) segue **gated por
