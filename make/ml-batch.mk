@@ -19,9 +19,9 @@ ML_REGISTRY_URI := file:$(ML_ROOT)/registry/mlruns
         ml-batch-train-ivt ml-batch-pacing-dryrun ml-batch-help \
         ml-batch-no-float
 
-## ml-batch-test: roda todos os testes de pacing + fraude supervisionada + fraude nao-supervisionada (gate J6/K2)
-ml-batch-test: ml-batch-test-pacing ml-batch-test-fraud ml-batch-test-unsup
-	@echo "ml-batch-test: OK — pacing, fraud e unsup passaram."
+## ml-batch-test: roda todos os testes de pacing + fraude supervisionada + fraude nao-supervisionada + gate TX-2 (J6/K2)
+ml-batch-test: ml-batch-no-float ml-batch-test-pacing ml-batch-test-fraud ml-batch-test-unsup
+	@echo "ml-batch-test: OK — no-float TX-2, pacing, fraud e unsup passaram."
 
 ## ml-batch-test-pacing: pytest de ml/pacing/ (controlador proporcional DA-4)
 ml-batch-test-pacing:
@@ -58,14 +58,19 @@ ml-batch-pacing-dryrun:
 	$(ML_VENV) $(ML_PACING_DIR)/pacing_job.py --dry-run
 	@echo "ml-batch-pacing-dryrun: OK"
 
-## ml-batch-no-float: verifica ausencia de float monetario em ml/pacing/ e ml/fraud/ (TX-2)
+## ml-batch-no-float: verifica ausencia de float MONETARIO em ml/pacing/ e ml/fraud/ (TX-2).
+## Padrão monetário: float() aplicado a amount/price/cpm/cpc/cpa/bid/budget/revenue/
+## cost/minor_units/money. Float de feature ML (vetores numpy/ONNX) nao e flagrado.
+## Plugado em ml-batch-test para garantir que CI sempre execute este gate.
 ml-batch-no-float:
 	@echo "== ml-batch-no-float (TX-2) =="
 	@fail=0; \
 	for f in $(ML_PACING_DIR)/*.py $(ML_FRAUD_DIR)/*.py; do \
 		[ -f "$$f" ] || continue; \
-		if grep -nE '\bfloat\b.*minor_units|minor_units.*\bfloat\b' "$$f"; then \
-			echo "  POSSIVEL VIOLACAO TX-2 em $$f"; \
+		if grep -nEi \
+			'float\s*\(.*\b(amount|price|cpm|cpc|cpa|bid|budget|revenue|cost|minor_units?|money|spend|payout|charge)\b|\b(amount|price|cpm|cpc|cpa|bid|budget|revenue|cost|minor_units?|money|spend|payout|charge)\b.*float\s*\(' \
+			"$$f"; then \
+			echo "  VIOLACAO TX-2: float monetario em $$f — use int64 minor-units"; \
 			fail=1; \
 		fi; \
 	done; \

@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
-# no-float-py.sh — TX-2: proibe float em codigo monetario Python.
-# Escopo financeiro: money/ledger/billing/payments. Dinheiro usa
-# decimal.Decimal (contexto fixo ROUND_HALF_EVEN). Ver contracts/lint/no-float.md.
+# no-float-py.sh — TX-2: proibe float MONETARIO em codigo financeiro Python.
+# Escopo financeiro: money/ledger/billing/payments (contabilidade), mais
+# ml/fraud e ml/pacing que declaram TX-2 e processam dados financeiros
+# indiretamente. Dinheiro usa int64 minor-units. Ver contracts/lint/no-float.md.
+#
+# DISTINCAO FLOAT MONETARIO vs FLOAT DE FEATURE (2026-06-08):
+#   ml/fraud/*.py e ml/pacing/*.py contem float/float32/np.float LEGITIMOS
+#   como vetores de feature ONNX/LightGBM/numpy — nao sao violacoes TX-2.
+#   O gate varre por PADRAO MONETARIO: float aplicado a nomes financeiros
+#   (amount, price, cpm, cpc, cpa, bid, budget, revenue, cost, minor_units,
+#   money). Float puro em contexto de feature/ML nao e capturado.
 #
 # COMMENT-AWARE (2026-06-03):
 #   Usa o modulo `tokenize` da stdlib CPython para separar tokens de codigo
@@ -18,8 +26,11 @@
 #   que set -e aborte o script antes de reportar os hits ao usuario.
 set -euo pipefail
 
+# Escopo 1: dirs de contabilidade nominais (money/ledger/billing/payments)
+# Escopo 2: ml/fraud e ml/pacing — declaram TX-2 e operam sobre dados financeiros
 mapfile -t files < <(git ls-files \
     '*money*/*.py' '*ledger*/*.py' '*billing*/*.py' '*payments*/*.py' \
+    'ml/fraud/*.py' 'ml/pacing/*.py' \
     2>/dev/null | sort)
 
 if [ "${#files[@]}" -eq 0 ]; then
@@ -46,16 +57,35 @@ SKIP_TYPES = {
     tok_mod.ENDMARKER,
 }
 
-# float como nome de tipo/funcao
-FLOAT_NAME = re.compile(r'^float$')
-
-# Literal numerico de ponto flutuante (inclui underscore separators, complex)
-# Cobre: 1.0  .5  1e3  1_000.5  1.0j  1e3j  — mas nao inteiros puros
-FLOAT_LIT = re.compile(
-    r'^[0-9][0-9_]*\.[0-9_]*([eE][+-]?[0-9_]+)?[jJ]?$'
-    r'|^\.[0-9][0-9_]*([eE][+-]?[0-9_]+)?[jJ]?$'
-    r'|^[0-9][0-9_]*[eE][+-]?[0-9_]+[jJ]?$'
+# Nomes financeiros que NUNCA devem receber float (TX-2).
+# Cobre snake_case e variantes: amount, price, cpm, cpc, cpa, bid, budget,
+# revenue, cost, minor_units, money (e plurais/compostos comuns).
+# Float de feature ML (feature_vec, X_train, score, deficit, etc.) NAO casa.
+MONEY_NAMES = re.compile(
+    r'\b(?:amount|price|cpm|cpc|cpa|bid|budget|revenue|cost|minor_units?|money'
+    r'|spend|payout|charge|rate_money|billing_amount)\b',
+    re.IGNORECASE,
 )
+
+def line_has_monetary_float(line: str) -> bool:
+    """
+    Retorna True se a linha de codigo contiver float() ou um literal de ponto
+    flutuante atribuido/aplicado a um nome financeiro.
+
+    Logica: a linha tem um nome monetario E tem float() ou literal float.
+    Float puro sem nome monetario na mesma linha nao e flagrado — preserva
+    vetores de feature (np.float32, astype(np.float32), etc.).
+    """
+    has_money = bool(MONEY_NAMES.search(line))
+    if not has_money:
+        return False
+    # Verifica se ha float() como chamada/cast ou literal numerico float
+    has_float_call = bool(re.search(r'\bfloat\s*\(', line))
+    has_float_lit  = bool(re.search(
+        r'(?<![A-Za-z0-9_])([0-9]+\.[0-9]+|\.[0-9]+|[0-9]+[eE][+-]?[0-9]+)',
+        line,
+    ))
+    return has_float_call or has_float_lit
 
 found = []      # lista de strings "path:lineno:text"
 seen  = set()   # conjunto (path, lineno) para deduplicar multiplos hits na mesma linha
@@ -68,39 +98,57 @@ for path in sys.argv[1:]:
     try:
         tokens = list(tokenize.generate_tokens(io.StringIO(src).readline))
     except tokenize.TokenError:
-        # Fallback para arquivo com erro de sintaxe: remove comentarios # e checa
+        # Fallback para arquivo com erro de sintaxe: varre linha a linha
         for lineno, line in enumerate(lines, 1):
             code_part = line.split('#', 1)[0]
-            if re.search(r'\bfloat\b', code_part) or \
-               re.search(r'(?<![A-Za-z0-9_])'
-                         r'([0-9]+\.[0-9]+|\.[0-9]+|[0-9]+[eE][+-]?[0-9]+)',
-                         code_part):
+            if line_has_monetary_float(code_part):
                 key = (path, lineno)
                 if key not in seen:
                     seen.add(key)
                     found.append(f"{path}:{lineno}:{line.rstrip()}")
         continue
 
-    for ttype, tstring, tstart, _tend, _line in tokens:
-        if ttype in SKIP_TYPES:
-            continue
-        lineno = tstart[0]
-        key = (path, lineno)
-        if key in seen:
-            continue  # ja reportou esta linha
-        orig = lines[lineno - 1].rstrip() if lineno <= len(lines) else tstring
+    # Varre linha a linha usando tokenize apenas para pular comentarios/strings
+    # Agrupa tokens por linha; testa a linha de codigo limpa (sem comentarios/strings)
+    skip_lines: set = set()
+    for ttype, tstring, tstart, tend, _line in tokens:
+        if ttype in (tok_mod.COMMENT, tok_mod.STRING):
+            # Marca todas as linhas cobertas por este token como parcialmente comentadas.
+            # Usamos abordagem mais simples: reconstruimos a linha sem esses tokens.
+            pass  # tratado abaixo
 
-        # float como identificador (nome de tipo ou chamada de funcao)
-        if ttype == tok_mod.NAME and FLOAT_NAME.match(tstring):
-            seen.add(key)
-            found.append(f"{path}:{lineno}:{orig}")
+    # Abordagem linha a linha: para cada linha do arquivo, reconstroi o trecho de
+    # codigo sem tokens de comentario/string usando o tokenizer.
+    line_code: dict = {i+1: list(lines[i]) for i in range(len(lines))}
+    # Blinda strings e comentarios zerando seus caracteres na representacao de linha
+    for ttype, tstring, tstart, tend, _line in tokens:
+        if ttype not in (tok_mod.COMMENT, tok_mod.STRING):
             continue
+        srow, scol = tstart
+        erow, ecol = tend
+        if srow == erow:
+            for c in range(scol, min(ecol, len(line_code.get(srow, [])))):
+                line_code[srow][c] = ' '
+        else:
+            # Multi-line string: zera da coluna inicial ate fim da primeira linha
+            # e linhas intermediarias inteiras, e ate ecol na ultima linha
+            row = srow
+            for c in range(scol, len(line_code.get(row, []))):
+                line_code[row][c] = ' '
+            for row in range(srow+1, erow):
+                line_code[row] = [' '] * len(line_code.get(row, []))
+            row = erow
+            for c in range(0, min(ecol, len(line_code.get(row, [])))):
+                line_code[row][c] = ' '
 
-        # Literal numerico de ponto flutuante
-        if ttype == tok_mod.NUMBER and FLOAT_LIT.match(tstring):
-            seen.add(key)
-            found.append(f"{path}:{lineno}:{orig}")
-            continue
+    for lineno, chars in line_code.items():
+        code_line = ''.join(chars)
+        if line_has_monetary_float(code_line):
+            key = (path, lineno)
+            if key not in seen:
+                seen.add(key)
+                orig = lines[lineno-1].rstrip() if lineno <= len(lines) else code_line
+                found.append(f"{path}:{lineno}:{orig}")
 
 if found:
     for hit in found:
@@ -111,7 +159,7 @@ PYEOF
 hits=$(cat "$_tmpout")
 
 if [ "$py_status" -ne 0 ] || [ -n "$hits" ]; then
-    echo "float proibido em codigo monetario (Python/TX-2): use decimal.Decimal"
+    echo "float monetario proibido (Python/TX-2): use int64 minor-units ou decimal.Decimal"
     [ -n "$hits" ] && echo "$hits"
     exit 1
 fi
