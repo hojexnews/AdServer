@@ -218,11 +218,16 @@ export const CreateBannerInputSchema = z
     path: ["assetUrl"],
   });
 
+// assetUrl/destUrl NÃO são nullable no update: este caminho não gere asset_blob
+// nem creative_type, então gravar NULL violaria banners_asset_xor_chk /
+// banners_dest_url_chk (0001) — 23514 em runtime. O update só SUBSTITUI a URL;
+// limpar/alternar a representação do criativo é recriar o banner. Espelha os
+// .refine() de CreateBannerInputSchema.
 export const UpdateBannerInputSchema = z.object({
   id: IdSchema,
   name: z.string().min(1).max(300).optional(),
-  assetUrl: z.string().url().nullable().optional(),
-  destUrl: z.string().url().nullable().optional(),
+  assetUrl: z.string().url().optional(),
+  destUrl: z.string().url().optional(),
   active: z.boolean().optional(),
 });
 

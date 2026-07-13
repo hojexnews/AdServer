@@ -80,17 +80,19 @@ BEGIN
             'Ver cabeçalho do arquivo para instruções.';
     END IF;
 
-    -- Inserir advertisers (tenant A e B) — como superuser (bypass RLS)
+    -- Inserir advertisers (tenant A e B) — como superuser (bypass RLS).
+    -- Dois INSERTs de UMA linha cada: `RETURNING id INTO <scalar>` exige que a
+    -- instrução retorne exatamente uma linha (um INSERT multi-VALUES aborta com
+    -- "query returned more than one row"). Mesmo padrão de sites/zones/campaigns.
     INSERT INTO config.advertisers
         (tenant_id, name, login_username, login_password_hash)
-    VALUES
-        (v_tenant_a, 'Advertiser A', 'adv_a_test_rls', '$2b$12$placeholder_hash_a'),
-        (v_tenant_b, 'Advertiser B', 'adv_b_test_rls', '$2b$12$placeholder_hash_b')
+    VALUES (v_tenant_a, 'Advertiser A', 'adv_a_test_rls', '$2b$12$placeholder_hash_a')
     RETURNING id INTO v_adv_a;
 
-    -- Recupera ID do advertiser A e B separadamente
-    SELECT id INTO v_adv_a FROM config.advertisers WHERE login_username = 'adv_a_test_rls';
-    SELECT id INTO v_adv_b FROM config.advertisers WHERE login_username = 'adv_b_test_rls';
+    INSERT INTO config.advertisers
+        (tenant_id, name, login_username, login_password_hash)
+    VALUES (v_tenant_b, 'Advertiser B', 'adv_b_test_rls', '$2b$12$placeholder_hash_b')
+    RETURNING id INTO v_adv_b;
 
     -- Inserir sites (tenant A e B)
     INSERT INTO config.sites (tenant_id, name, url)
@@ -471,6 +473,47 @@ BEGIN
         'bbbbbbbb-0000-0000-0000-000000000001'
     );
     PERFORM pg_temp.assert_count('superuser vê ambos campaign_zones (bypass RLS)', v_count, 2);
+END;
+$$;
+
+
+-- ===========================================================================
+-- BLOCO 6 — WITH CHECK: o banco REJEITA escrita cross-tenant (INSERT/UPDATE)
+--   Os BLOCOS 1–4 provam só a LEITURA. Este bloco prova a ESCRITA — espelha o
+--   Bloco 7 do rls_isolation_test.sql do ledger. Como adserver_app com o tenant
+--   A na sessão, toda tentativa de gravar linha do tenant B deve abortar com
+--   SQLSTATE 42501 (new row violates row-level security policy). Cada tentativa
+--   roda num sub-bloco BEGIN/EXCEPTION (savepoint), então uma rejeição esperada
+--   não aborta a transação de teste; uma ACEITAÇÃO inesperada faz RAISE (falha).
+-- ===========================================================================
+
+DO $$
+DECLARE
+    v_tenant_b UUID := 'bbbbbbbb-0000-0000-0000-000000000001';
+BEGIN
+    SET LOCAL ROLE adserver_app;
+    SET LOCAL adserver.tenant_id = 'aaaaaaaa-0000-0000-0000-000000000001';
+
+    -- 6a. INSERT com tenant_id forjado (B) enquanto a sessão é o tenant A.
+    BEGIN
+        INSERT INTO config.sites (tenant_id, name, url)
+        VALUES (v_tenant_b, 'Site Forjado', 'https://forjado.example');
+        RAISE EXCEPTION
+            'ASSERT FALHOU [WITH CHECK INSERT]: INSERT cross-tenant ACEITO (esperado 42501)';
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE NOTICE 'PASS [WITH CHECK: INSERT forjado (tenant B) rejeitado]: SQLSTATE=%', SQLSTATE;
+    END;
+
+    -- 6b. UPDATE tentando mover uma linha do tenant A para o tenant B.
+    BEGIN
+        UPDATE config.sites SET tenant_id = v_tenant_b WHERE name = 'Site A';
+        RAISE EXCEPTION
+            'ASSERT FALHOU [WITH CHECK UPDATE]: UPDATE tenant-flip A→B ACEITO (esperado 42501)';
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE NOTICE 'PASS [WITH CHECK: UPDATE tenant-flip (A→B) rejeitado]: SQLSTATE=%', SQLSTATE;
+    END;
+
+    RESET ROLE;
 END;
 $$;
 

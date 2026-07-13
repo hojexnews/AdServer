@@ -41,3 +41,7 @@ GRANT SELECT ON ALL TABLES IN SCHEMA asset_registry TO adserver_app;
 
 -- The RLS policy helper must be callable by the app role.
 GRANT EXECUTE ON FUNCTION config.current_tenant_id() TO adserver_app, adserver_loader;
+
+-- App writes INSERT rows into BIGSERIAL tables, so it needs nextval() on the
+-- owning sequences (USAGE covers nextval + currval). Read-only loader does not.
+GRANT USAGE ON ALL SEQUENCES IN SCHEMA config TO adserver_app;

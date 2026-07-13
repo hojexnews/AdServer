@@ -625,6 +625,64 @@ acionados** no fechamento — superfície de gate de lint/CI (a regra de ouro va
 arquiteto: a `main` permanece **genuinamente esgotada em código de produto**; o próximo movimento real segue
 sendo exclusivamente **infra/spec viva externa**.
 
+### ✅ Entregue na Fase 3 — 14ª onda: `PostgresConfigAdapter` real (fecha o laço console→decisão) (sob ADR-0004, sem ADR novo; gates verdes)
+
+Onda de **um artefato de produto** com endurecimento adversarial: promove o BFF de config do stub
+`InMemoryConfigAdapter` (I4) para o **`PostgresConfigAdapter` real** — espelho exato do já-committado
+`PostgresPaymentsAdapter` (hardening) —, escrevendo no **mesmo schema `config` que o motor de decisão (Go)
+lê no snapshot**, fechando o laço "administrar no console → servir no site". Selecionado por `BFF_PG_DSN`
+(mesmo `pgPool` compartilhado com payments); sem DSN, cai no stub in-memory (dev/CI). Toda operação corre
+numa transação com `SELECT set_config('adserver.tenant_id',$1,true)` (TX-3/CA-1, tenant SEMPRE do ctx),
+`rate` lido como `rate::text`→`Money` (TX-2, nunca `Number`), senha do anunciante gravada como hash `scrypt$`
+(DA-11). Uma **revisão adversarial multi-lente** (money/security/schema-contract/bff-qa, cada achado
+refutado-por-omissão e adjudicado em primeira-mão) rendeu **3 defeitos reais** (2 FPs corretamente descartados):
+
+- **[HIGH] Escrita cross-tenant por owner_id forjado** (`security-reviewer`): os `create*` aceitavam
+  `owner_id`/`parent_id` do cliente e os INSERTiam **sem** verificar que o pai pertence ao tenant — o RLS
+  `WITH CHECK` valida só o `tenant_id` da PRÓPRIA linha, e a FK de banner/zone/campaign **ignora** o RLS
+  (cap/rule têm owner polimórfico **sem FK**). Confirmado em primeira-mão: o loader `BYPASSRLS`
+  ([internal/configload/assemble.go](internal/configload/assemble.go)) agrupa caps por `owner_type:owner_id`
+  **sem** guarda de tenant (a SELECT de caps nem lê `tenant_id`), então `cap.create{ownerId:<campanha do
+  tenant B>, limitCount:1}` capava a campanha de B a 1 impressão — **DoS cross-tenant que B não consegue
+  diagnosticar** (o RLS esconde a linha de A). **Corrigido** com `assertParentVisible()` — SELECT filtrado
+  pelo RLS ANTES do INSERT em `createCampaign/Banner/Zone/Cap/DeliveryRule` (+`rule_set_id`), mesma disciplina
+  do `linkCampaignZones` que já validava os dois lados via `INSERT...SELECT`. (`WITH CHECK` **não** fecharia
+  isto — valida o dono da linha, não os IDs que ela referencia.)
+- **[MEDIUM/LOW] `updateBanner` nulificando `asset_url`/`dest_url`** (`schema-contracts-steward`):
+  `UpdateBannerInputSchema` deixava ambos `nullable`, mas o `updateBanner` não gere `asset_blob`/`creative_type`
+  — gravar NULL violaria `banners_asset_xor_chk`/`banners_dest_url_chk` (0001), erro 23514 → 500 não-tratado
+  (o stub in-memory mascarava). **Confirmado em Postgres real** (ambos 23514). **Corrigido** removendo o
+  `.nullable()` do schema de update (espelha os `.refine()` do create); alternar a representação do criativo
+  é recriar o banner.
+- **[REAL, alta-alavancagem] Teste de RLS do config quebrado + prova de escrita ausente**: o
+  [rls_isolation_test.sql](db/config/tests/rls_isolation_test.sql) **abortava no próprio seed** (INSERT de 2
+  linhas com `RETURNING id INTO <escalar>` → "query returned more than one row") — **nunca passou**, então a
+  isolação CA-1 do config estava **afirmada, não provada** (o caminho `make db-test`/`db-test-all` exige
+  Postgres externo/Docker, fora do `make verify`). **Corrigido** (dois INSERTs de 1 linha) + **BLOCO 6 novo**
+  provando a REJEIÇÃO de escrita cross-tenant (INSERT forjado + UPDATE tenant-flip → 42501), espelhando o
+  Bloco 7 do ledger. Roda agora ponta-a-ponta: **38 PASS** contra Postgres local, reversível (up/down/up).
+
+Endurecimentos de acompanhamento: **`WITH CHECK` explícito** nas 8 policies do
+[0002_config_rls_up.sql](db/config/migrations/0002_config_rls_up.sql) — defesa-em-profundidade + paridade com
+o ledger (medido em primeira-mão: a policy permissiva `FOR ALL` só-`USING` **já** barra INSERT/UPDATE
+cross-tenant por omissão, então **não era um buraco funcional**, é robustez a policies por-comando futuras);
+**GRANT USAGE ON SEQUENCES** ao `adserver_app` em [dev_roles.sql](db/seed/dev_roles.sql) (INSERT em BIGSERIAL
+precisa de `nextval` — latente sem isto); e **`postgres-config.test.ts` novo** (a lacuna vs. o precedente
+payments) provando a sequência de tenant, o par `rate+currency` atômico, o hash de senha, `buildSet` e a
+guarda de owner. **2 FALSOS-POSITIVOS descartados:** (a) `campaign_zones` só-`USING` valida só o lado campanha
+— mas o `linkCampaignZones` já valida os dois lados via `INSERT...SELECT` filtrado, e a cascata dupla-fecha
+por tenant (nenhuma serving/leak/crash reproduzível); (b) "sem teste unitário" — endereçado nesta onda.
+
+**Gates verdes (14ª onda):** `bff-ci` typecheck+lint+**73 testes** (era 54; +19 do config adapter);
+config RLS **38 PASS** (fresh DB, up/down/up); `db-lint` (no-float SQL) ok; loader Go inalterado (a guarda
+vive no BFF, camada certa da escrita). `security-reviewer` — vetor HIGH fechado com prova; `money-ledger-guardian`
+**sem achados** (`rate::text`/`Money`, sem float, par atômico); `schema-contracts-steward` — 2 achados de
+paridade contrato↔CHECK fechados; `parity-golden-test-guardian` — zero toque em hot path/`.proto`/dinheiro/
+fixtures do motor de decisão. **Regra de ouro mantida:** nenhum escopo inventado — o adapter era o WIP em
+curso, e cada mudança rastreia a um invariante documentado (TX-2/TX-3/CA-1/DA-11) ou a um defeito reproduzido
+em primeira-mão contra Postgres real. Disciplina de medição: as perguntas de RLS `WITH CHECK` e de violação de
+CHECK foram **decididas rodando SQL real no Postgres local**, não por aritmética de LLM.
+
 ### ⏭️ Pendente da Fase 3
 
 **K8** (promoção do deep ranking sob **uplift A/B + kill-switch**) segue **gated por

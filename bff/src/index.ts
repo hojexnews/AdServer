@@ -25,6 +25,8 @@ import { createStatsRouter } from "./routers/stats.js";
 import { createCopilotRouter } from "./routers/copilot.js";
 import { createPaymentsRouter } from "./routers/payments.js";
 import { InMemoryConfigAdapter } from "./adapters/in-memory-config.js";
+import { PostgresConfigAdapter } from "./adapters/postgres-config.js";
+import type { ConfigAdapter } from "./adapters/config-adapter.js";
 import { InMemoryStatsAdapter } from "./adapters/in-memory-stats.js";
 import { InMemoryPaymentsAdapter } from "./adapters/in-memory-payments.js";
 import {
@@ -36,7 +38,14 @@ import type { PaymentsAdapter } from "./adapters/payments-adapter.js";
 // ---------------------------------------------------------------------------
 // Adapters — substituir pelos reais em produção
 // ---------------------------------------------------------------------------
-const configAdapter = new InMemoryConfigAdapter();
+// pgPool compartilhado: com BFF_PG_DSN definido, config + payments usam o
+// Postgres real (o MESMO schema `config` que o motor de decisão lê no snapshot),
+// fechando o laço console → decisão. Sem DSN, caem no stub in-memory (dev/CI).
+const pgPool = createPgPool();
+
+const configAdapter: ConfigAdapter = pgPool
+  ? new PostgresConfigAdapter(pgPool)
+  : new InMemoryConfigAdapter();
 const statsAdapter = new InMemoryStatsAdapter();
 
 /**
@@ -55,7 +64,6 @@ const statsAdapter = new InMemoryStatsAdapter();
  *   - TX-3: tenantId SEMPRE do ctx (sessão), nunca do cliente.
  *   - DA-11: DSN nunca exposto no payload; PII descartada.
  */
-const pgPool = createPgPool();
 const paymentsAdapter: PaymentsAdapter = pgPool
   ? new PostgresPaymentsAdapter(pgPool)
   : new InMemoryPaymentsAdapter();
