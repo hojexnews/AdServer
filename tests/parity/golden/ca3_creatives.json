@@ -1,0 +1,184 @@
+[
+  {
+    "id": "CA3-001",
+    "description": "Imagem: creative_type=image mapeia AssetURL -> Banner.ImageURL e DestURL -> Banner.ClickURL; largura/altura carregadas; selecionado e exposto",
+    "ca": "CA-3",
+    "sub": "image-maps-to-imageurl-and-dest",
+    "input": {
+      "zone_id": "z1",
+      "tenant_id": "t1",
+      "creative_type": "image",
+      "asset_url": "https://cdn.example.com/banner-300x250.jpg",
+      "asset_blob": "",
+      "dest_url": "https://advertiser.example.com/landing",
+      "width": 300,
+      "height": 250
+    },
+    "expect": {
+      "image_url": "https://cdn.example.com/banner-300x250.jpg",
+      "html": "",
+      "video_url": "",
+      "click_url": "https://advertiser.example.com/landing",
+      "width": 300,
+      "height": 250,
+      "selected": true,
+      "served_tier": "SERVED_TIER_REMNANT"
+    }
+  },
+  {
+    "id": "CA3-002",
+    "description": "CA-3.1 realidade: um criativo de imagem SEM dest_url NAO e rejeitado na camada Go — o loader mapeia ClickURL=\"\" e o banner permanece elegivel e selecionado (a rejeicao 'exige dest_url' vive na CHECK do Postgres, nao no engine)",
+    "ca": "CA-3",
+    "sub": "image-without-dest-still-selected-no-rejection",
+    "input": {
+      "zone_id": "z1",
+      "tenant_id": "t1",
+      "creative_type": "image",
+      "asset_url": "https://cdn.example.com/no-dest.jpg",
+      "asset_blob": "",
+      "dest_url": "",
+      "width": 728,
+      "height": 90
+    },
+    "expect": {
+      "image_url": "https://cdn.example.com/no-dest.jpg",
+      "html": "",
+      "video_url": "",
+      "click_url": "",
+      "width": 728,
+      "height": 90,
+      "selected": true,
+      "served_tier": "SERVED_TIER_REMNANT"
+    }
+  },
+  {
+    "id": "CA3-003",
+    "description": "CA-3.2 plumbing: pacote HTML5 (creative_type=html5) mapeia o blob para Banner.HTML (blob preferido sobre URL); Width/Height carregados (o que a tag responsiva consome). O render responsivo em si vive no asyncjs do collector (package main).",
+    "ca": "CA-3",
+    "sub": "html5-maps-to-html-blob-preferred",
+    "input": {
+      "zone_id": "z1",
+      "tenant_id": "t1",
+      "creative_type": "html5",
+      "asset_url": "https://cdn.example.com/pkg/index.html",
+      "asset_blob": "<div id=\"ad\">html5 package</div>",
+      "dest_url": "https://advertiser.example.com/html5",
+      "width": 300,
+      "height": 600
+    },
+    "expect": {
+      "image_url": "",
+      "html": "<div id=\"ad\">html5 package</div>",
+      "video_url": "",
+      "click_url": "https://advertiser.example.com/html5",
+      "width": 300,
+      "height": 600,
+      "selected": true,
+      "served_tier": "SERVED_TIER_REMNANT"
+    }
+  },
+  {
+    "id": "CA3-004",
+    "description": "CA-3.3 plumbing: third-party tag (creative_type=thirdparty_tag) e servido pelo MESMO caminho que html5 — mapeia para Banner.HTML, indistinguivel de html5 na camada de decisao. A contagem propria/dupla do 3p vive no pixel /lg do collector (package main), sem campo no Banner.",
+    "ca": "CA-3",
+    "sub": "thirdparty-tag-served-as-html",
+    "input": {
+      "zone_id": "z1",
+      "tenant_id": "t1",
+      "creative_type": "thirdparty_tag",
+      "asset_url": "",
+      "asset_blob": "<script src=\"https://3p.example.com/tag.js\"></script>",
+      "dest_url": "https://advertiser.example.com/3p",
+      "width": 300,
+      "height": 250
+    },
+    "expect": {
+      "image_url": "",
+      "html": "<script src=\"https://3p.example.com/tag.js\"></script>",
+      "video_url": "",
+      "click_url": "https://advertiser.example.com/3p",
+      "width": 300,
+      "height": 250,
+      "selected": true,
+      "served_tier": "SERVED_TIER_REMNANT"
+    }
+  },
+  {
+    "id": "CA3-005",
+    "description": "CA-3.4: video aceita URL remota + dest_url — creative_type=video mapeia AssetURL (URL remota) -> Banner.VideoURL e DestURL -> Banner.ClickURL; selecionado e exposto com ambos nao-vazios. VAST4/validacao de esquema vivem no collector (package main).",
+    "ca": "CA-3",
+    "sub": "video-remote-url-plus-dest",
+    "input": {
+      "zone_id": "z1",
+      "tenant_id": "t1",
+      "creative_type": "video",
+      "asset_url": "https://cdn.example.com/spot.mp4",
+      "asset_blob": "",
+      "dest_url": "https://advertiser.example.com/video-landing",
+      "width": 640,
+      "height": 360
+    },
+    "expect": {
+      "image_url": "",
+      "html": "",
+      "video_url": "https://cdn.example.com/spot.mp4",
+      "click_url": "https://advertiser.example.com/video-landing",
+      "width": 640,
+      "height": 360,
+      "selected": true,
+      "served_tier": "SERVED_TIER_REMNANT"
+    }
+  },
+  {
+    "id": "CA3-006",
+    "description": "CA-3.2 plumbing (else-branch): HTML5 sem blob inline cai para AssetURL em Banner.HTML — trava a preferencia blob-else-url de setCreative.",
+    "ca": "CA-3",
+    "sub": "html5-url-fallback-when-no-blob",
+    "input": {
+      "zone_id": "z1",
+      "tenant_id": "t1",
+      "creative_type": "html5",
+      "asset_url": "https://cdn.example.com/pkg/only-url.html",
+      "asset_blob": "",
+      "dest_url": "https://advertiser.example.com/html5-url",
+      "width": 970,
+      "height": 250
+    },
+    "expect": {
+      "image_url": "",
+      "html": "https://cdn.example.com/pkg/only-url.html",
+      "video_url": "",
+      "click_url": "https://advertiser.example.com/html5-url",
+      "width": 970,
+      "height": 250,
+      "selected": true,
+      "served_tier": "SERVED_TIER_REMNANT"
+    }
+  },
+  {
+    "id": "CA3-007",
+    "description": "Invariante REAL 'at most one': setCreative (assemble.go:437-450) e um switch SEM default (ao contrario dos switches-irmaos tier/pricing/vector/operator), entao um creative_type NAO reconhecido deixa TODOS os campos de payload vazios (0 campos, nao 1). Mesmo assim o banner recebe ClickURL=dest (mapeamento incondicional, independente de tipo, assemble.go:218) e permanece ELEGIVEL/SELECIONADO (eligibleBanners filtra so por Active+regras, nunca pelo payload). Trava a semantica honesta 'no maximo um / ainda selecionado' — paralelo a CA3-002 (nao-rejeicao por dest ausente).",
+    "ca": "CA-3",
+    "sub": "unrecognized-type-zero-payload-still-selected",
+    "input": {
+      "zone_id": "z1",
+      "tenant_id": "t1",
+      "creative_type": "native",
+      "asset_url": "https://cdn.example.com/native-widget.json",
+      "asset_blob": "",
+      "dest_url": "https://advertiser.example.com/native",
+      "width": 320,
+      "height": 100
+    },
+    "expect": {
+      "image_url": "",
+      "html": "",
+      "video_url": "",
+      "click_url": "https://advertiser.example.com/native",
+      "width": 320,
+      "height": 100,
+      "selected": true,
+      "served_tier": "SERVED_TIER_REMNANT"
+    }
+  }
+]
