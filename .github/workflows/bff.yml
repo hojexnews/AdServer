@@ -1,0 +1,36 @@
+# bff (Fase 1/3) — control-plane tRPC (Node/TS): typecheck + lint + test.
+#
+# Materializa o gate `make bff-ci` (tsc --noEmit strict + ESLint max-warnings 0
+# + jest), que era ÓRFÃO: nenhum workflow o acionava e ele não está no agregado
+# `verify` da raiz (proto + no-float) — o BFF/copiloto (fronteira de ACL, RLS por
+# tenant, adapters Postgres) mergeava sem gate automatizado. (sweep item 6, CI-2)
+name: bff (Fase 1/3)
+
+on:
+  pull_request:
+    paths:
+      - "bff/**"
+      - "make/bff.mk"
+      - ".github/workflows/bff.yml"
+  push:
+    branches: [main]
+    paths:
+      - "bff/**"
+      - "make/bff.mk"
+      - ".github/workflows/bff.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  bff-ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: install deps
+        run: make bff-install
+      - name: ci (typecheck + lint + test)
+        run: make bff-ci

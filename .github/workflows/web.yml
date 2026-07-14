@@ -1,0 +1,35 @@
+# web (Fase 1) — console Next.js: typecheck + lint.
+#
+# Materializa o gate `make web-ci` (tsc --noEmit strict + next lint
+# max-warnings 0), que era ÓRFÃO: nenhum workflow o acionava e ele não está no
+# agregado `verify` da raiz. (sweep item 6, CI-3)
+name: web (Fase 1)
+
+on:
+  pull_request:
+    paths:
+      - "web/console/**"
+      - "make/web.mk"
+      - ".github/workflows/web.yml"
+  push:
+    branches: [main]
+    paths:
+      - "web/console/**"
+      - "make/web.mk"
+      - ".github/workflows/web.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  web-ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: install deps
+        run: make web-install
+      - name: ci (typecheck + lint)
+        run: make web-ci

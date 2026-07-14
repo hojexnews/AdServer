@@ -1,0 +1,40 @@
+# data (Fase 1/2) — invariantes de ClickHouse/Iceberg (DDL + specs).
+#
+# Materializa o gate `make data-validate` (data-lint no-float TX-2 +
+# data-schema-invariants TX-3 row-policies/TX-5 UA-PII + data-ivt-sql-check TX-6),
+# que era ÓRFÃO: nenhum workflow o acionava — defeitos de float monetário ou de
+# isolamento cross-tenant no DDL de dados mergeavam verde. (sweep item 6, CI-1)
+name: data (Fase 1/2)
+
+on:
+  pull_request:
+    paths:
+      - "data/**"
+      - "scripts/ci/data-*.py"
+      - "scripts/ci/no-float-data-sql.sh"
+      - "make/data.mk"
+      - ".github/workflows/data.yml"
+  push:
+    branches: [main]
+    paths:
+      - "data/**"
+      - "scripts/ci/data-*.py"
+      - "scripts/ci/no-float-data-sql.sh"
+      - "make/data.mk"
+      - ".github/workflows/data.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  data-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install deps
+        run: pip install --quiet pyyaml
+      - name: validate (no-float TX-2 + schema invariants TX-3/TX-5 + IVT TX-6)
+        run: make data-validate
