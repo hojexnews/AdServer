@@ -721,6 +721,49 @@ PASS** (fresh DB, up/down/up); `make data-validate` (12 invariantes) + `data-bil
 invariante (TX-2/TX-3/CA-1/DA-6/DA-7/DA-11) ou a um defeito **reproduzido em primeira-mão**; o achado gated-off
 foi **documentado sob seu gate**, não reescrito às pressas.
 
+### ✅ Entregue na Fase 3 — 16ª onda: golden test de paridade **CA-3 (Criativos §4.3)** — o único golden faltante da suíte (sob ADR-0004, sem ADR novo; gates verdes)
+
+Adicionado o **golden test CA-3 ausente** — o único deliverable de código que o Plano de Desenvolvimento nomeia
+para E3 ("*adicionar o golden test CA-3 ausente — hoje o repo só tem `ca2/ca4/ca5/ca6_*_golden_test.go`*"),
+e o único item de código de produto do addon que **não** está gated por tráfego/infra/legal (o golden exercita
+os pacotes `internal/*` diretamente, sem infra externa). Fecha o gate de aceitação de E3 do lado da suíte de
+paridade: **CA-2/CA-4/CA-5/CA-6 (existentes) + CA-3 (adicionado nesta onda)**. Dois arquivos novos:
+`tests/parity/ca3_creatives_golden_test.go` + `tests/parity/golden/ca3_creatives.json` — nenhum código de
+produto tocado.
+
+- **Escopo HONESTO (metade importável vs `package main`):** CA-3 tem quatro sub-critérios, mas a lógica que
+  "faz algo" (render responsivo do HTML5, contagem própria/dupla do 3p, geração/validação de VAST, guarda SSRF
+  do `dest_url`) vive no `services/collector` **`package main`** (NÃO importável de um `parity_test` externo) ou
+  apenas no Postgres (CHECK `banners_dest_url_chk`). O golden trava a metade **importável e real**: o
+  MAPEAMENTO `creative_type` → campo do `Banner` via `configload.Assemble` (image→ImageURL, video→VideoURL,
+  html5|thirdparty_tag→HTML com AssetBlob preferido, DestURL→ClickURL incondicional), a SELEÇÃO+EXPOSIÇÃO via
+  `cascade.Engine.Decide`, e o vínculo server-side do `dest_url` no token HMAC + rejeição de token
+  adulterado/forjado/vazio via `clicktoken.Signer` (a fatia importável real de CA-3.1). Um **gate de
+  cross-referência** (`TestCA3_CollectorServing_CrossRef`) NOMEIA os **11 testes co-localizados do collector**
+  (`package main`) que cobrem a metade de serving — todos verificados **presentes e verdes** — para que um
+  rename quebre o CI (mesmo padrão de contrato-documental do CA-6).
+- **Varredura adversarial (3 céticos refute-por-omissão + 1 crítico-de-completude, adjudicação em 1ª mão):**
+  **0 casos fabricados** — os céticos recomputaram cada valor esperado contra o código real
+  (`assemble.go`/`cascade.go`/`clicktoken.go`), confirmaram que cada caso chama o símbolo de produção (sem
+  re-implementação/mock) e rastreia a um sub-critério real de CA-3, e que só os 2 arquivos foram tocados. O
+  crítico-de-completude achou — e **eu confirmei medindo em primeira mão** — 1 lacuna real na camada importável:
+  `setCreative` (`assemble.go:437-450`) é um `switch` **sem `default`** (ao contrário dos 4 switches-irmãos
+  tier/pricing/vector/operator, que têm), logo um `creative_type` não-reconhecido deixa **zero** campos de
+  payload, mas o banner **ainda é selecionado** (`eligibleBanners` filtra só por Active+regras, nunca pelo
+  payload). O invariante REAL é "**no máximo um**", não "exatamente um" — a asserção original o superestimava.
+  Fechado com **CA3-007** (tipo `native` não-reconhecido → 0 payload, `ClickURL=dest`, ainda selecionado) e a
+  asserção corrigida para `>1` (a violação estrutural real; os expects por-campo já fixam o "exatamente um" no
+  caminho feliz). Paralelo à honestidade de CA3-002 (não-rejeição por `dest` ausente).
+
+**Gates verdes (16ª onda):** `go build ./...` limpo; `go vet ./tests/parity/... ./internal/...` limpo;
+`go test ./tests/parity/... -race` verde — **CA-3: 7 casos golden (CA3-001..007) + 2 testes auxiliares**
+(`TestCA3_DestURL_ServerSideBinding_TamperRejected`, `TestCA3_CollectorServing_CrossRef`), todos PASS; ca2/ca4/
+ca5/ca6 **intactos** (sem regressão no motor de decisão); os **11 testes de collector cross-referenciados**
+rodados e verdes. `gofmt` limpo, JSON válido. **Regra de ouro:** nenhum escopo inventado — o golden trava só
+comportamento Go **real e importável**, a metade de serving é cross-referenciada (não re-testada nem
+refatorada), e a única correção sobre o gerado (CA3-007 + `>1`) **rastreia a um invariante reproduzido em
+primeira mão** (`switch` sem `default`), não a uma mudança manufaturada.
+
 ### ⏭️ Pendente da Fase 3
 
 **K8** (promoção do deep ranking sob **uplift A/B + kill-switch**) segue **gated por
