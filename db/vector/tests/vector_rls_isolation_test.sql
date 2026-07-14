@@ -117,12 +117,18 @@ BEGIN
     SELECT COUNT(*) INTO v_count FROM vector_store.help_doc_embeddings;
     PERFORM pg_temp.vec_assert_count('help_doc_embeddings: tenant_a vê 2 (1 público + 1 privado)', v_count, 2);
 
-    -- 1c. Busca vetorial (cosine distance) retorna apenas criativos do tenant A
-    SELECT COUNT(*) INTO v_count
-    FROM vector_store.creative_embeddings
-    ORDER BY embedding <=> '[' || repeat('0.1,', 1023) || '0.1]'::vector
-    LIMIT 10;
-    -- Há 2 criativos do tenant A; a busca vetorial retorna no máximo 2
+    -- 1c. Busca vetorial (cosine distance) retorna apenas criativos do tenant A.
+    --     COUNT(*) precisa envolver um subselect: no mesmo nível, ORDER BY
+    --     embedding <=> (...) LIMIT (vizinhos) colide com o agregado (a coluna
+    --     embedding não-agrupada). E o literal precisa de parênteses ANTES do
+    --     ::vector — o cast liga mais forte que ||, senão vira "malformed vector".
+    SELECT COUNT(*) INTO v_count FROM (
+        SELECT 1
+        FROM vector_store.creative_embeddings
+        ORDER BY embedding <=> ('[' || repeat('0.1,', 1023) || '0.1]')::vector
+        LIMIT 10
+    ) s;
+    -- Há 2 criativos do tenant A; a busca vetorial (LIMIT 10) retorna no máximo 2
     PERFORM pg_temp.vec_assert_count('busca vetorial: tenant_a vê <= 2', v_count, 2);
 
     RESET ROLE;
@@ -282,15 +288,74 @@ BEGIN
     SET LOCAL ROLE adserver_app;
     SET LOCAL adserver.tenant_id = 'cccccccc-0000-0000-0000-000000000001';
 
-    -- Tenant A com filtro ctr >= 0.04 deve ver apenas o banner HTML5 (ctr=0.08)
-    -- e não o banner do tenant B (ctr=0.03) mesmo que esteja acima de 0.0
+    -- Tenant A com filtro ctr >= 0.02: seus DOIS criativos (0.05 e 0.08) qualificam.
+    -- O criativo de B (ctr=0.03) TAMBÉM passaria o filtro por valor, mas o RLS o
+    -- bloqueia — logo A vê 2, não 3. Isso prova que é o RLS (não o filtro de ctr)
+    -- que isola B. (O assert antigo esperava 1 assumindo, errado, que só o 0.08
+    -- qualificava — o criativo image de A tem ctr=0.05, também >= 0.04.)
     SELECT COUNT(*) INTO v_count
     FROM vector_store.creative_embeddings
-    WHERE ctr >= 0.04;
+    WHERE ctr >= 0.02;
     PERFORM pg_temp.vec_assert_count(
-        'busca com min_ctr=0.04: tenant A vê apenas 1 criativo (html5 ctr=0.08)',
-        v_count, 1
+        'busca com min_ctr=0.02: tenant A vê seus 2 criativos (B bloqueado pelo RLS)',
+        v_count, 2
     );
+
+    RESET ROLE;
+END;
+$$;
+
+-- ===========================================================================
+-- BLOCO 7 — WITH CHECK: um tenant NÃO grava linha de outro tenant nem doc
+--   "público" (tenant_id NULL). Os BLOCOS 1–3 provam só a LEITURA; este prova
+--   a ESCRITA. Sem o WITH CHECK explícito, a policy do help_doc (com o ramo
+--   `tenant_id IS NULL` no USING) deixaria um tenant INSERIR um doc público
+--   que todos leem — envenenamento do corpus RAG. Cada tentativa deve abortar
+--   com 42501; cada probe roda num sub-bloco (savepoint), então a rejeição
+--   esperada não derruba a transação de teste.
+-- ===========================================================================
+DO $$
+DECLARE
+    v_zero_vec TEXT := '[' || repeat('0,', 1023) || '0]';
+    v_tenant_b UUID := 'dddddddd-0000-0000-0000-000000000001';
+BEGIN
+    SET LOCAL ROLE adserver_app;
+    SET LOCAL adserver.tenant_id = 'cccccccc-0000-0000-0000-000000000001';
+
+    -- 7a. help_doc "público" forjado (tenant_id NULL) por um tenant → rejeitado
+    BEGIN
+        INSERT INTO vector_store.help_doc_embeddings
+            (tenant_id, doc_id, title, content, chunk_index, embedding, embedding_model)
+        VALUES (NULL, 'help-forjado', 'Forjado', 'x', 0, v_zero_vec::vector, 'test-model');
+        RAISE EXCEPTION
+            'ASSERT FALHOU [WITH CHECK help_doc NULL]: doc público por tenant ACEITO (esperado 42501)';
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE NOTICE 'PASS [WITH CHECK: help_doc público (tenant_id NULL) forjado rejeitado]: %', SQLSTATE;
+    END;
+
+    -- 7b. help_doc com tenant_id de B → rejeitado
+    BEGIN
+        INSERT INTO vector_store.help_doc_embeddings
+            (tenant_id, doc_id, title, content, chunk_index, embedding, embedding_model)
+        VALUES (v_tenant_b, 'help-b-forjado', 'Forjado B', 'x', 0, v_zero_vec::vector, 'test-model');
+        RAISE EXCEPTION
+            'ASSERT FALHOU [WITH CHECK help_doc B]: INSERT cross-tenant ACEITO (esperado 42501)';
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE NOTICE 'PASS [WITH CHECK: help_doc do tenant B rejeitado]: %', SQLSTATE;
+    END;
+
+    -- 7c. creative com tenant_id de B → rejeitado
+    BEGIN
+        INSERT INTO vector_store.creative_embeddings
+            (tenant_id, banner_id, campaign_id, creative_type, ctr,
+             impression_count, description_snippet, embedding, embedding_model)
+        VALUES (v_tenant_b, 999, 9999, 'image', 0.01, 1, 'forjado',
+                v_zero_vec::vector, 'test-model');
+        RAISE EXCEPTION
+            'ASSERT FALHOU [WITH CHECK creative B]: INSERT cross-tenant ACEITO (esperado 42501)';
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE NOTICE 'PASS [WITH CHECK: creative do tenant B rejeitado]: %', SQLSTATE;
+    END;
 
     RESET ROLE;
 END;

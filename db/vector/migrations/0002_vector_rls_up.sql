@@ -26,12 +26,14 @@ ALTER TABLE vector_store.creative_embeddings FORCE  ROW LEVEL SECURITY;
 
 CREATE POLICY creative_embeddings_tenant_isolation
     ON vector_store.creative_embeddings
-    USING (tenant_id = config.current_tenant_id());
+    USING      (tenant_id = config.current_tenant_id())
+    WITH CHECK (tenant_id = config.current_tenant_id());
 
 COMMENT ON POLICY creative_embeddings_tenant_isolation
     ON vector_store.creative_embeddings IS
     'Isolamento estrito por tenant (TX-3): nenhum tenant lê embeddings de outro. '
-    'Fail-closed: sem adserver.tenant_id → 0 linhas.';
+    'Fail-closed: sem adserver.tenant_id → 0 linhas. WITH CHECK: rejeita INSERT/UPDATE '
+    'com tenant_id ≠ do tenant corrente.';
 
 -- ---------------------------------------------------------------------------
 -- help_doc_embeddings — RLS com suporte a docs públicos (tenant_id NULL)
@@ -39,18 +41,27 @@ COMMENT ON POLICY creative_embeddings_tenant_isolation
 ALTER TABLE vector_store.help_doc_embeddings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE vector_store.help_doc_embeddings FORCE  ROW LEVEL SECURITY;
 
--- Policy: doc público (NULL) OU doc do tenant corrente
+-- Policy de LEITURA: doc público (NULL) OU doc do tenant corrente.
+-- Policy de ESCRITA (WITH CHECK): SÓ o próprio tenant. Sem o WITH CHECK
+-- explícito, o Postgres reusa o USING como verificação de escrita — e o ramo
+-- `tenant_id IS NULL` deixaria um role de tenant INSERIR um doc "público"
+-- (tenant_id NULL) que TODOS os tenants passam a ler (envenenamento do corpus
+-- RAG compartilhado). Docs públicos são semeados só pelo loader/superuser
+-- (BYPASSRLS), nunca por um tenant.
 CREATE POLICY help_doc_embeddings_tenant_isolation
     ON vector_store.help_doc_embeddings
     USING (
         tenant_id IS NULL
         OR tenant_id = config.current_tenant_id()
-    );
+    )
+    WITH CHECK (tenant_id = config.current_tenant_id());
 
 COMMENT ON POLICY help_doc_embeddings_tenant_isolation
     ON vector_store.help_doc_embeddings IS
-    'Docs públicos (tenant_id IS NULL) são visíveis para todos os tenants autenticados. '
-    'Docs privados (tenant_id NOT NULL) só são visíveis para o próprio tenant (TX-3).';
+    'LEITURA: docs públicos (tenant_id IS NULL) visíveis a todos os tenants '
+    'autenticados + docs privados do próprio tenant (TX-3). ESCRITA (WITH CHECK): '
+    'só o próprio tenant — um tenant NÃO grava doc público (NULL) nem de outro '
+    'tenant; públicos são semeados via loader/superuser BYPASSRLS.';
 
 -- ---------------------------------------------------------------------------
 -- Grants para o usuário de aplicação

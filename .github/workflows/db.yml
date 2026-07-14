@@ -36,7 +36,12 @@ jobs:
     # Postgres 16 efêmero — sem persistência, sem credenciais externas.
     services:
       postgres:
-        image: postgres:16
+        # pgvector/pgvector:pg16 = postgres:16 + extensão pgvector. Necessário:
+        # a migração db/vector/0001 faz `CREATE EXTENSION vector` e a stock
+        # `postgres:16` não a traz → a migração abortava e TODO o gate de RLS
+        # (config/ledger/vector/compliance) nunca executava (falso-verde por
+        # não-acionamento). Ver db-test-vector / vector_rls_isolation_test.sql.
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres_test_only
