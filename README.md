@@ -683,12 +683,59 @@ curso, e cada mudança rastreia a um invariante documentado (TX-2/TX-3/CA-1/DA-1
 em primeira-mão contra Postgres real. Disciplina de medição: as perguntas de RLS `WITH CHECK` e de violação de
 CHECK foram **decididas rodando SQL real no Postgres local**, não por aritmética de LLM.
 
+### ✅ Entregue na Fase 3 — 15ª onda: varredura profunda de bugs (item 6), 11 achados corrigidos/gated (sob ADR-0004, sem ADR novo; gates verdes)
+
+Varredura multi-lente do addon (5 lentes: isolamento-de-tenant/owner-ref, dinheiro TX-2/DA-10, hot-path Go +
+concorrência, gates-de-CI-que-mentem, migrações/testes de BD), cada achado **adversarialmente verificado
+(refute-por-omissão) e adjudicado em primeira-mão** contra Postgres/pgvector real, Go `-race` e execução real
+dos gates. **12 achados reais** (2 eram o mesmo defeito por 2 lentes → **11 distintos**), 1 FP descartado. A
+varredura confirmou 2 classes que a onda 14 previu: "teste que nunca prova o invariante" (o bug de seed do
+config **se repete no vector**) e a classe `WITH CHECK` (descartada como FP no config por ter USING de igualdade
+estrita, **é real no help_doc** por causa do ramo `IS NULL`). Corrigido em 4 commits:
+
+- **DB/vector** (`a083181`): [HIGH] o `vector_rls_isolation_test.sql` **nunca passou** (3 defeitos SQL
+  empilhados na BLOCO 1c) → as provas cross-tenant dos embeddings RAG nunca rodavam; corrigido +
+  **BLOCO 7** de rejeição de escrita (42501), **18 PASS**. [MED-sec] `help_doc_embeddings` só-`USING`
+  (ramo `tenant_id IS NULL`) deixava um tenant **inserir doc "público" que todos leem** — `WITH CHECK`
+  explícito fecha. [MED-ci] `db.yml` usava `postgres:16` sem pgvector → o gate RLS inteiro nunca rodava →
+  imagem `pgvector/pgvector:pg16`.
+- **Hot-path Go** (`39c03c0`): [HIGH] o registro do WAL de telemetria persistia só o payload → no replay
+  pós-crash o `topic` sumia → Kafka rejeita → **evento perdido** (quebra a durabilidade que a reconciliação
+  DA-7 assume); + nunca compactava (re-replay infinito). Fix: WAL carrega topic+key, replay reconstrói,
+  Close() compacta; teste e2e prova replay→produce com topic REAL. [MED-sec] capping fazia `Incr` e depois
+  `Expire` (erro engolido) → chave pseudônima por-usuário **sem TTL, permanente** (viola DA-6/TX-5); fix:
+  `INCR`+`PEXPIRE` atômicos (Lua).
+- **CI órfão** (`f68fb04`): [MED/MED/LOW] `bff-ci`, `data-validate`, `web-ci` existiam como alvos `make` mas
+  **nenhum workflow os acionava** (classe das ondas 11/13) → 3 novos workflows (bff/data/web).
+- **Billing + ranker** (`04f951a`): [LOW] `calc_cpm_amount` faturava a fração sub-mille (`(imp/1000)*rate`) em
+  vez de `floor(imp/1000)*rate` (BILLING.md §4.1) — 999 impressões faturavam 2.00 em vez de 0.00; fix floor +
+  teste. [HIGH/MED **gated**] a race de mis-atribuição OPE do ranker/shadow (`last` compartilhado lido após
+  `Decide`) é **inerte** (RANKER/AB/SHADOW off até E4/J3) e seu conserto é refactor de hot-path — **documentada
+  como pré-condição bloqueante de E4/J3** (comentário FALSO "handler não reusado entre goroutines" corrigido),
+  não apressada em código gated-off.
+
+**Gates verdes (15ª onda):** `make go-build`+`go-vet`+`go-test` (**28 pacotes `-race`**, golden de paridade
+intacto — sem regressão no motor de decisão) + `make parity-golden-short`; config **38 PASS** e vector **18
+PASS** (fresh DB, up/down/up); `make data-validate` (12 invariantes) + `data-billing-test`; `bff` typecheck+lint+
+**73 testes**; `web`/`db`/YAML válidos. **Regra de ouro:** nenhum escopo inventado — cada correção rastreia a um
+invariante (TX-2/TX-3/CA-1/DA-6/DA-7/DA-11) ou a um defeito **reproduzido em primeira-mão**; o achado gated-off
+foi **documentado sob seu gate**, não reescrito às pressas.
+
 ### ⏭️ Pendente da Fase 3
 
 **K8** (promoção do deep ranking sob **uplift A/B + kill-switch**) segue **gated por
 tráfego real** — o código está pronto desde K1 (flag default-off); a promoção espera o
-número de uplift sobre o GBDT, que depende do cutover de infra da Fase 2. A **habilitação
-de AEV/BND** segue **gated pela spec de produto** (`scale`/classificação/supply — CHECK
+número de uplift sobre o GBDT, que depende do cutover de infra da Fase 2.
+
+> **Pré-condição de código de E4/J3 (HOT-1/HOT-3, 15ª onda):** antes de ligar
+> `RANKER_ENABLED`/`AB_ENABLED`/`SHADOW_ENABLED` sob tráfego real, o **RankResult por-request
+> deve fluir de `Decide()`** (retornado, ou ranker por-request) em vez do campo `last`
+> compartilhado lido via `LastResult()` — hoje uma instância compartilhada sob concorrência
+> pode trocar propensity/model_version/scores entre requests e enviesar o OPE que decide a
+> promoção. Inerte enquanto os flags estão off; documentado em `internal/ranker/bandit_ranker.go`,
+> `ranker.go` e `shadow.go`.
+
+A **habilitação de AEV/BND** segue **gated pela spec de produto** (`scale`/classificação/supply — CHECK
 estrutural impede habilitar sem `scale`). **Pré-condições de go-live** restantes são
 **só de infra/spec viva** (a camada de código está pronta **e provada** — ver hardening +
 4ª onda acima, com runbook em [docs/ops/go-live-runbook.md](docs/ops/go-live-runbook.md)):
