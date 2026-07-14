@@ -210,6 +210,15 @@ func NewShadowRanker(
 // Context fields:
 //   - decisionID: the ULID of the current decision (for OPE join).
 //   - zoneID: the zone being served (placement context).
+//
+// KNOWN LIMITATION (HOT-3, gate J3): the decision handler holds a SINGLE shared
+// ShadowRanker; net/http invokes it concurrently. Because this per-request
+// context is set on the shared instance BEFORE Decide and read inside Rank, a
+// concurrent request B can overwrite A's context in between, so A's shadow
+// record is stamped with B's decision_id/zone_id — poisoning the OPE join.
+// Inert while SHADOW_ENABLED is off; before J3 the context must be passed
+// THROUGH Rank (or a per-request ShadowRanker), not via a shared field. Same
+// root cause as HOT-1 (bandit_ranker.go). See README "Pendente da Fase 3".
 func (sr *ShadowRanker) SetRequestContext(decisionID, zoneID string) {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()

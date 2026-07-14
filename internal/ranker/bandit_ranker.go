@@ -18,11 +18,21 @@
 //     returns the original unmodified slice, stores FailOpen=true, and sets
 //     ExploreResult.Propensity=1.0 (deterministic fallback).
 //
-//   Thread safety: BanditRanker is NOT safe for concurrent Rank calls.
-//     Each request goroutine must have its own BanditRanker instance, or the
-//     decision handler must serialize calls (the current single-ranker model
-//     already serialises: one Rank call per HTTP request goroutine, and the
-//     handler is not reused across goroutines).
+//   Thread safety / OPE attribution — KNOWN LIMITATION, gate: E4/J4 (HOT-1):
+//     A SINGLE shared BanditRanker is wired into the cascade engine, and
+//     net/http invokes the decision handler CONCURRENTLY (the handler struct IS
+//     reused across goroutines — the earlier "not reused" note was wrong). The
+//     mutex below makes Rank/LastResult free of DATA races, but does NOT make
+//     them atomic PER REQUEST: the handler reads LastResult() AFTER
+//     cascade.Decide() returns, so a concurrent request's Rank can overwrite
+//     `last` in between — request A then logs request B's propensity /
+//     model_version / per-candidate scores, biasing OPE/IPS/DR (§2.3) and the
+//     model-promotion / kill-switch inputs. INERT today: AB_ENABLED /
+//     RANKER_ENABLED default OFF (not promoted until E4 under real traffic).
+//     BEFORE flipping those flags the per-request RankResult MUST flow back FROM
+//     Decide() (return it, or a per-request ranker) instead of via shared
+//     `last`. Same root cause for SHADOW: shadow.go SetRequestContext (HOT-3).
+//     See README "Pendente da Fase 3".
 //
 //   PII-free (TX-5/DA-11): BanditRanker sees only cascade.Candidate (no user
 //     identifiers). Propensity and epsilon are ML signals, not PII.

@@ -123,6 +123,13 @@ type MLRanker struct {
 	// Protected by mu: Rank (writer) and LastResult (reader) may be called
 	// from concurrent goroutines when the same MLRanker instance is shared
 	// across HTTP request handlers (RANKER_ENABLED=true, Fase 2+).
+	//
+	// KNOWN LIMITATION (HOT-1, gate E4): the mutex prevents a DATA race but not
+	// per-request mis-attribution — the handler reads LastResult() AFTER Decide()
+	// returns, so a concurrent Rank can overwrite `last` in between (A logs B's
+	// scores/model_version → biased OPE). Inert while RANKER_ENABLED is off; the
+	// per-request RankResult must flow from Decide() before E4. See the authoritative
+	// note in bandit_ranker.go and README "Pendente da Fase 3".
 	last RankResult
 }
 

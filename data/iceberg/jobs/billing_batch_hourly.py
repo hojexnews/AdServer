@@ -162,15 +162,23 @@ def calc_cpm_amount(
     asset: AssetInfo,
 ) -> Decimal:
     """
-    Calculo CPM: (impressions / 1000) * rate.
-    Tudo em Decimal; nunca float (TX-2).
-    ROUND_HALF_EVEN aplicado apenas na fronteira de faturamento.
+    Calculo CPM (BILLING.md §4.1): mille = floor(impressions / 1000);
+    billing = mille * rate. Fatura-se por MILHAR COMPLETO — a fração sub-mille
+    (impressions % 1000) NAO e faturada aqui; "o resto fica para o proximo bucket,
+    nao ha posting parcial de CPM incompleto" (§4.1). O ACUMULO do resto entre
+    buckets e responsabilidade do leitor de ingestao (E2 — ver TODO em
+    read_impressions_for_billing), nao desta funcao pura.
+
+    Tudo em Decimal; nunca float (TX-2). ROUND_HALF_EVEN so na fronteira de
+    faturamento, para uma eventual fracao de `rate` (§4.1 "nota de escala").
     """
     with localcontext() as ctx:
         ctx.prec = DECIMAL_CTX_PRECISION
         ctx.rounding = DECIMAL_ROUNDING
-        result = (Decimal(impressions) / Decimal(1000)) * rate
-        # Arredondar para o scale do ativo (ROUND_HALF_EVEN, TX-2 §6)
+        mille = impressions // 1000  # floor — sub-mille remainder carries forward
+        result = Decimal(mille) * rate
+        # Arredondar para o scale do ativo (ROUND_HALF_EVEN, TX-2 §6). Com mille
+        # inteiro isto so atua se `rate` tiver mais casas que o scale do ativo.
         quantize_str = Decimal(10) ** -asset.scale
         return result.quantize(quantize_str, rounding=DECIMAL_ROUNDING)
 

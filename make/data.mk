@@ -16,7 +16,7 @@ RP_DIR           := $(DATA_DIR)/redpanda
 
 .PHONY: data-lint data-no-float data-sql-check data-yaml-check data-py-syntax \
         data-validate data-schema-invariants data-ivt-test data-ivt-sql-check \
-        data-help
+        data-billing-test data-help
 
 ## data-lint: valida DDL SQL, specs YAML e jobs Python de data/ (sem subir ClickHouse)
 data-lint: data-no-float data-sql-check data-yaml-check data-py-syntax
@@ -76,6 +76,11 @@ data-ivt-test:
 data-schema-invariants:
 	@echo "== data-schema-invariants =="
 	@python3 scripts/ci/data-schema-invariants.py
+
+## data-billing-test: testa a semantica de FLOOR do CPM (BILLING.md 4.1). So stdlib.
+data-billing-test:
+	@echo "== data-billing-test (CPM floor, BILLING.md 4.1 / sweep MONEY-01) =="
+	@python3 data/iceberg/jobs/test_billing_batch_hourly.py
 
 ## data-help: lista os alvos de data/
 data-help:
