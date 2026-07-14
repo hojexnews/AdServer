@@ -77,6 +77,10 @@ type RedisClient interface {
 	// Expire sets the TTL on an existing key.  It is called after Incr to set
 	// the TTL only on the first increment (when the key is new).
 	Expire(ctx context.Context, key string, expiration time.Duration) *redis.BoolCmd
+	// Eval runs a Lua script atomically (INCR + PEXPIRE in one round-trip) so a
+	// counter key can NEVER exist without its TTL (DA-6/TX-5/DA-11).  Both
+	// *redis.Client and *redis.ClusterClient provide Eval.
+	Eval(ctx context.Context, script string, keys []string, args ...any) *redis.Cmd
 }
 
 // ---------------------------------------------------------------------------
@@ -207,27 +211,33 @@ func (c *Capper) Allowed(userID string, camp *snapshot.Campaign, ban *snapshot.B
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-// checkAndIncr increments key and returns true iff the new value <= limit.
-// When ttl > 0 it is set on the key only when the key is first created (i.e.
-// the counter just moved from 0→1).  This avoids resetting the TTL on every
-// impression — we want a fixed window, not a sliding one.
+// incrExpireLua atomically increments KEYS[1] and, ONLY on first creation
+// (value == 1), sets a PTTL of ARGV[1] milliseconds.  Doing INCR+PEXPIRE in a
+// single atomic script closes the window where a crash — or an Expire timeout
+// within the shared 10 ms budget — between two separate calls would leave a
+// PERMANENT (untimed) pseudonymous per-user key, violating DA-6/TX-5/DA-11 and
+// this package's own "keys MUST expire" invariant.  A later increment (v>1)
+// intentionally does NOT reset the TTL — we want a fixed window, not sliding.
+const incrExpireLua = `
+local v = redis.call('INCR', KEYS[1])
+if v == 1 and tonumber(ARGV[1]) > 0 then
+  redis.call('PEXPIRE', KEYS[1], ARGV[1])
+end
+return v`
+
+// checkAndIncr atomically increments key (setting its TTL on first creation)
+// and returns true iff the new value <= limit.
 //
 // If the counter exceeds the limit the increment is NOT rolled back (best-effort
-// per ADR-0002 B.3: slight over-delivery is acceptable).  Rolling back would
-// require a Lua script or WATCH/MULTI/EXEC, adding latency to the hot path.
+// per ADR-0002 B.3: slight over-delivery is acceptable).  On any Redis error the
+// caller fail-safes (Allowed → false); crucially, because the TTL is set in the
+// SAME atomic op as the INCR, a failed/timed-out call can never leave an untimed
+// key behind (the script either fully ran — key created WITH its PTTL — or not
+// at all).
 func (c *Capper) checkAndIncr(ctx context.Context, key string, limit int64, ttl time.Duration) (bool, error) {
-	newVal, err := c.client.Incr(ctx, key).Result()
+	newVal, err := c.client.Eval(ctx, incrExpireLua, []string{key}, ttl.Milliseconds()).Int64()
 	if err != nil {
-		return false, fmt.Errorf("capping: redis incr %q: %w", key, err)
-	}
-
-	// Set TTL only when the key is newly created (first impression).
-	if newVal == 1 && ttl > 0 {
-		if err := c.client.Expire(ctx, key, ttl).Err(); err != nil {
-			// Non-fatal: the key will live forever but the cap will still
-			// enforce.  Log via observability; don't abort delivery.
-			_ = err // caller's observability layer handles
-		}
+		return false, fmt.Errorf("capping: redis incr+expire %q: %w", key, err)
 	}
 
 	return newVal <= limit, nil

@@ -68,6 +68,17 @@ func (f *parityFakeRedis) Expire(_ context.Context, _ string, _ time.Duration) *
 	return redis.NewBoolResult(true, nil)
 }
 
+// Eval emulates the atomic INCR (+ first-create PEXPIRE) script used by the
+// Capper.  The golden cases assert cap COUNTS, not TTLs, so the increment
+// semantics are what matter here.
+func (f *parityFakeRedis) Eval(_ context.Context, _ string, keys []string, _ ...any) *redis.Cmd {
+	if f.down {
+		return redis.NewCmdResult(nil, errFakeRedisDown)
+	}
+	f.counters[keys[0]]++
+	return redis.NewCmdResult(f.counters[keys[0]], nil)
+}
+
 // ---------------------------------------------------------------------------
 // Golden file schema (CA-5) — subset used for table-driven parametric cases
 // ---------------------------------------------------------------------------

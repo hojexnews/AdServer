@@ -25,9 +25,14 @@ import (
 //
 // Record format (binary, little-endian):
 //
-//	[4 bytes: uint32 payload length]
-//	[N bytes: payload (serialised protobuf)]
-//	[4 bytes: CRC32 of payload]
+//	[4 bytes: uint32 topic length][topic bytes]
+//	[4 bytes: uint32 key   length][key bytes]
+//	[4 bytes: uint32 payload length][payload bytes (serialised protobuf)]
+//	[4 bytes: CRC32 of (topic ++ key ++ payload)]
+//
+// The topic and routing key are persisted ALONGSIDE the payload: on replay the
+// producer must reconstruct the FULL record (a Kafka produce with an empty topic
+// is rejected — the events the WAL exists to protect would be silently lost).
 //
 // ---------------------------------------------------------------------------
 
@@ -35,7 +40,15 @@ import (
 // Fields are exported so the export_test.go alias exposes them to _test packages.
 type walRecord struct {
 	Offset  int64  // byte offset of the start of this record
+	End     int64  // byte offset just past this record (Offset + on-disk size)
+	Topic   string // Kafka topic (persisted so replay can re-produce correctly)
+	Key     []byte // partition-routing key (event_id bytes)
 	Payload []byte // raw protobuf bytes
+}
+
+// walRecordSize returns the on-disk byte size of a record with these fields.
+func walRecordSize(topic string, key, payload []byte) int64 {
+	return int64(4 + len(topic) + 4 + len(key) + 4 + len(payload) + 4)
 }
 
 // WAL is an append-only, crash-durable event log.
@@ -62,20 +75,33 @@ func openWAL(path string, syncWrites bool) (*WAL, error) {
 	return &WAL{f: f, pos: pos, path: path, sync: syncWrites}, nil
 }
 
-// Append writes payload to the WAL and returns the byte offset of the record.
-// It is safe for concurrent use.
-func (w *WAL) Append(payload []byte) (int64, error) {
+// Append writes (topic, key, payload) to the WAL and returns the byte offset of
+// the START of the record.  It is safe for concurrent use.
+func (w *WAL) Append(topic string, key, payload []byte) (int64, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	offset := w.pos
 
-	// [4 bytes length][payload][4 bytes CRC]
-	buf := make([]byte, 4+len(payload)+4)
-	binary.LittleEndian.PutUint32(buf[0:4], uint32(len(payload)))
-	copy(buf[4:], payload)
-	crc := crc32.ChecksumIEEE(payload)
-	binary.LittleEndian.PutUint32(buf[4+len(payload):], crc)
+	tb := []byte(topic)
+	// [4 topicLen][topic][4 keyLen][key][4 payloadLen][payload][4 CRC]
+	buf := make([]byte, walRecordSize(topic, key, payload))
+	n := 0
+	binary.LittleEndian.PutUint32(buf[n:], uint32(len(tb)))
+	n += 4
+	n += copy(buf[n:], tb)
+	binary.LittleEndian.PutUint32(buf[n:], uint32(len(key)))
+	n += 4
+	n += copy(buf[n:], key)
+	binary.LittleEndian.PutUint32(buf[n:], uint32(len(payload)))
+	n += 4
+	n += copy(buf[n:], payload)
+	// CRC covers topic ++ key ++ payload (everything but the length prefixes).
+	crc := crc32.NewIEEE()
+	_, _ = crc.Write(tb)
+	_, _ = crc.Write(key)
+	_, _ = crc.Write(payload)
+	binary.LittleEndian.PutUint32(buf[n:], crc.Sum32())
 
 	if _, err := w.f.Write(buf); err != nil {
 		return 0, fmt.Errorf("wal: write: %w", err)
@@ -103,35 +129,55 @@ func (w *WAL) Replay(fn func(r walRecord)) error {
 
 	reader := bufio.NewReader(w.f)
 	var offset int64
-	for {
-		var length uint32
-		if err := binary.Read(reader, binary.LittleEndian, &length); err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				break
-			}
-			return fmt.Errorf("wal: replay read length: %w", err)
+	// readField reads a [4-byte length][bytes] field; returns io.EOF-ish on a
+	// truncated tail (caller breaks).
+	readField := func() ([]byte, bool) {
+		var n uint32
+		if err := binary.Read(reader, binary.LittleEndian, &n); err != nil {
+			return nil, false
 		}
-
-		payload := make([]byte, length)
-		if _, err := io.ReadFull(reader, payload); err != nil {
-			// Truncated record — stop here.
+		b := make([]byte, n)
+		if _, err := io.ReadFull(reader, b); err != nil {
+			return nil, false
+		}
+		return b, true
+	}
+	for {
+		topicB, ok := readField()
+		if !ok {
+			break // clean EOF or truncated length/topic — stop.
+		}
+		keyB, ok := readField()
+		if !ok {
 			break
 		}
-
+		payload, ok := readField()
+		if !ok {
+			break
+		}
 		var storedCRC uint32
 		if err := binary.Read(reader, binary.LittleEndian, &storedCRC); err != nil {
 			break
 		}
 
-		computedCRC := crc32.ChecksumIEEE(payload)
-		recordSize := int64(4 + length + 4)
-		if computedCRC != storedCRC {
+		recordSize := walRecordSize(string(topicB), keyB, payload)
+		crc := crc32.NewIEEE()
+		_, _ = crc.Write(topicB)
+		_, _ = crc.Write(keyB)
+		_, _ = crc.Write(payload)
+		if crc.Sum32() != storedCRC {
 			// Corrupt record — skip and continue.
 			offset += recordSize
 			continue
 		}
 
-		fn(walRecord{Offset: offset, Payload: payload})
+		fn(walRecord{
+			Offset:  offset,
+			End:     offset + recordSize,
+			Topic:   string(topicB),
+			Key:     keyB,
+			Payload: payload,
+		})
 		offset += recordSize
 	}
 

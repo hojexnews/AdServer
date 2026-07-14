@@ -45,6 +45,12 @@ type Producer struct {
 	queue chan pendingRecord
 	wg    sync.WaitGroup
 
+	// walAckedEnd is the highest WAL end-offset whose record has been
+	// successfully produced this lifetime.  Written ONLY by drainLoop; read by
+	// Close after wg.Wait() (happens-before), which then compacts the WAL up to
+	// it so a normal restart doesn't re-produce the entire history.
+	walAckedEnd int64
+
 	// seenIDs is a small bloom-style dedup window for the in-process path.
 	// Exactly-once is the consumer's job; this only avoids obvious hot-path
 	// duplicates within the same process lifecycle.
@@ -56,6 +62,7 @@ type pendingRecord struct {
 	topic   string
 	key     []byte // event_id bytes for partition routing
 	payload []byte // serialised protobuf
+	walEnd  int64  // WAL end-offset of this record (0 if not WAL-backed)
 }
 
 // KafkaClient is the subset of franz-go used by the Producer.
@@ -140,9 +147,16 @@ func NewProducer(cfg Config) (*Producer, error) {
 	// Replay WAL entries into the queue on startup.
 	if wal != nil {
 		_ = wal.Replay(func(r walRecord) {
-			// Best-effort: if the queue is full, skip replayed entries.
+			// Reconstruct the FULL record (topic + key + payload): producing with
+			// an empty topic is rejected by Kafka and would silently lose exactly
+			// the events the WAL exists to protect.
 			select {
-			case p.queue <- pendingRecord{payload: r.Payload}:
+			case p.queue <- pendingRecord{
+				topic:   r.Topic,
+				key:     r.Key,
+				payload: r.Payload,
+				walEnd:  r.End,
+			}:
 			default:
 				logger.Warn("telemetry: WAL replay queue full; entry dropped",
 					"offset", r.Offset)
@@ -325,18 +339,25 @@ func (p *Producer) enqueue(topic, eventID string, msg proto.Message) {
 		return
 	}
 
-	// Write to WAL for durability before network.
+	// Write to WAL for durability before network.  Persist topic + key so a
+	// replayed record can be produced correctly (empty topic → Kafka rejects).
+	key := []byte(eventID)
+	var walEnd int64
 	if p.wal != nil {
-		if _, err := p.wal.Append(payload); err != nil {
+		off, err := p.wal.Append(topic, key, payload)
+		if err != nil {
 			p.logger.Warn("telemetry: WAL append failed", "err", err)
 			// Continue: event may be lost on crash, but don't block hot path.
+		} else {
+			walEnd = off + walRecordSize(topic, key, payload)
 		}
 	}
 
 	rec := pendingRecord{
 		topic:   topic,
-		key:     []byte(eventID),
+		key:     key,
 		payload: payload,
+		walEnd:  walEnd,
 	}
 
 	// Non-blocking send: if the queue is full, log and drop.
@@ -354,7 +375,8 @@ func (p *Producer) drainLoop() {
 	defer p.wg.Done()
 	for rec := range p.queue {
 		if p.client == nil {
-			// No Kafka client (dev/test mode): discard.
+			// No Kafka client (dev/test mode): don't produce and DON'T ack —
+			// keep the WAL intact so a later real run can replay it.
 			continue
 		}
 		kr := &kgo.Record{
@@ -363,12 +385,18 @@ func (p *Producer) drainLoop() {
 			Value: rec.payload,
 		}
 		results := p.client.ProduceSync(context.Background(), kr)
+		produced := true
 		for _, res := range results {
 			if res.Err != nil {
+				produced = false
 				p.logger.Error("telemetry: produce failed",
 					"topic", rec.topic, "err", res.Err)
 				// WAL retains the record; it will be replayed on restart.
 			}
+		}
+		// Advance the compaction watermark only for durably-produced records.
+		if produced && rec.walEnd > p.walAckedEnd {
+			p.walAckedEnd = rec.walEnd
 		}
 	}
 }
@@ -376,8 +404,18 @@ func (p *Producer) drainLoop() {
 // Close drains the queue and closes the WAL and Kafka client.
 func (p *Producer) Close() {
 	close(p.queue)
-	p.wg.Wait()
+	p.wg.Wait() // drainLoop returned → walAckedEnd is final (no concurrent append)
+
 	if p.wal != nil {
+		// Compact: drop the prefix of records already produced this lifetime;
+		// only un-acked (failed / never-produced) records survive to be replayed
+		// on the next start.  Safe here — the queue is closed and drained, so no
+		// concurrent Append can invalidate walAckedEnd.
+		if p.walAckedEnd > 0 {
+			if err := p.wal.Truncate(p.walAckedEnd); err != nil {
+				p.logger.Warn("telemetry: WAL compaction on close failed", "err", err)
+			}
+		}
 		_ = p.wal.Close()
 	}
 	if p.client != nil {

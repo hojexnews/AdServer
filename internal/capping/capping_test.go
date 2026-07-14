@@ -63,6 +63,31 @@ func (f *fakeRedis) Expire(ctx context.Context, key string, expiration time.Dura
 	return redis.NewBoolResult(true, nil)
 }
 
+// Eval emulates the atomic INCR + (first-create) PEXPIRE script used by
+// checkAndIncr.  args[0] is the TTL in milliseconds.  Increment and TTL happen
+// together, mirroring the real script's atomicity (no untimed-key window).
+func (f *fakeRedis) Eval(ctx context.Context, script string, keys []string, args ...any) *redis.Cmd {
+	if f.down {
+		return redis.NewCmdResult(nil, errDown)
+	}
+	key := keys[0]
+	f.counters[key]++
+	v := f.counters[key]
+	if v == 1 && len(args) > 0 {
+		var ms int64
+		switch a := args[0].(type) {
+		case int64:
+			ms = a
+		case int:
+			ms = int64(a)
+		}
+		if ms > 0 {
+			f.ttls[key] = time.Duration(ms) * time.Millisecond
+		}
+	}
+	return redis.NewCmdResult(v, nil)
+}
+
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
@@ -369,5 +394,32 @@ func TestCapper_CampaignTotal_TTLIsPositive(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestCapper_NoUntimedKey_AllScopes encodes the DA-6/TX-5/DA-11 invariant that a
+// pseudonymous per-user counter key can NEVER exist without a TTL, across ALL
+// active cap scopes.  The prior Incr-then-Expire path could leave a permanent
+// key when Expire timed out within the shared 10 ms budget (error swallowed) or
+// the process crashed between the two calls; the atomic INCR+PEXPIRE closes it.
+func TestCapper_NoUntimedKey_AllScopes(t *testing.T) {
+	r := newFakeRedis()
+	c := capping.New(r, "test-salt")
+	// All three scopes active → three distinct counter keys; each MUST be timed.
+	camp := makeCamp(5, 5, 5, 3600)
+	ban := makeBan(0, 0, 0, 0)
+
+	if ok, err := c.Allowed("user-x", camp, ban); err != nil || !ok {
+		t.Fatalf("first impression: ok=%v err=%v", ok, err)
+	}
+
+	if len(r.counters) == 0 {
+		t.Fatal("no counter keys created for a capped campaign")
+	}
+	for key := range r.counters {
+		ttl, ok := r.ttls[key]
+		if !ok || ttl <= 0 {
+			t.Errorf("counter key %q has no positive TTL (permanent per-user key — DA-6/TX-5/DA-11)", key)
+		}
 	}
 }
