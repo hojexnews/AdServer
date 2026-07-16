@@ -166,9 +166,25 @@ func (DiscardSink) EmitShadow(_ ShadowRecord) {}
 // ShadowRanker) OR use DiscardSink — same effect.
 //
 // State: shadowDecisionID and shadowZoneID must be set per-request via
-// SetRequestContext BEFORE calling Rank. The decision handler does this.
-// This is safe because the decision service uses one cascade.Decide call
-// per HTTP request (serial within a goroutine).
+// SetRequestContext BEFORE calling Rank.
+//
+// FIXED (gate E6/E10, was HOT-3): a single shared ShadowRanker is NOT
+// attribution-safe across concurrent HTTP requests — SetRequestContext writes
+// shadowDecisionID/shadowZoneID on a field shared with every other in-flight
+// request, so a concurrent request B can overwrite A's context between A's
+// SetRequestContext call and the Rank call inside A's cascade.Decide,
+// poisoning A's ShadowRecord with B's decision_id/zone_id.
+//
+// The decision service hot path no longer wires a shared ShadowRanker into
+// the cascade engine. Instead, for each HTTP request it constructs a fresh
+// ranker.RequestShadowRanker (see request.go) carrying that request's
+// decisionID/zoneID baked in at construction time, and calls
+// cascade.Engine.DecideWithRanker(req, snap, requestShadowRanker). The
+// ShadowRecord is read from that local variable — never a shared field.
+// rankShadow/buildShadowRecord (below) contain the actual scoring/record
+// logic and touch no shared state; both ShadowRanker.Rank (kept for existing
+// test callers that wire it via cascade.WithRanker on a single goroutine)
+// and RequestShadowRanker.Rank delegate to them.
 type ShadowRanker struct {
 	inner        *MLRanker
 	sink         ShadowSink
@@ -211,14 +227,9 @@ func NewShadowRanker(
 //   - decisionID: the ULID of the current decision (for OPE join).
 //   - zoneID: the zone being served (placement context).
 //
-// KNOWN LIMITATION (HOT-3, gate J3): the decision handler holds a SINGLE shared
-// ShadowRanker; net/http invokes it concurrently. Because this per-request
-// context is set on the shared instance BEFORE Decide and read inside Rank, a
-// concurrent request B can overwrite A's context in between, so A's shadow
-// record is stamped with B's decision_id/zone_id — poisoning the OPE join.
-// Inert while SHADOW_ENABLED is off; before J3 the context must be passed
-// THROUGH Rank (or a per-request ShadowRanker), not via a shared field. Same
-// root cause as HOT-1 (bandit_ranker.go). See README "Pendente da Fase 3".
+// Test-only / single-goroutine usage: see the FIXED note on the ShadowRanker
+// type doc above. The decision service hot path uses
+// ranker.RequestShadowRanker instead (per-request, no shared context field).
 func (sr *ShadowRanker) SetRequestContext(decisionID, zoneID string) {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
@@ -244,54 +255,8 @@ func (sr *ShadowRanker) Rank(candidates []*cascade.Candidate) []*cascade.Candida
 	zoneID := sr.shadowZoneID
 	sr.mu.Unlock()
 
-	// Record the cascade order BEFORE the inner ranker touches anything.
-	cascadeOrder := make([]string, len(candidates))
-	for i, c := range candidates {
-		if c.Campaign != nil {
-			cascadeOrder[i] = c.Campaign.ID
-		}
-	}
-
-	// Run the inner ML ranker to compute the shadow ordering.
-	// NOTE: We use a COPY of the slice so the inner ranker cannot mutate
-	// the original. The cascade sees the unmodified original back.
-	shadowCandidates := make([]*cascade.Candidate, len(candidates))
-	copy(shadowCandidates, candidates)
-
-	shadowRanked := sr.inner.Rank(shadowCandidates)
-	innerResult := sr.inner.LastResult()
-
-	// Compute shadow order (campaign IDs in the ML-ranked order).
-	shadowOrder := make([]string, len(shadowRanked))
-	for i, c := range shadowRanked {
-		if c.Campaign != nil {
-			shadowOrder[i] = c.Campaign.ID
-		}
-	}
-
-	// Determine served campaign (first in cascade order).
-	servedCampaignID := ""
-	if len(cascadeOrder) > 0 {
-		servedCampaignID = cascadeOrder[0]
-	}
-
-	// Determine shadow top choice.
-	shadowTopID := ""
-	if len(shadowOrder) > 0 {
-		shadowTopID = shadowOrder[0]
-	}
-
-	rec := ShadowRecord{
-		DecisionID:          decisionID,
-		ZoneID:              zoneID,
-		ModelVersion:        sr.modelVersion,
-		CascadeOrder:        cascadeOrder,
-		ShadowOrder:         shadowOrder,
-		ShadowScores:        innerResult.Scores,
-		ShadowTopCampaignID: shadowTopID,
-		ServedCampaignID:    servedCampaignID,
-		Agreement:           shadowTopID == servedCampaignID,
-	}
+	shadowRanked, innerResult := rankShadow(sr.inner, candidates)
+	rec := buildShadowRecord(candidates, shadowRanked, innerResult, sr.modelVersion, decisionID, zoneID)
 
 	sr.mu.Lock()
 	sr.lastShadow = rec
@@ -303,8 +268,8 @@ func (sr *ShadowRanker) Rank(candidates []*cascade.Candidate) []*cascade.Candida
 	if sr.logger != nil && !rec.Agreement {
 		sr.logger.Debug("shadow: disagreement between ML and cascade",
 			"decision_id", decisionID,
-			"cascade_top", servedCampaignID,
-			"shadow_top", shadowTopID,
+			"cascade_top", rec.ServedCampaignID,
+			"shadow_top", rec.ShadowTopCampaignID,
 			"model_version", sr.modelVersion,
 		)
 	}
@@ -316,8 +281,76 @@ func (sr *ShadowRanker) Rank(candidates []*cascade.Candidate) []*cascade.Candida
 // LastShadowRecord returns the shadow record from the most recent Rank call.
 // Must be called on the same goroutine immediately after the cascade.Decide
 // that invoked Rank.
+//
+// Test-only / single-goroutine usage: see the FIXED note on the ShadowRanker
+// type doc above. The decision service hot path uses
+// ranker.RequestShadowRanker.Result() instead (per-request, no sharing).
 func (sr *ShadowRanker) LastShadowRecord() ShadowRecord {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
 	return sr.lastShadow
+}
+
+// ---------------------------------------------------------------------------
+// rankShadow / buildShadowRecord — shared scoring + record logic
+// (no shared state; used by both ShadowRanker and RequestShadowRanker).
+// ---------------------------------------------------------------------------
+
+// rankShadow runs the inner ML ranker on a COPY of candidates (so the inner
+// ranker cannot mutate the slice the cascade will keep serving) and returns
+// the shadow-ranked order plus the raw RankResult (for scores/model version).
+//
+// Touches no shared state of its own: ml.rankInternal has no shared state
+// (see MLRanker doc), and the copy is allocated fresh on each call.
+func rankShadow(ml *MLRanker, candidates []*cascade.Candidate) ([]*cascade.Candidate, RankResult) {
+	shadowCandidates := make([]*cascade.Candidate, len(candidates))
+	copy(shadowCandidates, candidates)
+	innerResult := ml.rankInternal(shadowCandidates)
+	return innerResult.Ordered, innerResult
+}
+
+// buildShadowRecord assembles a ShadowRecord from the served (cascade) order,
+// the shadow-ranked order, and the RankResult. Pure function — no shared
+// state, no I/O.
+func buildShadowRecord(
+	cascadeCandidates []*cascade.Candidate,
+	shadowRanked []*cascade.Candidate,
+	innerResult RankResult,
+	modelVersion, decisionID, zoneID string,
+) ShadowRecord {
+	cascadeOrder := make([]string, len(cascadeCandidates))
+	for i, c := range cascadeCandidates {
+		if c.Campaign != nil {
+			cascadeOrder[i] = c.Campaign.ID
+		}
+	}
+
+	shadowOrder := make([]string, len(shadowRanked))
+	for i, c := range shadowRanked {
+		if c.Campaign != nil {
+			shadowOrder[i] = c.Campaign.ID
+		}
+	}
+
+	servedCampaignID := ""
+	if len(cascadeOrder) > 0 {
+		servedCampaignID = cascadeOrder[0]
+	}
+
+	shadowTopID := ""
+	if len(shadowOrder) > 0 {
+		shadowTopID = shadowOrder[0]
+	}
+
+	return ShadowRecord{
+		DecisionID:          decisionID,
+		ZoneID:              zoneID,
+		ModelVersion:        modelVersion,
+		CascadeOrder:        cascadeOrder,
+		ShadowOrder:         shadowOrder,
+		ShadowScores:        innerResult.Scores,
+		ShadowTopCampaignID: shadowTopID,
+		ServedCampaignID:    servedCampaignID,
+		Agreement:           shadowTopID == servedCampaignID,
+	}
 }

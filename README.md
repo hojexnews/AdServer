@@ -764,19 +764,68 @@ comportamento Go **real e importável**, a metade de serving é cross-referencia
 refatorada), e a única correção sobre o gerado (CA3-007 + `>1`) **rastreia a um invariante reproduzido em
 primeira mão** (`switch` sem `default`), não a uma mudança manufaturada.
 
+### ✅ Entregue na Fase 3 — 17ª onda: correção **HOT-1/HOT-3 — RankResult por-request** (G0/E6+E10; sob ADR-0004, sem ADR novo; gates verdes)
+
+Fecha a **única pré-condição de código marcada como bloqueante** no próximo plano
+([docs/plano-desenvolvimento-por-addon.md](docs/plano-desenvolvimento-por-addon.md) §5 **G0**,
+`E6` do `decision-engine-engineer` + `E10` do `ml-optimization-engineer`, gate
+`parity-golden-test-guardian`). Refs: `TX-4`, `DA-3`, `ADR-0003 §G (J3/J4)`, `ADR-0004 §A`, `CA-2`.
+
+- **Defeito (HOT-1/HOT-3):** o ponto de extensão de ML (`internal/ranker`) devolvia o resultado
+  rico de cada request — propensity/model_version/decision_id/zone_id/scores — via **campos
+  compartilhados** (`MLRanker.last`; `BanditRanker.last`/`cfg` via `WithConfig`;
+  `ShadowRanker.shadowDecisionID`/`lastShadow` via `SetRequestContext`) lidos pelo handler
+  **depois** que `cascade.Decide()` retorna. O mutex eliminava o *data race*, mas **não** a
+  mis-atribuição por-request: como uma única instância é compartilhada entre goroutines
+  concorrentes (net/http reusa o handler), o request A podia registrar a atribuição do request B
+  → **OPE/IPS/DR enviesado** e join de shadow envenenado. Inerte com os flags off; travante antes
+  de ligá-los.
+- **Fix (Design A — ranker por-request):** novo `cascade.Engine.DecideWithRanker(req, snap, r)`
+  (mesma `decide()` interna de `Decide()`; `Decide()` intacto ⇒ caminho default byte-idêntico) +
+  `internal/ranker/request.go` com `RequestRanker`/`RequestBanditRanker`/`RequestShadowRanker`
+  construídos **a cada request** no handler, carregando os inputs do request (decisionID/zoneID/
+  BanditConfig) e referenciando só as deps imutáveis-durante-serving (o `*MLRanker` compartilhado:
+  socket/client/budget/model_version; o `ShadowSink`). O resultado é gravado em campo **local**
+  (nunca compartilhado) e lido via `Result()` na mesma goroutine — race-free por construção, sem
+  socket/goroutine/Engine novo (TX-4). **Simplificação habilitada pelo design:** o 2º
+  `cascade.Engine` (`cascadePure`) e o rebuild do engine de tratamento A/B saíram — agora há **um
+  único Engine**, e controle/tratamento/legacy/shadow são só a escolha do `Ranker` passado a
+  `DecideWithRanker`.
+- **Prova (`-race`, `internal/ranker/request_race_test.go`):** 3 testes com 60 goroutines cada
+  provam isolamento por-request nos três caminhos (MLRanker legacy; BanditRanker propensity+epsilon;
+  ShadowRanker decision_id+zone_id); um **canário de regressão**
+  (`TestLegacySharedFieldPattern_ExhibitsMisattribution_Regression`) reproduz a mis-atribuição do
+  padrão antigo em ~92–96% das leituras sob carga — provando que o teste detecta o bug real e o novo
+  design o elimina. As APIs antigas (`Rank`/`LastResult`/`WithConfig`/`SetRequestContext`) ficam **só
+  para os testes single-goroutine/canário**; comentários atualizados (`ranker.go`/`bandit_ranker.go`/
+  `shadow.go`) de "KNOWN LIMITATION" → "FIXED", com aviso de não re-wire via `cascade.WithRanker` no
+  serving (achado LOW convergente dos dois gates — classe "a spec não mente" — corrigido na janela).
+
+**Gates verdes (17ª onda):** revisão adversarial `parity-golden-test-guardian` **PASS** (goldens
+CA-2/3/4/5/6 + shadow harness + dual-run + `TestABParity_*` de controle bit-idêntico/kill-switch/
+revenue-guard, todos verdes sob `-race`; o teste `-race` é genuíno; DA-3/TX-4 intocados; a
+eliminação do `cascadePure` comprovada pelos AB parity tests) + `ml-optimization-engineer` **PASS**
+(propensity/model_version/scores/decision_id/zone_id 100% por-request; matemática de ranking —
+`rankInternal`/`ExploreRank`/`ScoreCandidate` — intocada). Verificação inline de 1ª mão: `go build`,
+`go vet`, `go test -race -count=2` (cascade/ranker/decision), `make parity-golden-short`,
+`go test ./...` (módulo inteiro) e `make verify` (buf TX-1 + no-float TX-2) **todos verdes**.
+**Backlog não-bloqueante** (registrado pelo gate parity): teste E2E `httptest.Server` + N goroutines
+batendo em `/v1/decide` fecharia a prova de isolamento no limite de produção completo (hoje provado
+nos wrappers isolados + argumento arquitetural).
+
 ### ⏭️ Pendente da Fase 3
 
 **K8** (promoção do deep ranking sob **uplift A/B + kill-switch**) segue **gated por
 tráfego real** — o código está pronto desde K1 (flag default-off); a promoção espera o
 número de uplift sobre o GBDT, que depende do cutover de infra da Fase 2.
 
-> **Pré-condição de código de E4/J3 (HOT-1/HOT-3, 15ª onda):** antes de ligar
-> `RANKER_ENABLED`/`AB_ENABLED`/`SHADOW_ENABLED` sob tráfego real, o **RankResult por-request
-> deve fluir de `Decide()`** (retornado, ou ranker por-request) em vez do campo `last`
-> compartilhado lido via `LastResult()` — hoje uma instância compartilhada sob concorrência
-> pode trocar propensity/model_version/scores entre requests e enviesar o OPE que decide a
-> promoção. Inerte enquanto os flags estão off; documentado em `internal/ranker/bandit_ranker.go`,
-> `ranker.go` e `shadow.go`.
+> **HOT-1/HOT-3 — RESOLVIDO na 17ª onda (G0/E6+E10).** O **RankResult por-request** agora flui de
+> `cascade.Engine.DecideWithRanker()` via `RequestRanker`/`RequestBanditRanker`/`RequestShadowRanker`
+> (`internal/ranker/request.go`), em vez dos campos `last`/`cfg`/`SetRequestContext` compartilhados —
+> `RANKER_ENABLED`/`AB_ENABLED`/`SHADOW_ENABLED` já podem ser ligados sob tráfego real concorrente sem
+> enviesar o OPE. Provado por `internal/ranker/request_race_test.go` (`-race`: isolamento por-request
+> nos 3 caminhos + canário de regressão do padrão antigo). Isso **destrava o veto de código do gate
+> de paridade** (E14) sobre a promoção K8; o restante do gate K8 segue **só por tráfego real**.
 
 A **habilitação de AEV/BND** segue **gated pela spec de produto** (`scale`/classificação/supply — CHECK
 estrutural impede habilitar sem `scale`). **Pré-condições de go-live** restantes são

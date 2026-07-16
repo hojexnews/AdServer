@@ -4,25 +4,27 @@
 //
 //  1. Override   — campaigns with TierOverride; wins immediately.
 //  2. Contract   — campaigns with TierContract, sorted by pacing deficit
-//                  (highest deficit first); first eligible wins.
+//     (highest deficit first); first eligible wins.
 //  3. Remnant    — campaigns with TierRemnant, sorted by eCPM descending
-//                  (same asset_code / tenant — DA-10); first eligible wins.
+//     (same asset_code / tenant — DA-10); first eligible wins.
 //  4. Blank      — no eligible candidate in any tier; a blank impression is
-//                  registered as a forensic deficit metric (CA-2).
+//     registered as a forensic deficit metric (CA-2).
 //
 // The N:N campaign↔zone relationship (DA-2) is resolved per request by
 // reading the pre-computed ZoneCampaigns index from the Snapshot.
 //
 // Re-ranker extension point (TX-4):
-//   Each stratum's candidate slice is passed through a Ranker before
-//   selection.  In I0 the DefaultRanker preserves the deterministic order.
-//   In Fase 2 the ML ranker plugs in here behind a timeout + fail-open
-//   (the cascade always falls back to DefaultRanker on ML timeout/error).
+//
+//	Each stratum's candidate slice is passed through a Ranker before
+//	selection.  In I0 the DefaultRanker preserves the deterministic order.
+//	In Fase 2 the ML ranker plugs in here behind a timeout + fail-open
+//	(the cascade always falls back to DefaultRanker on ML timeout/error).
 //
 // Frequency-capping extension point (I2):
-//   The Capper interface is called per candidate before eligibility is
-//   confirmed.  The NoOpCapper (I0) always allows; the Redis-backed
-//   implementation arrives in I2.
+//
+//	The Capper interface is called per candidate before eligibility is
+//	confirmed.  The NoOpCapper (I0) always allows; the Redis-backed
+//	implementation arrives in I2.
 //
 // The page never breaks: any internal error in candidate evaluation is
 // absorbed and the affected candidate is simply skipped.  If all candidates
@@ -179,9 +181,9 @@ func WithCapper(c Capper) Option { return func(e *Engine) { e.capper = c } }
 
 // Request carries the per-ad-call inputs.
 type Request struct {
-	ZoneID      string
-	TenantID    string
-	Rules       *rules.Context
+	ZoneID   string
+	TenantID string
+	Rules    *rules.Context
 	// UserID is the hashed+salted stable user identifier for capping.
 	// Empty string = no stable identifier (all capped campaigns are skipped).
 	UserID      string
@@ -198,7 +200,43 @@ type Request struct {
 // or its TenantID does not match req.TenantID, the request is fail-closed to
 // BLANK.  This prevents tenant isolation violations even if req.TenantID is
 // somehow misset by the caller.
+//
+// Decide uses the Engine's configured ranker (e.ranker, set at construction
+// via WithRanker). See DecideWithRanker for the per-request extension point
+// used to fix HOT-1/HOT-3 (per-request RankResult attribution).
 func (e *Engine) Decide(req Request, snap *snapshot.Snapshot) Result {
+	return e.decide(req, snap, e.ranker)
+}
+
+// DecideWithRanker runs the cascade exactly like Decide, but uses the given
+// Ranker for THIS CALL ONLY instead of the Engine's configured e.ranker.
+//
+// Rationale (gate E6/E10, HOT-1/HOT-3): a single Engine instance is shared
+// across concurrent HTTP requests (net/http reuses the handler). If the
+// Engine's ranker itself carries per-request mutable state (e.g. an ML
+// ranker's last score, a bandit's exploration config, a shadow ranker's
+// decision/zone context), that state is subject to mis-attribution between
+// concurrent requests — request A can observe request B's RankResult.
+//
+// The fix: the decision handler constructs a small, per-request Ranker value
+// (see package ranker: RequestRanker / RequestBanditRanker /
+// RequestShadowRanker) that holds ONLY this request's inputs (decisionID,
+// zoneID, bandit config) plus references to the shared IMMUTABLE/thread-safe
+// dependencies (the sidecar ScoreClient, the ShadowSink). It passes that
+// value here, and reads the resulting RankResult/ExploreResult/ShadowRecord
+// from its OWN local variable after DecideWithRanker returns — never from a
+// field shared with other goroutines.
+//
+// DA-3 / TX-4 are unaffected: r.Rank is invoked exactly where e.ranker.Rank
+// would have been invoked (once per attempted stratum); stratum purity and
+// the fail-open contract are enforced identically regardless of which Ranker
+// value is passed.
+func (e *Engine) DecideWithRanker(req Request, snap *snapshot.Snapshot, r Ranker) Result {
+	return e.decide(req, snap, r)
+}
+
+// decide is the shared implementation behind Decide and DecideWithRanker.
+func (e *Engine) decide(req Request, snap *snapshot.Snapshot, r Ranker) Result {
 	// Fail-closed: the zone MUST exist in the snapshot and its TenantID
 	// must match req.TenantID (which was derived server-side by the handler).
 	zone, zoneOK := snap.Zones[req.ZoneID]
@@ -250,14 +288,14 @@ func (e *Engine) Decide(req Request, snap *snapshot.Snapshot) Result {
 	}
 
 	// Evaluate tiers in strict order.
-	if r, ok := e.tryStratum(overrides, sortOverrides, req); ok {
-		return r
+	if res, ok := e.tryStratum(overrides, sortOverrides, req, r); ok {
+		return res
 	}
-	if r, ok := e.tryStratum(contracts, sortContracts, req); ok {
-		return r
+	if res, ok := e.tryStratum(contracts, sortContracts, req, r); ok {
+		return res
 	}
-	if r, ok := e.tryStratum(remnants, sortRemnants, req); ok {
-		return r
+	if res, ok := e.tryStratum(remnants, sortRemnants, req, r); ok {
+		return res
 	}
 
 	return Blank()
@@ -266,10 +304,14 @@ func (e *Engine) Decide(req Request, snap *snapshot.Snapshot) Result {
 // tryStratum sorts, ranks, and selects the first capper-allowed candidate
 // from a stratum.  Returns (result, true) on success, (_, false) if the
 // stratum produced no eligible ad.
+//
+// r is the effective Ranker for this Decide/DecideWithRanker call (see
+// DecideWithRanker doc for the per-request rationale).
 func (e *Engine) tryStratum(
 	candidates []*Candidate,
 	sorter func([]*Candidate),
 	req Request,
+	r Ranker,
 ) (Result, bool) {
 	if len(candidates) == 0 {
 		return Result{}, false
@@ -279,7 +321,7 @@ func (e *Engine) tryStratum(
 	sorter(candidates)
 
 	// Apply the re-ranker (TX-4 extension point).  DefaultRanker is a no-op.
-	candidates = e.ranker.Rank(candidates)
+	candidates = r.Rank(candidates)
 
 	// Build the proto Candidate list for the decision log BEFORE selection.
 	protoCandidates := makeProtoCandidates(candidates)

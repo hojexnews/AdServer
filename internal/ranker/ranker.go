@@ -14,29 +14,29 @@
 //  3. Ranking objective per stratum (DA-3 / revenue vs. delivery):
 //
 //     REMNANT — revenue-maximising leilão:
-//       Sort key = ScoreCandidate(pCTR, ECPMMinorUnits) = eCPM in minor-units.
-//       Rationale: Remnant is an open auction; the economic objective is to
-//       maximise yield.  eCPM = pCTR × bid correctly captures expected
-//       revenue per impression.  Ordering by pCTR alone is an economic error:
-//       a candidate with pCTR=0.05, bid=50 (eCPM≈3) would beat one with
-//       pCTR=0.04, bid=10000 (eCPM≈400), destroying ~$4 of yield.
+//     Sort key = ScoreCandidate(pCTR, ECPMMinorUnits) = eCPM in minor-units.
+//     Rationale: Remnant is an open auction; the economic objective is to
+//     maximise yield.  eCPM = pCTR × bid correctly captures expected
+//     revenue per impression.  Ordering by pCTR alone is an economic error:
+//     a candidate with pCTR=0.05, bid=50 (eCPM≈3) would beat one with
+//     pCTR=0.04, bid=10000 (eCPM≈400), destroying ~$4 of yield.
 //
 //     CONTRACT — delivery-driven (pacing):
-//       Sort key = pCTR (float32 from sidecar).
-//       Rationale: Contract campaigns have a committed delivery goal (pacing,
-//       DA-4).  The cascade has already ordered them by pacing deficit
-//       (sortContracts).  Within that priority, re-ranking by pCTR maximises
-//       CTR performance of the delivered impressions without violating the
-//       delivery commitment.  Revenue is not the objective here; the bid is
-//       pre-negotiated.
+//     Sort key = pCTR (float32 from sidecar).
+//     Rationale: Contract campaigns have a committed delivery goal (pacing,
+//     DA-4).  The cascade has already ordered them by pacing deficit
+//     (sortContracts).  Within that priority, re-ranking by pCTR maximises
+//     CTR performance of the delivered impressions without violating the
+//     delivery commitment.  Revenue is not the objective here; the bid is
+//     pre-negotiated.
 //
 //     OVERRIDE — priority-driven (guaranteed placement):
-//       Sort key = pCTR (float32 from sidecar).
-//       Rationale: Override campaigns are guaranteed placements (typically
-//       sponsorships or takeovers).  Delivery priority dominates; the cascade
-//       has already sorted by campaign Priority.  Re-ranking by pCTR within
-//       the same priority level optimises CTR without affecting the
-//       contractual delivery guarantee.
+//     Sort key = pCTR (float32 from sidecar).
+//     Rationale: Override campaigns are guaranteed placements (typically
+//     sponsorships or takeovers).  Delivery priority dominates; the cascade
+//     has already sorted by campaign Priority.  Re-ranking by pCTR within
+//     the same priority level optimises CTR without affecting the
+//     contractual delivery guarantee.
 //
 //  4. Hard deadline (TX-4): if the total scoring budget is exceeded, MLRanker
 //     returns the original (deterministic cascade) order unchanged — fail-open.
@@ -51,10 +51,11 @@
 //     Decision.ml_fail_open = true (OPE must exclude these decisions).
 //
 // State tracking:
-//   MLRankerResult carries the per-Rank-call result: the ordered candidates,
-//   whether fail-open occurred, the model version used, and per-candidate scores.
-//   The decision handler reads this to fill Decision.candidates[].score,
-//   Decision.ml_fail_open, Decision.model_version, and Decision.exploration_policy.
+//
+//	MLRankerResult carries the per-Rank-call result: the ordered candidates,
+//	whether fail-open occurred, the model version used, and per-candidate scores.
+//	The decision handler reads this to fill Decision.candidates[].score,
+//	Decision.ml_fail_open, Decision.model_version, and Decision.exploration_policy.
 //
 // The J1 dummy model (sidecar in stub mode) returns score=0 for all candidates.
 // With identical scores, sort.SliceStable preserves the original order — so the
@@ -118,18 +119,20 @@ type MLRanker struct {
 	budget       time.Duration
 	logger       *slog.Logger
 
-	mu   sync.Mutex
+	mu sync.Mutex
 	// last is the most recent RankResult from the last Rank call.
-	// Protected by mu: Rank (writer) and LastResult (reader) may be called
-	// from concurrent goroutines when the same MLRanker instance is shared
-	// across HTTP request handlers (RANKER_ENABLED=true, Fase 2+).
+	// Protected by mu: Rank (writer) and LastResult (reader).
 	//
-	// KNOWN LIMITATION (HOT-1, gate E4): the mutex prevents a DATA race but not
-	// per-request mis-attribution — the handler reads LastResult() AFTER Decide()
-	// returns, so a concurrent Rank can overwrite `last` in between (A logs B's
-	// scores/model_version → biased OPE). Inert while RANKER_ENABLED is off; the
-	// per-request RankResult must flow from Decide() before E4. See the authoritative
-	// note in bandit_ranker.go and README "Pendente da Fase 3".
+	// FIXED (gate E6/E10, was HOT-1): the mutex prevents a DATA race but not
+	// per-request mis-attribution — a concurrent Rank could overwrite `last`
+	// between another request's Decide() returning and its LastResult() read
+	// (A would log B's scores/model_version → biased OPE). The production hot
+	// path no longer uses this shared field: the decision handler wraps the
+	// shared *MLRanker in a per-request RequestRanker (request.go) that calls
+	// rankInternal directly and stores the RankResult on its own local field,
+	// race-free by construction. Rank/LastResult are retained ONLY for
+	// single-goroutine legacy/regression tests — do NOT wire a bare MLRanker
+	// into a shared Engine's serving path via cascade.WithRanker.
 	last RankResult
 }
 
@@ -163,8 +166,10 @@ func (r *MLRanker) WithModelVersion(v string) *MLRanker {
 // It re-ranks candidates within the given stratum using ML scores from the
 // sidecar. On any error or timeout, it returns the original slice (fail-open).
 //
-// The caller (decision handler) must call LastResult() immediately after Rank
-// to obtain the full RankResult metadata (scores, fail-open flag, model version).
+// Rank writes its RankResult to the shared `last` field, read via LastResult().
+// This shared-field path is single-goroutine only (legacy/regression tests):
+// the production hot path uses the per-request RequestRanker (request.go),
+// which is race-free by construction (gate E6/E10, was HOT-1).
 //
 // IMPORTANT: Rank does not have a context parameter because cascade.Ranker
 // does not pass one (the interface is minimal by design). The budget is enforced
@@ -179,7 +184,10 @@ func (r *MLRanker) Rank(candidates []*cascade.Candidate) []*cascade.Candidate {
 }
 
 // LastResult returns the RankResult from the most recent Rank call.
-// Safe for concurrent callers: the result is copied under the mutex.
+// Copied under the mutex, so it is free of DATA races — but NOT free of
+// per-request mis-attribution under concurrency (that is precisely why the
+// production path uses RequestRanker; see the `last` field note above).
+// Legacy / single-goroutine test use only.
 func (r *MLRanker) LastResult() RankResult {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -254,8 +262,8 @@ func (r *MLRanker) rankInternal(candidates []*cascade.Candidate) RankResult {
 	//   - Override/Contract: all pCTR=0 → stable sort is a no-op.
 	// In both cases the J1 golden tests remain green.
 	type indexed struct {
-		idx      int
-		sortKey  int64 // eCPM minor-units for Remnant; int64(pCTR*1e9) for others
+		idx     int
+		sortKey int64 // eCPM minor-units for Remnant; int64(pCTR*1e9) for others
 	}
 	order := make([]indexed, len(candidates))
 	for i, s := range scores {
