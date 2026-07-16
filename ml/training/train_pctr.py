@@ -29,13 +29,17 @@ ANTI-SKEW:
   - A funcao de featurizacao e SEMPRE ml/features/python/featurize.py.
   - NUNCA reimplementar featurizacao aqui.
 
-SIDECAR (J1) — contrato de artefato ONNX:
+SIDECAR (G0/E11) — contrato de artefato ONNX:
   - Caminho no MLflow: artifacts/pctr_model.onnx
   - Input name: "features"
   - Input dtype: float32
   - Input shape: [N, 23]  (N = batch size; N=1 no hot path)
-  - Output name: "probabilities"  (campo "probabilities" do ZipMap, index 1 = P(click=1))
-  - Alternativa de output raw: "output_probability" se o grafo nao tiver ZipMap
+  - Output name: "probabilities" — TENSOR PLANO float32 [N, 2] (SEM ZipMap:
+    onnxmltools.convert_lightgbm(..., zipmap=False)). Coluna 1 = P(click=1).
+    Motivo: seq(map(int64, tensor(float))) (ZipMap) e hostil a runtimes de
+    inferencia embarcados que trabalham com tensores planos (ex.: o Go
+    services/ranker-sidecar/internal/onnx via yalue/onnxruntime_go). O tensor
+    plano evita parsing de mapa/sequencia no hot path (TX-4).
   - feature_spec_version: "1.0.0"
 
 USO:
@@ -365,16 +369,26 @@ def export_onnx(booster: lgb.Booster, output_path: Path) -> onnx.ModelProto:
     """
     Converte o Booster LightGBM para ONNX via onnxmltools.
 
-    CONTRATO DE ARTEFATO (para o sidecar J1 / services/ranker-sidecar):
+    CONTRATO DE ARTEFATO (para o sidecar services/ranker-sidecar):
       - Input name:  "features"
       - Input dtype: float32
       - Input shape: [N, 23]  (N = 1 no hot path, batch >= 1 em batch scoring)
       - Output: o modelo ONNX de classificacao binaria LightGBM exporta dois tensores:
-          * "label"        — int64[N] — classe predita (0 ou 1)
-          * "probabilities" — Mapa ou Sequencia — probabilidades por classe
-        O sidecar deve extrair P(click=1) de "probabilities[1]".
-        Ver services/ranker-sidecar/README.md para o codigo de extração exato.
+          * "label"         — int64[N] — classe predita (0 ou 1)
+          * "probabilities" — TENSOR PLANO float32 [N, 2] — probabilidades por classe
+            (zipmap=False: SEM ZipMap/seq(map(...)). Coluna 1 = P(click=1)).
+        O sidecar deve extrair P(click=1) de "probabilities[:, 1]".
       - feature_spec_version: "1.0.0" — gravado como metadata do artefato no MLflow.
+
+    Por que zipmap=False (G0/E11):
+      onnxmltools.convert_lightgbm por padrao produz um output "probabilities"
+      do tipo seq(map(int64, tensor(float))) (operador ZipMap). Esse tipo exige
+      um runtime que suporte mapas/sequencias no lado do consumidor. O runtime
+      de serving embarcado do hot path (github.com/yalue/onnxruntime_go, Go,
+      CGO-free por default) so manipula tensores planos de forma direta.
+      zipmap=False remove o ZipMap do grafo e expoe "probabilities" como um
+      tensor denso [N, 2] float32 — o mesmo contrato para treino/validacao
+      (este modulo) e para o sidecar Go (services/ranker-sidecar/internal/onnx).
 
     Retorna o ModelProto ONNX.
     """
@@ -392,11 +406,12 @@ def export_onnx(booster: lgb.Booster, output_path: Path) -> onnx.ModelProto:
         _supported = min(int(_onnx_pkg.__version__.split(".")[0]) + 13, 17)
     target_opset = min(_supported, 15)  # 15 e amplamente suportado
 
-    print(f"[export_onnx] Convertendo LightGBM -> ONNX (input: float32[N,{_N_FEATURES}], opset={target_opset})")
+    print(f"[export_onnx] Convertendo LightGBM -> ONNX (input: float32[N,{_N_FEATURES}], opset={target_opset}, zipmap=False)")
     onnx_model = onnxmltools.convert_lightgbm(
         booster,
         initial_types=initial_type,
         target_opset=target_opset,
+        zipmap=False,
     )
 
     onnx.save(onnx_model, str(output_path))
@@ -448,8 +463,11 @@ def validate_onnx(
     inputs = {sess.get_inputs()[0].name: X_check}
     outputs = sess.run(None, inputs)
 
-    # outputs[1] e "probabilities" — pode ser lista de dicts ou array dependendo do opset
-    # Extraimos P(click=1) de forma robusta
+    # outputs[1] e "probabilities". Desde G0/E11 o grafo e exportado com
+    # zipmap=False (ver export_onnx): tensor plano [N,2] float32, coluna 1 =
+    # P(click=1). O parsing abaixo permanece defensivo (aceita tambem a forma
+    # antiga em lista-de-dicts) para artefatos legados exportados antes da
+    # mudanca, mas o caminho esperado em runs novos e sempre "hasattr(shape)".
     onnx_probs_raw = outputs[1]
     if isinstance(onnx_probs_raw, list):
         # Lista de dicts {0: p0, 1: p1}

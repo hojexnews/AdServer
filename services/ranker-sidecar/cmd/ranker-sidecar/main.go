@@ -9,14 +9,15 @@
 //	RANKER_SOCKET_PATH   Path to the Unix socket file.
 //	                     Default: /tmp/ranker.sock
 //
-//	RANKER_MODEL_PATH    Path to the ONNX model file (for J2+ with OnnxInferencer).
-//	                     In J1 (StubInferencer), this variable is ignored; the sidecar
-//	                     runs without a model file and returns score=0 for all inputs.
+//	RANKER_MODEL_PATH    Path to the compiled .onnx model file (G0/E11 OnnxInferencer).
+//	                     If empty, or the file does not exist, or the sidecar was built
+//	                     without the `onnx` tag, the sidecar falls back to StubInferencer
+//	                     and returns score=0 for all inputs (fail-safe — see below).
 //	                     Default: "" (stub mode)
 //
 //	RANKER_MODEL_VERSION Version tag to embed in score responses and log entries.
 //	                     Used by the decision handler to populate Decision.model_version.
-//	                     In J1 stub mode, use "stub-j1" (or leave empty for "stub-j1").
+//	                     In stub mode, use "stub-j1" (or leave empty for "stub-j1").
 //	                     Default: "stub-j1"
 //
 //	DEEP_ENABLED         K1/Fase 3 gate: enables the deep ranker Triton/GPU backend.
@@ -36,26 +37,31 @@
 //	                     the Triton server is unreachable — the cascade pure order
 //	                     is preserved. Never a blank impression for ML failure.
 //
-// # J2 ONNX Integration Point
+// # ONNX Runtime nativo (G0/E11)
 //
-// To swap in the real ONNX model (J2):
-//  1. Ensure libonnxruntime.so.1 is installed (e.g., via apt or bundled in the image).
-//  2. Set RANKER_MODEL_PATH to the path of the compiled .onnx artefact downloaded
-//     from the MLflow registry (ml/registry/).
-//  3. Replace the StubInferencer instantiation below with OnnxInferencer:
+// The sidecar now instantiates onnx.New(modelPath, modelVersion) whenever
+// RANKER_MODEL_PATH is set and the file exists (see the Inferencer selection
+// block below). onnx.New is implemented in two variants, selected by Go
+// build tag (ADR-0002 §C — hermetic default build):
 //
-//	     // Before (J1 stub):
-//	     inf := stub.NewStub(modelVersion)
+//   - Default build (no tags): services/ranker-sidecar/internal/onnx/disabled.go
+//     (`//go:build !onnx`). New always returns onnx.ErrNotCompiled. No CGO,
+//     no libonnxruntime dependency — `go build ./...` stays hermetic.
+//   - `-tags onnx` build: services/ranker-sidecar/internal/onnx/onnx.go
+//     (`//go:build onnx`). New loads the compiled GBDT .onnx artefact via
+//     github.com/yalue/onnxruntime_go (CGO, dlopen of libonnxruntime.so.*;
+//     see ONNXRUNTIME_SHARED_LIBRARY_PATH below).
 //
-//	     // After (J2 ONNX):
-//	     // import "github.com/hojex/adserver/services/ranker-sidecar/internal/onnx"
-//	     // inf, err := onnx.New(modelPath, modelVersion)
-//	     // if err != nil { logger.Error("onnx load failed", "err", err); os.Exit(1) }
-//	     // defer inf.Close()
+// Either way, an error from onnx.New (including ErrNotCompiled) is logged
+// and the sidecar falls back to stub.NewStub — the sidecar never refuses to
+// start, and the cascade is never starved of a fail-open score=0 backend
+// (DA-3). The Inferencer interface (stub.Inferencer) is implemented by both
+// StubInferencer and OnnxInferencer — no other code changes needed.
 //
-//  4. The Inferencer interface (stub.Inferencer) is implemented by both StubInferencer
-//     and OnnxInferencer — no other code changes needed.
-//  5. Run go test ./... to verify parity and server tests still pass.
+//	ONNXRUNTIME_SHARED_LIBRARY_PATH  Path to libonnxruntime.so.* for dlopen.
+//	                                 Only read by the `-tags onnx` build.
+//	                                 Default: "" (searches "onnxruntime.so"
+//	                                 on the default dynamic linker path).
 //
 // # K1/Fase 3 Deep Ranker Integration Point (DEEP_ENABLED=false by default)
 //
@@ -72,14 +78,15 @@
 //  5. The deep model replaces the GBDT BEHIND THE SAME extension point (ADR-0004 §A).
 //     No new cascade path is created.
 //
-// # Hot-reload (J2+)
+// # Hot-reload (future work)
 //
-// On SIGHUP, the sidecar will:
+// On SIGHUP, the sidecar could:
 //  1. Load a new OnnxInferencer from the updated RANKER_MODEL_PATH.
 //  2. Close the old inferencer.
 //  3. Update the model version in the server.
-//  This allows model version rollout without socket rebind or decision service restart.
-//  Not implemented in J1 (stub has no state to reload).
+//     This would allow model version rollout without socket rebind or decision
+//     service restart. NOT implemented yet (neither stub nor onnx have state to
+//     reload today) — the sidecar process is restarted to pick up a new model.
 //
 // # Wire protocol
 //
@@ -88,11 +95,13 @@
 package main
 
 import (
+	"errors"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
 
+	"github.com/hojex/adserver/services/ranker-sidecar/internal/onnx"
 	"github.com/hojex/adserver/services/ranker-sidecar/internal/stub"
 )
 
@@ -122,9 +131,12 @@ func main() {
 	//     The deep replaces GBDT BEHIND THE SAME extension point (ADR-0004 §A).
 	//     No new cascade path. Budget TX-4 (5-8 ms p99) is NOT expanded.
 	//
-	//   J1: RANKER_MODEL_PATH is empty or the file does not exist → StubInferencer.
-	//   J2: RANKER_MODEL_PATH points to a valid .onnx file → OnnxInferencer.
-	//       (See comment block in package doc above for swap instructions.)
+	//   RANKER_MODEL_PATH empty or file does not exist → StubInferencer.
+	//   RANKER_MODEL_PATH points to a valid .onnx file → onnx.New is attempted;
+	//     on ANY error (including onnx.ErrNotCompiled in the default,
+	//     `-tags onnx`-less build) the sidecar logs a warning and falls back
+	//     to StubInferencer. This is a fail-safe path, not fail-open: it
+	//     happens once at startup, never mid-request.
 	// ---------------------------------------------------------------------------
 	if deepEnabled {
 		logger.Info("ranker-sidecar: DEEP_ENABLED=true (K8 gate open)",
@@ -142,13 +154,32 @@ func main() {
 	var inf stub.Inferencer
 	if modelPath != "" {
 		if _, err := os.Stat(modelPath); err == nil {
-			// Model file present: in J2, instantiate OnnxInferencer here.
-			// For J1, we still use the stub (ONNX runtime not available).
-			logger.Warn("ranker-sidecar: RANKER_MODEL_PATH set but ONNX runtime not compiled in — "+
-				"using StubInferencer. Set build tag 'onnx' and provide libonnxruntime.so for J2.",
-				"model_path", modelPath,
-				"model_version", modelVersion)
-			inf = stub.NewStub(modelVersion)
+			// Model file present: attempt the real OnnxInferencer (G0/E11).
+			// onnx.New's behaviour depends on the build tag:
+			//   - `-tags onnx`:  loads the model via onnxruntime (CGO, dlopen).
+			//   - default build: always returns onnx.ErrNotCompiled (CGO-free).
+			// Either way, ANY error here is a fail-SAFE (not fail-open) startup
+			// fallback to StubInferencer — the sidecar always starts serving.
+			onnxInf, onnxErr := onnx.New(modelPath, modelVersion)
+			if onnxErr != nil {
+				if errors.Is(onnxErr, onnx.ErrNotCompiled) {
+					logger.Warn("ranker-sidecar: RANKER_MODEL_PATH set but ONNX runtime not compiled in — "+
+						"using StubInferencer. Build with -tags onnx and provide libonnxruntime.so to enable it.",
+						"model_path", modelPath,
+						"model_version", modelVersion)
+				} else {
+					logger.Warn("ranker-sidecar: onnx.New failed to load model — using StubInferencer",
+						"model_path", modelPath,
+						"model_version", modelVersion,
+						"err", onnxErr)
+				}
+				inf = stub.NewStub(modelVersion)
+			} else {
+				logger.Info("ranker-sidecar: OnnxInferencer loaded",
+					"model_path", modelPath,
+					"model_version", modelVersion)
+				inf = onnxInf
+			}
 		} else {
 			logger.Warn("ranker-sidecar: RANKER_MODEL_PATH set but file not found — using StubInferencer",
 				"model_path", modelPath,
@@ -156,7 +187,7 @@ func main() {
 			inf = stub.NewStub(modelVersion)
 		}
 	} else {
-		logger.Info("ranker-sidecar: RANKER_MODEL_PATH not set — running in stub mode (J1)",
+		logger.Info("ranker-sidecar: RANKER_MODEL_PATH not set — running in stub mode",
 			"model_version", modelVersion)
 		inf = stub.NewStub(modelVersion)
 	}

@@ -9,6 +9,7 @@ require (
 	github.com/redis/go-redis/v9 v9.20.0
 	github.com/twmb/franz-go v1.21.2
 	github.com/twmb/murmur3 v1.1.8
+	github.com/yalue/onnxruntime_go v1.26.0
 	google.golang.org/protobuf v1.36.11
 )
 

@@ -21,11 +21,12 @@
 // hot path simple and avoids request pipelining issues. The client (ScoreClient
 // in internal/ranker/ipc.go) dials a fresh connection per scoring call.
 //
-// Hot-reload (J2 note):
-//   When the sidecar receives SIGHUP, it calls Inferencer.Close() on the old
-//   model and loads a new OnnxInferencer from the updated RANKER_MODEL_PATH.
-//   The modelVersion field in the response is updated automatically.
-//   The server loop continues without downtime (no socket rebind needed).
+// Hot-reload (future work, not implemented yet):
+//
+//	A SIGHUP handler could call Inferencer.Close() on the old model and load
+//	a new OnnxInferencer from an updated RANKER_MODEL_PATH, updating
+//	modelVersion without a socket rebind. Today the sidecar process must be
+//	restarted to pick up a new model (see cmd/ranker-sidecar/main.go).
 package stub
 
 import (
@@ -46,7 +47,8 @@ type Server struct {
 
 // NewServer creates a Server.
 //   - socketPath: filesystem path for the Unix domain socket (created on Serve).
-//   - inferencer: the inference backend (StubInferencer in J1, OnnxInferencer in J2).
+//   - inferencer: the inference backend (StubInferencer or OnnxInferencer,
+//     selected by cmd/ranker-sidecar/main.go — see internal/onnx).
 //   - logger: may be nil.
 func NewServer(socketPath string, inferencer Inferencer, logger *slog.Logger) *Server {
 	return &Server{

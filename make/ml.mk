@@ -40,8 +40,10 @@ ml-features-test:
 	PYTHONPATH=. $(PYTEST_ML) ml/features/ -v
 
 ## ml-training-test: pipeline de treino com dados sinteticos
+## (test_training_parity.py: paridade de featurizacao; test_onnx_export.py:
+##  contrato de artefato ONNX zipmap=False p/ o sidecar Go — G0/E11)
 ml-training-test:
-	PYTHONPATH=. $(PYTEST_ML) ml/training/test_training_parity.py -v
+	PYTHONPATH=. $(PYTEST_ML) ml/training/ -v
 
 ## ml-calibration-test: calibracao isotonica (sem dados reais — usa sinteticos).
 ## exit 5 = pytest "no tests collected" -> OK; qualquer outro exit != 0 = falha real -> propaga.
