@@ -13,14 +13,21 @@ plugins:
   # Saida na raiz do repo (../gen/go a partir de proto/) para que o
   # import path github.com/hojex/adserver/gen/go/... resolva corretamente
   # com o go.mod na raiz. O codigo gerado e versionado (Fase 1, ADR-0002 §C).
-  - remote: buf.build/protocolbuffers/go
+  #
+  # Versao do plugin remoto fixada (pin): o staleness gate `proto-gen-check`
+  # (TX-1) so deve falhar em drift real de schema, nunca por bump cosmetico
+  # de um plugin `latest` flutuante (ex.: mudanca so no header "@generated
+  # by"). Atualize o pin deliberadamente e regenere quando subir de versao.
+  - remote: buf.build/protocolbuffers/go:v1.36.11
     out: ../gen/go
     opt:
       - paths=source_relative
 
   # ---- TypeScript / ECMAScript (front Next.js) ----
   # Saida na raiz do repo (../gen/ts a partir de proto/).
-  - remote: buf.build/bufbuild/es
+  #
+  # Versao fixada pelo mesmo motivo do plugin Go acima (staleness gate TX-1).
+  - remote: buf.build/bufbuild/es:v2.12.0
     out: ../gen/ts
     opt:
       - target=ts
