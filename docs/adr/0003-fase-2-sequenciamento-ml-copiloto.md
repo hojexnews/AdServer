@@ -273,7 +273,16 @@ Go compartilhados). O que já existe está marcado *(existe — Fase 1)*.
 │   ├── collector/              # (existe)
 │   ├── ranker-sidecar/         # NOVO — sidecar de serving CPU (Treelite/ONNX) por
 │   │   └── ...                 # Unix socket; SEM Triton/GPU. Hot-reload de versão.
-│   │                           # Linguagem do runtime do modelo (não-Go); fora do go.mod.
+│   │                           # Runtime do modelo isolado num processo sidecar co-
+│   │                           # localizado (ADR-0002 §C: hot path Go CGO-free).
+│   │                           # Reconciliação G0/E11: a OPÇÃO ONNX Runtime usa um
+│   │                           # binding Go-nativo (github.com/yalue/onnxruntime_go)
+│   │                           # que ENTRA no go.mod, porém SÓ sob `//go:build onnx`
+│   │                           # — o build default (`go build ./...`) segue CGO-free
+│   │                           # e não linka a lib. O invariante real ("runtime do
+│   │                           # modelo isolado; hot path Go hermético") é preservado;
+│   │                           # a antiga nota "fora do go.mod" valia p/ a opção
+│   │                           # Treelite/lib-nativa, não p/ o binding Go tagueado.
 │   └── copilot/                # NOVO — gateway Python LangGraph: grafo + HITL +
 │       └── ...                 # ferramentas tipadas server-side + RAG pgvector (RLS) +
 │                               # Langfuse. ATRÁS do BFF; nunca exposto ao cliente.

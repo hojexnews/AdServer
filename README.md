@@ -864,6 +864,59 @@ testado") — ambos corrigidos em [docs/plano-desenvolvimento-por-addon.md](docs
 > **platform E8** (mandato item 4), **frontend E9+E10** (fail-closed + stack §2.5) e **copiloto E12**
 > (higiene de layout). Triagem read-only confirmou os 5 como pendências genuínas (0 falsos-positivos).
 
+### ✅ Entregue na Fase 3 — 19ª onda: **ONNX Runtime nativo no ranker-sidecar** (G0/E11; sob ADR-0003 §B, sem ADR novo; gates verdes)
+
+Fecha o **3º item de código de G0** (ml E11), o próximo após E5 (18ª onda). Substitui o `StubInferencer`
+sempre-0.0 por um `OnnxInferencer` real, **sob build tag**, mantendo o build default **hermético**
+(ADR-0002 §C). Dono `ml-optimization-engineer`; gates `tech-lead-architect` + `parity-golden-test-guardian`.
+Refs: `ADR-0003 §B` (sidecar Treelite/ONNX via UDS, hot path Go CGO-free), `TX-4`, `DA-3` (fail-open).
+
+- **Defeito (E11):** o sidecar ([main.go](services/ranker-sidecar/cmd/ranker-sidecar/main.go)) SEMPRE
+  instanciava `stub.NewStub` (`Score`→0.0) — mesmo com `RANKER_MODEL_PATH` setado logava "ONNX runtime not
+  compiled in". Não havia `OnnxInferencer`, nem build tag, nem dep de runtime → o re-ranker de yield era
+  inerte (0.0 preserva a ordem pura da cascata, mas nunca havia inferência real).
+- **Fix (build-tag, hermético por construção):** novo pacote
+  [services/ranker-sidecar/internal/onnx/](services/ranker-sidecar/internal/onnx/): `onnx.go` (`//go:build
+  onnx`) implementa `stub.Inferencer` via `github.com/yalue/onnxruntime_go` (carrega o `.onnx`, tensor
+  `[1,23]`, extrai P(click=1); erro transiente → `(0,nil)` fail-open ADR-0003 §A/DA-3); `disabled.go`
+  (`//go:build !onnx`) devolve `ErrNotCompiled` → o **build default (`go build ./...`) fica CGO-free** e o
+  `main` cai no stub (fail-safe no boot, nunca mid-request). Wiring troca o stub incondicional por
+  `onnx.New(...)` com fallback. `go list -deps` prova `onnxruntime` **fora** de todo binário de produção
+  default. `yalue/onnxruntime_go` entra no `go.mod` mas só compila sob `-tags onnx`.
+- **Contrato de serving sem ZipMap:** o `pctr_model.onnx` era exportado com **ZipMap**
+  (`seq(map(int64,tensor(float)))`), hostil a runtimes embarcados. Re-exportado do booster salvo com
+  `zipmap=False` ([train_pctr.py](ml/training/train_pctr.py) `export_onnx`) → output `probabilities` vira
+  **tensor plano `[N,2]`** (P(1)=coluna 1); equivalência numérica booster≡onnx `max_abs_diff≈8e-08`. Único
+  consumidor Python (`validate_onnx`) já era defensivo; `make ml-test` verde (0 regressão).
+- **Prova (paridade de inferência real):** o ambiente tinha `libonnxruntime.so.1.26.0` (venv) + gcc + CGO,
+  então o path `-tags onnx` foi **buildado, linkado e RODADO** de fato. `onnx_parity_test.go` (`//go:build
+  onnx`, `t.Skip` sem lib/modelo) prova `OnnxInferencer.Score` (Go) ≡ referência Python `onnxruntime` sobre
+  os mesmos vetores canônicos de `parity_cases.json` — **diff=0.00e+00 nos 5 casos** + fail-open em input
+  malformado. Cadeia end-to-end: Go `Featurize` ≡ vetores (`internal/ranker/parity_test.go`) + Go
+  `Score(vetores)` ≡ golden.
+
+**Gates verdes (19ª onda):** `tech-lead-architect` **PASS** (build hermético provado com `CGO_ENABLED=0`;
+`onnxruntime` fora de `go list -deps`; regra de ouro mantida — ONNX é sancionado por ADR-0003 §B, sem
+Triton/GPU/novo processo, TX-4 não ampliado; re-export `zipmap=False` numericamente provado, sem quebrar
+consumidor) + `parity-golden-test-guardian` **PASS** (cadeia de paridade **genuína, não tautológica** —
+provada por 2 canários: trocar a coluna extraída ou perturbar o vetor faz o teste FALHAR). Verificação inline
+de 1ª mão: `go build ./...`, `go vet`, `go test` default, `go test -tags onnx` (paridade bit-exata),
+`make ml-training-test` (17 testes), `make parity-golden-short`, `make verify` (buf TX-1 + no-float TX-2) —
+**todos verdes**. **Correções aplicadas na janela** (exigidas/recomendadas pelos gates): (a) o comentário de
+`onnx.go` alegava um cross-check `numFeatures↔ranker.FeatureVectorLength` inexistente → adicionado de verdade
+em `features_contract_test.go` (roda no **CI default**, sem CGO); (b) novo pytest `test_onnx_export.py` cobre
+o contrato `zipmap=False` em CI normal (fecha o "gate que sempre skipa" — o parity `-tags onnx` depende de lib
+não disponível em CI); (c) reconciliação de doc em `ADR-0003 §B` (a nota "fora do go.mod" agora qualifica a
+opção Treelite; o binding Go do ONNX entra no go.mod só sob build tag). **Backlog não-bloqueante** (gates): o
+golden `score_golden.json` depende do `.onnx` gitignored (teste `-tags onnx` skipa em CI sem o artefato);
+`model_version` reportado como a versão real mesmo no fallback stub (candidato a `stub-fallback`); warning
+cosmético de shape no output `label` (batch N>1). O golden e o artefato do modelo seguem gitignored (padrão
+ADR-0003 §B: modelos compilados não versionados como blobs).
+
+> **G0 — progresso:** **3 de 7** itens de código fechados (E6/E10 na 17ª, E5 na 18ª, **E11 na 19ª**). Restam,
+> sem exigir infra: **schema E8** (falso-positivo do `proto-gen-check` — próximo), **platform E8** (mandato
+> item 4), **frontend E9+E10** (fail-closed + stack §2.5) e **copiloto E12** (higiene de layout).
+
 ### ⏭️ Pendente da Fase 3
 
 **K8** (promoção do deep ranking sob **uplift A/B + kill-switch**) segue **gated por
