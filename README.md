@@ -813,6 +813,57 @@ eliminação do `cascadePure` comprovada pelos AB parity tests) + `ml-optimizati
 batendo em `/v1/decide` fecharia a prova de isolamento no limite de produção completo (hoje provado
 nos wrappers isolados + argumento arquitetural).
 
+### ✅ Entregue na Fase 3 — 18ª onda: **hot-reload do GeoLite2 (.mmdb) sem restart** (G0/E5; sob ADR-0004, sem ADR novo; gates verdes)
+
+Fecha o **próximo item de código de G0** na sequência ordenada do próximo plano
+([docs/plano-desenvolvimento-por-addon.md](docs/plano-desenvolvimento-por-addon.md) §5 **G0**,
+`E5` do `decision-engine-engineer`, gate `parity-golden-test-guardian`), logo após o HOT-1/HOT-3
+(E6/E10) fechado na 17ª onda. Refs: `DA-9`, `CA-9`, `§4.10`, `TX-5/DA-11`, `ADR-0002 §C`.
+Triada por fan-out multiagente read-only sobre os 6 itens restantes de G0 (0 falsos-positivos: o
+plano representava a realidade; E5 era o próximo genuíno).
+
+- **Defeito (E5):** o `.mmdb` do GeoLite2 era carregado **uma única vez no boot**
+  ([internal/geo/maxmind.go](internal/geo/maxmind.go)) — o comentário admitia "not implemented in I2".
+  Atualizar os dados (DA-9/§4.10: "auto-atualizam sem intervenção manual", CA-9) exigia **restart** do
+  collector, que resolve geo por request concorrente ([collector `Resolve`](services/collector/cmd/collector/main.go)).
+- **Fix (RWMutex, não `atomic.Pointer` nu):** `MaxMindResolver` passa a guardar o `*maxminddb.Reader`
+  sob `sync.RWMutex`; `Resolve` faz `Lookup` sob `RLock`; novo `Reload(dbPath)` abre o novo reader, troca
+  sob `Lock` e **só então** fecha o antigo. A escolha do RWMutex é **de correção, não de estilo**: o reader
+  é lastreado por **mmap** e `Close()` faz **munmap** — com `atomic.Pointer` sozinho, um `Lookup` em voo
+  poderia dereferenciar memória já desmapeada por um `Reload` concorrente (use-after-munmap/SIGSEGV). O
+  `Lock()` só é concedido após todos os `RLock` drenarem, então o close do reader antigo nunca corre contra
+  um `Lookup` que ainda o usa. Em **falha** de reload (arquivo ruim/corrompido), o reader anterior **continua
+  servindo** — nunca rebaixa um DB funcionando para vazio (**DA-9**).
+- **Gatilho (collector):** `runGeoReloader` faz **poll de mtime** (`GEOIP_RELOAD_INTERVAL`, default 1h) e
+  chama `Reload` quando o job externo de auto-atualização substitui o arquivo — sem sinal do operador,
+  espelhando o `Refresher` de [internal/snapshot/loader.go](internal/snapshot/loader.go). Atado ao `ctx` de
+  shutdown; **nunca vê nem loga IP** (só `os.Stat`/`os.Open` de um path — TX-5/DA-11 intactos).
+- **Prova (`-race`, [internal/geo/maxmind_reload_test.go](internal/geo/maxmind_reload_test.go)):** fixtures
+  `.mmdb` gerados com `mmdbwriter` **só-teste** (Go puro, sem cgo → build de produção segue hermético,
+  **ADR-0002 §C**; nenhum binário de produção importa `mmdbwriter`). Três testes: swap-in-place (BR→US na
+  mesma instância, zero downtime), falha retém o DB antigo (DA-9) e **50×Resolve ∥ 4×Reload** sem data race
+  nem panic.
+
+**Gates verdes (18ª onda):** revisão adversarial `parity-golden-test-guardian` **PASS** — o gate **injetou
+o bug** (removeu o RWMutex) e confirmou que o teste de concorrência trava com SIGSEGV/use-after-munmap
+(**canário genuíno, não teatro**), depois restaurou o arquivo e reconfirmou tudo verde; paridade bit-idêntica
+(o caminho existente é intocado; os goldens usam `StubResolver`), DA-9, TX-5/DA-11 e build hermético todos
+verificados de forma independente. Verificação inline de 1ª mão: `go build ./...`, `go vet`
+(geo/collector/decision), `go test -race -count=2 ./internal/geo/...` (8 testes), `make parity-golden-short`
+(3 pacotes `-race`) e `make verify` (buf TX-1 + no-float TX-2) — **todos verdes**; `go list -deps` prova
+`mmdbwriter` fora de todo binário de produção. **Backlog não-bloqueante** (registrado pelo gate): endurecer
+`Reload` com guard `closed` contra reabrir após `Close()` (hoje inatingível — nenhum caminho de produção chama
+`Close`); table-test de `geoReloadInterval`; sub-caso de arquivo truncado no teste de DA-9; e o gap de boot
+(se o `.mmdb` falha ao abrir no boot, cai para `EmptyResolver` e o reloader não arma — candidato do
+`platform-infra-engineer`, não regressão desta onda). Junto, a onda corrigiu o **drift de status do plano**:
+E6/E10 (fechados na 17ª) ainda constavam "→ próxima" e o E11 trazia um **overclaim** ("o wrapper Go é escrito e
+testado") — ambos corrigidos em [docs/plano-desenvolvimento-por-addon.md](docs/plano-desenvolvimento-por-addon.md).
+
+> **G0 — progresso:** 2 de 7 itens de código fechados (E6/E10 na 17ª, **E5 na 18ª**). Restam, sem exigir
+> infra: **ml E11** (ONNX nativo — próximo), **schema E8** (falso-positivo do `proto-gen-check`),
+> **platform E8** (mandato item 4), **frontend E9+E10** (fail-closed + stack §2.5) e **copiloto E12**
+> (higiene de layout). Triagem read-only confirmou os 5 como pendências genuínas (0 falsos-positivos).
+
 ### ⏭️ Pendente da Fase 3
 
 **K8** (promoção do deep ranking sob **uplift A/B + kill-switch**) segue **gated por
