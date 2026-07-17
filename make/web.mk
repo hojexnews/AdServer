@@ -20,8 +20,15 @@ web-build:
 web-lint:
 	cd $(WEB_DIR) && npm run lint
 
-## web-ci: typecheck + lint (sem build — build é separado e lento)
-web-ci: web-typecheck web-lint
+## web-test: testes unitários com o runner NATIVO do Node (node:test), sem jest/vitest.
+## O console não tem framework de teste instalado; usa o type-stripping nativo do
+## Node 24 para rodar .ts diretamente (ver src/lib/session-guard.test.ts — fail-closed
+## do middleware, G0/frontend E9). Determinístico e sem rede (nenhum npm install).
+web-test:
+	cd $(WEB_DIR) && node --test $$(find src -name '*.test.ts')
+
+## web-ci: typecheck + lint + testes unitários (sem build — build é separado e lento)
+web-ci: web-typecheck web-lint web-test
 	@echo "OK — Web CI verde."
 
-.PHONY: web-install web-typecheck web-build web-lint web-ci
+.PHONY: web-install web-typecheck web-build web-lint web-test web-ci

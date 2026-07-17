@@ -11,6 +11,16 @@
  *   3. GUARDA DE AUTENTICAÇÃO: rotas /api/copilot/* e /api/trpc/* sem sessão
  *      válida retornam 401 imediatamente — o BFF e a rota SSE nunca chegam a
  *      processar um request não autenticado.
+ *   4. FAIL-CLOSED DE CONFIGURAÇÃO (G0/frontend E9, TX-3/CA-1): em produção
+ *      (NODE_ENV=production), SESSION_SECRET ausente OU curto demais (<32
+ *      bytes) faz TODA rota casada pelo matcher retornar 500 — nunca cai no
+ *      ramo dev-stub de verifySessionToken (que aceita token sem assinatura).
+ *      Ver lib/session-guard.ts para o predicado puro e seus testes. Duas
+ *      camadas de defesa: (a) o guard no topo de middleware() recusa a
+ *      requisição antes de qualquer outra lógica; (b) verifySessionToken()
+ *      também recusa (retorna null) se produção + sem segredo, mesmo que (a)
+ *      seja removido por engano. Isto é hardening de CÓDIGO — independente
+ *      da injeção real do segredo via OpenBao/infra (item E11, separado).
  *
  * POR QUE ISSO RESOLVE H4:
  *   - Mesmo que o cliente envie X-Adserver-Session-Tenant no request, o middleware
@@ -38,6 +48,7 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
+import { sessionConfigError } from "@/lib/session-guard";
 
 // ---------------------------------------------------------------------------
 // Configuração
@@ -113,6 +124,14 @@ async function verifySessionToken(
   token: string
 ): Promise<SessionPayload | null> {
   if (!SESSION_SECRET) {
+    // ---- Camada 2 de defense-in-depth (TX-3/CA-1, G0/frontend E9) ----
+    // Mesmo que o guard de topo em middleware() seja removido por engano no
+    // futuro, este branch NUNCA aceita um token não-assinado em produção.
+    // Rejeita incondicionalmente em vez de cair no parse do dev-stub abaixo.
+    if (process.env["NODE_ENV"] === "production") {
+      return null;
+    }
+
     // Dev-stub: aceita token no formato JSON simples (sem assinatura)
     // NUNCA em produção — SESSION_SECRET deve estar definido.
     try {
@@ -214,6 +233,26 @@ function isUuid(s: string): boolean {
 // ---------------------------------------------------------------------------
 
 export async function middleware(request: NextRequest): Promise<NextResponse> {
+  // ---- 0. GUARD DE CONFIGURAÇÃO (TX-3/CA-1, G0/frontend E9) ----
+  // Fail-closed REAL: em produção, SESSION_SECRET ausente (ou fraco) nunca
+  // pode cair no ramo dev-stub de verifySessionToken (que aceita tokens sem
+  // verificação de assinatura). Recusa TODA rota casada pelo matcher abaixo
+  // com 500, ANTES de qualquer outra lógica — "recusar boot" em nível de
+  // requisição, já que o Edge Runtime não expõe um hook de boot do processo.
+  // Isto é hardening de CÓDIGO, independente da injeção real do segredo via
+  // OpenBao/infra (item G0/frontend E11, separado e ainda pendente).
+  const configError = sessionConfigError(
+    process.env["NODE_ENV"],
+    SESSION_SECRET
+  );
+  if (configError !== null) {
+    console.error(`[middleware] server misconfiguration: ${configError}`);
+    return NextResponse.json(
+      { error: "server misconfiguration" },
+      { status: 500 }
+    );
+  }
+
   const { pathname } = request.nextUrl;
 
   // ---- 1. DENYLIST: remove todos os headers proibidos do request de entrada ----

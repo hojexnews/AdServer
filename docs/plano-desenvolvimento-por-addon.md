@@ -954,8 +954,8 @@ Só migrar as ferramentas tipadas do ToolGateway para o protocolo MCP quando hou
 | `E6` | BFF + UI de pagamentos — status somente-leitura, cripto fora do cliente (K7, ADR-0004 §H) | ✅ concluída | `frontend-bff-engineer` | `ADR-0004 §H (K7)` · `TX-2` · `TX-3` · `§2.5` | — |
 | `E7` | CI do front/BFF deixa de ser órfã (bff-ci/web-ci) | ✅ concluída | `frontend-bff-engineer` | `§2.5` · `ADR-0002` | — |
 | `E8` | PostgresConfigAdapter real — fecha o laço console→decisão (14ª onda) | ✅ concluída | `frontend-bff-engineer` | `CA-1` · `TX-3` · `DA-11` | — |
-| `E9` | Fail-closed real do middleware de sessão em produção | → próxima | `frontend-bff-engineer` | `TX-3` · `CA-1` · `§2.5` | — |
-| `E10` | Alinhamento de stack com o mandato §2.5 (dívida verificada, sem bloqueio de infra) | ◻ pendente | `frontend-bff-engineer` | `§2.5` · `WCAG 2.2 AA` · `ADR-0003` | — |
+| `E9` | Fail-closed real do middleware de sessão em produção | ✅ concluída (22ª onda) | `frontend-bff-engineer` | `TX-3` · `CA-1` · `§2.5` | — |
+| `E10` | Alinhamento de stack com o mandato §2.5 (dívida verificada, sem bloqueio de infra) | → próxima | `frontend-bff-engineer` | `§2.5` · `WCAG 2.2 AA` · `ADR-0003` | — |
 | `E11` | Ativação em produção sob infra real (SESSION_SECRET/OpenBao, FQDNs, cutover) | ⏳ gated | `frontend-bff-engineer` | `TX-3` · `docs/ops/go-live-runbook.md §3` · `ADR-0002 (I5)` | infra real: cluster/OpenBao/DNS de produção ainda não aplicados neste ambiente (mesma pendência não-código do restante do roadmap) |
 | `E12` | Copiloto embutido contextualmente na UI (sucessor pós-F3, sob gatilho de uso medido) | ⏳ gated | `frontend-bff-engineer` | `§2.5` · `ADR-0003 (J5)` | requer tráfego real em produção (E11) para medir o sinal de uso que justifica o investimento — não mensurável em ambiente local/CI |
 | `E13` | Assinatura on-chain pelo anunciante no front (fora de escopo padrão, sob spec AEV/BND) | ⏳ gated | `payments-crypto-engineer` | `ADR-0004 E.9` · `§2.5` · `§3 (q.9)` | bloqueio de produto: spec oficial de AEV/BND ainda não define se o anunciante assina on-chain ou se a plataforma custodia por ele (ADR-0004 §3 q.9, sem resposta) |
@@ -1044,7 +1044,7 @@ Promover o BFF de config do stub in-memory para o adapter Postgres real, fazendo
 
 **Subagente:** `frontend-bff-engineer` · **Doc:** `CA-1` · `TX-3` · `DA-11` · **Gate:** money/security/schema-contracts (revisão adversarial multi-lente) — APROVADO na 14ª onda · **Depende de:** —
 
-##### E9 · Fail-closed real do middleware de sessão em produção — → próxima
+##### E9 · Fail-closed real do middleware de sessão em produção — ✅ concluída (22ª onda)
 
 Fechar um gap verificado no código: middleware.ts cai em modo dev-stub (aceita token sem assinatura HMAC) sempre que SESSION_SECRET está ausente, sem nenhum hard-fail explícito se NODE_ENV=production — hoje a proteção depende só de disciplina operacional, não de um guard estrutural no código.
 
@@ -1053,6 +1053,8 @@ Fechar um gap verificado no código: middleware.ts cai em modo dev-stub (aceita 
 - Documentar em comentário que isto é independente da injeção real do segredo (E11) — é hardening de código, não infra
 
 **Subagente:** `frontend-bff-engineer` · **Doc:** `TX-3` · `CA-1` · `§2.5` · **Gate:** security-reviewer — deve aprovar que não há caminho de produção sem HMAC verificado · **Depende de:** E1
+
+> **Fechado na 22ª onda.** Predicado puro `web/console/src/lib/session-guard.ts` (`sessionConfigError`: produção com segredo ausente **ou < 32 bytes** → erro) em **dupla defesa** — camada 1 no topo de `middleware()` (500 para toda rota casada, "recusa boot") + camada 2 em `verifySessionToken` (produção sem segredo → `null`, nunca cai no dev-stub). Teste `session-guard.test.ts` via runner nativo `node:test` (10 casos; alvo `make web-test` em `web-ci`; `web.yml` no Node 24; `tsconfig` com `allowImportingTsExtensions`). Comportamento dev/CI 100% preservado. **Gate `security-reviewer` PASS** (`productionBypassPossible=false`, 0 CRITICAL/HIGH). `make web-ci` verde de 1ª mão (tsc + lint + 10/10 testes). **Residual MEDIUM diferido a E11:** o guard depende de `NODE_ENV` — enforce `NODE_ENV=production` no manifesto do pod (ou flag explícito) fecha o risco de deploy com `NODE_ENV` unset. É hardening de infra, não de código.
 
 ##### E10 · Alinhamento de stack com o mandato §2.5 (dívida verificada, sem bloqueio de infra) — ◻ pendente
 

@@ -1,8 +1,12 @@
-# web (Fase 1) — console Next.js: typecheck + lint.
+# web (Fase 1) — console Next.js: typecheck + lint + testes unitários.
 #
 # Materializa o gate `make web-ci` (tsc --noEmit strict + next lint
-# max-warnings 0), que era ÓRFÃO: nenhum workflow o acionava e ele não está no
-# agregado `verify` da raiz. (sweep item 6, CI-3)
+# max-warnings 0 + node:test), que era ÓRFÃO: nenhum workflow o acionava e ele
+# não está no agregado `verify` da raiz. (sweep item 6, CI-3)
+#
+# Node 24: `make web-test` roda os testes via runner nativo do Node (node:test)
+# com type-stripping nativo de .ts — disponível sem flag a partir do Node 22.18/24.
+# Fixado em 24 (baseline do repo) para não depender do minor exato do 22.x. (G0/E9)
 name: web (Fase 1)
 
 on:
@@ -28,8 +32,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "24"
       - name: install deps
         run: make web-install
-      - name: ci (typecheck + lint)
+      - name: ci (typecheck + lint + test)
         run: make web-ci

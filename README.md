@@ -1008,6 +1008,50 @@ inspeciona só `spec.containers[]`, não `initContainers[]` — candidato a hard
 > 20ª, **platform E8 na 21ª**). Restam, sem exigir infra: **frontend E9+E10** (fail-closed + stack §2.5 —
 > próximo) e **copiloto E12** (higiene de layout).
 
+### ✅ Entregue na Fase 3 — 22ª onda: **fail-closed real do middleware de sessão em produção** (G0/frontend-E9; sob TX-3/CA-1, sem ADR novo; gate verde)
+
+Fecha a **1ª das 2 dívidas de código do addon front/BFF** (frontend E9), a próxima na sequência ordenada do
+próximo plano ([docs/plano-desenvolvimento-por-addon.md](docs/plano-desenvolvimento-por-addon.md) §5 **G0**,
+addon front/BFF E9). Dono `frontend-bff-engineer`; gate adversarial obrigatório `security-reviewer`. Refs:
+`TX-3` (isolamento de tenant), `CA-1` (ACL server-side), `§2.5`.
+
+- **Gap corrigido (risco ALTO):** [web/console/src/middleware.ts](web/console/src/middleware.ts) deriva o
+  `tenant_id` de um cookie de sessão HttpOnly. `verifySessionToken()` tinha um ramo **dev-stub** que aceitava
+  o token como `base64url(JSON)` **sem verificar a assinatura HMAC** sempre que `SESSION_SECRET` estava ausente
+  — e **não havia hard-fail se `NODE_ENV=production`**. Ou seja, em produção sem o segredo o sistema fazia
+  **fail-OPEN** (aceitava `tenant_id` forjado → bypass de isolamento de tenant). A proteção dependia só de
+  disciplina operacional, não de um guard estrutural.
+- **Correção em dupla defesa (defense-in-depth):** predicado **puro** e testável
+  [web/console/src/lib/session-guard.ts](web/console/src/lib/session-guard.ts) —
+  `sessionConfigError(nodeEnv, secret)` retorna erro se, em produção, o segredo estiver **ausente ou < 32 bytes**.
+  **Camada 1**: no topo de `middleware()`, se o predicado acusa erro, loga (`console.error`, sem vazar o motivo)
+  e retorna **500 para toda rota casada pelo matcher** — "recusar boot" em nível de requisição, antes de qualquer
+  outra lógica. **Camada 2**: dentro de `verifySessionToken`, produção sem segredo retorna `null` — nunca cai no
+  parse do dev-stub, mesmo que a camada 1 seja removida por engano. Comportamento **dev/CI 100% preservado**
+  (fora de produção o dev-stub segue funcionando; com segredo, o HMAC como antes). Hardening de **código**,
+  independente da injeção real do segredo via OpenBao (item **E11**, separado e ainda gated).
+- **Teste sem framework (network-free):** o console não tem jest/vitest;
+  [web/console/src/lib/session-guard.test.ts](web/console/src/lib/session-guard.test.ts) usa o runner **nativo do
+  Node 24** (`node:test` + type-stripping de `.ts`), 10 casos (produção sem/curto/vazio/válido segredo, UTF-8
+  multi-byte por bytes, dev/test/undefined). Novo alvo `make web-test` ([make/web.mk](make/web.mk)) incluído em
+  `make web-ci`; [web.yml](.github/workflows/web.yml) alinhado ao **Node 24** (type-stripping sem flag).
+  `tsconfig.json` ganhou `allowImportingTsExtensions` (import `.ts` do teste sob `noEmit`).
+- **Gate `security-reviewer` PASS** (adversarial): **`productionBypassPossible = false`**, **zero CRITICAL/HIGH**
+  — traçou os 3 caminhos em produção (sem/curto/válido segredo) e confirmou que o header
+  `x-adserver-session-tenant` só é injetado após HMAC+exp+UUID; denylist/CSRF/injeção intactas; teste
+  **não-tautológico**. **1 MEDIUM residual registrado (não é bypass no escopo E9):** o guard é atrelado a
+  `NODE_ENV` — um deploy produtivo com `NODE_ENV` unset/`development` reabriria o dev-stub (exige 2ª má-config;
+  `next start` seta `NODE_ENV=production` por padrão). Fechamento pertence a **E11/infra** (enforce `NODE_ENV`
+  no manifesto do pod, ou trocar a chave por flag explícito) — coordenar com `platform-infra-engineer`.
+- **Verificação de 1ª mão (main loop):** `make web-ci` genuinamente verde — `tsc --noEmit` OK, `next lint`
+  "No ESLint warnings or errors", **`node:test` 10/10 pass**. (No ambiente local os bins do npm estavam como
+  cópias sem symlink — reparado só localmente; `node_modules` é gitignored e o CI faz install limpo.)
+
+> **G0 — progresso:** dos 7 itens de código, 5 estavam fechados (17ª–21ª) e a **22ª fecha o fail-closed do
+> middleware (frontend E9)** — a 1ª das 2 dívidas do addon front/BFF. Restam, sem exigir infra: **frontend E10**
+> (alinhamento de stack §2.5: Next 16/React 19.2/shadcn/Zustand/Vercel AI SDK v5/a11y CI — **próximo**) e
+> **copiloto E12** (higiene de layout).
+
 ### ⏭️ Pendente da Fase 3
 
 **K8** (promoção do deep ranking sob **uplift A/B + kill-switch**) segue **gated por
