@@ -1,15 +1,25 @@
-# Kyverno — baseline de admissão (supply chain, §2.7).
+# Kyverno — baseline de admissão (supply chain, §2.7, mandato item 4).
 #
-# Três controles mínimos: (1) imagens assinadas via cosign, (2) sem tag
-# :latest, (3) limites de recurso obrigatórios. cosign + SBOM + Trivy +
-# Falco completam a cadeia (CI de imagem + runtime, Fase 1).
+# Três controles mínimos: (1) imagens assinadas via cosign KEYLESS (OIDC do
+# GitHub Actions — Fulcio para o certificado efêmero + Rekor para o log de
+# transparência; sem chave estática em disco/git), (2) sem tag :latest,
+# (3) limites de recurso obrigatórios. SBOM (anchore/sbom-action, SPDX +
+# CycloneDX) + Trivy (fail em CRITICAL) completam a cadeia de CI de imagem
+# — ver .github/workflows/supply-chain.yml. Falco cobre o runtime — ver
+# platform/observability/falco-rules.yaml. E8 fechou os 4 controles do
+# mandato (antes só Kyverno tinha código real).
 ---
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
   name: verify-image-signatures
   annotations:
-    policies.kyverno.io/title: Exigir imagens assinadas (cosign)
+    policies.kyverno.io/title: Exigir imagens assinadas (cosign keyless)
+    policies.kyverno.io/description: >-
+      Exige que toda imagem ghcr.io/hojex/* tenha sido assinada com cosign
+      KEYLESS pelo workflow supply-chain.yml (identidade OIDC do GitHub
+      Actions, verificada via Fulcio + Rekor). Nenhuma chave estática é
+      distribuída ou versionada — a identidade do assinante É o workflow.
 spec:
   validationFailureAction: Enforce
   webhookTimeoutSeconds: 30
@@ -25,12 +35,16 @@ spec:
             - "ghcr.io/hojex/*"
           attestors:
             - entries:
-                - keys:
-                    # Chave pública cosign do registry (substituir no apply).
-                    publicKeys: |-
-                      -----BEGIN PUBLIC KEY-----
-                      REPLACE_WITH_COSIGN_PUBLIC_KEY
-                      -----END PUBLIC KEY-----
+                # Keyless (Sigstore): sem chave pública para gerenciar/rotacionar.
+                # A confiança é ancorada na identidade OIDC do workflow de CI
+                # (issuer) + no path exato do workflow (subject) — só builds
+                # disparados por tag/release em .github/workflows/supply-chain.yml
+                # deste repositório produzem assinatura aceita.
+                - keyless:
+                    issuer: "https://token.actions.githubusercontent.com"
+                    subject: "https://github.com/hojexnews/AdServer/.github/workflows/supply-chain.yml@refs/tags/*"
+                    rekor:
+                      url: https://rekor.sigstore.dev
 ---
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy

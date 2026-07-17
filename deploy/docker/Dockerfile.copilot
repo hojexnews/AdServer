@@ -1,0 +1,70 @@
+# deploy/docker/Dockerfile.copilot — Dockerfile de PRODUCAO do copiloto
+# (Python/LangGraph, services/copilot). Nao existia Dockerfile de producao
+# para este servico ate o E8 (mandato item 4 — supply chain).
+#
+# Multi-stage: builder resolve as dependencias do pyproject.toml (runtime
+# apenas — sem o extra [dev] de pytest/ruff/mypy) em virtualenv isolado;
+# o estagio final e slim, nonroot, sem toolchain de build nem segredo
+# (§2.7 — segredos vem do OpenBao/Vault Agent em runtime, nunca da imagem).
+#
+# Usado por .github/workflows/supply-chain.yml (build -> SBOM -> Trivy ->
+# cosign sign keyless -> push ghcr.io/hojex/copilot).
+#
+# Uso (contexto = services/copilot/, NAO a raiz do repo):
+#   docker build -f deploy/docker/Dockerfile.copilot \
+#     --build-arg REVISION="$(git rev-parse HEAD)" \
+#     -t ghcr.io/hojex/copilot:v1.2.3 services/copilot
+
+FROM python:3.12-slim AS build
+WORKDIR /src
+
+# Copia so o necessario para a resolucao de dependencias via
+# [tool.setuptools.packages.find] (pyproject.toml) — tests/ e
+# adserver_copilot.egg-info ficam de fora da imagem de producao.
+COPY pyproject.toml ./
+COPY app ./app
+COPY graph ./graph
+COPY guardrails ./guardrails
+COPY rag ./rag
+COPY observability ./observability
+COPY tools ./tools
+
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Apenas dependencias de runtime (sem [dev]: pytest/ruff/mypy ficam de fora).
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir .
+
+# Estagio final: slim (sem toolchain de compilacao), usuario nao-root
+# explicito (python:3.12-slim nao traz "nonroot" pronto como o distroless).
+FROM python:3.12-slim AS runtime
+
+ARG REVISION=unknown
+LABEL org.opencontainers.image.title="adserver-copilot" \
+      org.opencontainers.image.source="https://github.com/hojexnews/AdServer" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.vendor="Hojex" \
+      org.opencontainers.image.licenses="UNLICENSED" \
+      org.opencontainers.image.description="AdServer Copilot Gateway (LangGraph + FastAPI, J5/Fase 2) — imagem de producao, nonroot, sem segredo estatico."
+
+RUN groupadd --system --gid 65532 nonroot \
+    && useradd --system --uid 65532 --gid nonroot --no-create-home --shell /usr/sbin/nologin nonroot
+
+COPY --from=build /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /app
+COPY --from=build /src/app ./app
+COPY --from=build /src/graph ./graph
+COPY --from=build /src/guardrails ./guardrails
+COPY --from=build /src/rag ./rag
+COPY --from=build /src/observability ./observability
+COPY --from=build /src/tools ./tools
+
+USER nonroot:nonroot
+# Porta default do FastAPI (services/copilot/app/config.py: port=8001).
+EXPOSE 8001
+ENTRYPOINT ["uvicorn", "app.server:app", "--host", "0.0.0.0", "--port", "8001"]

@@ -1,0 +1,57 @@
+# deploy/docker/Dockerfile.go-service — Dockerfile de PRODUCAO para os
+# servicos Go do hot path (decision, collector, payments, ranker-sidecar).
+#
+# Reaproveita a MESMA receita hermetica de deploy/local/Dockerfile (module
+# graph cacheado, gen/ versionado -> sem rede para codegen (ADR-0002 §C),
+# CGO_ENABLED=0, distroless nonroot) e adiciona metadados OCI para
+# rastreabilidade de proveniencia (mandato item 4 / E8 — supply chain).
+#
+# deploy/local/Dockerfile permanece intocado (usado pelo docker-compose de
+# dev, deploy/local/docker-compose.yml). Este arquivo e o usado pelo CI de
+# imagem de producao: .github/workflows/supply-chain.yml (build -> SBOM ->
+# Trivy -> cosign sign keyless -> push ghcr.io/hojex/<servico>).
+#
+# Uso (contexto = raiz do repo, como em deploy/local/Dockerfile):
+#   docker build --build-arg SERVICE=decision \
+#     --build-arg REVISION="$(git rev-parse HEAD)" \
+#     -f deploy/docker/Dockerfile.go-service \
+#     -t ghcr.io/hojex/decision:v1.2.3 .
+#
+# ranker-sidecar: o build tag ONNX nativo (E11, 19a onda) NAO entra por
+# default neste build (sem -tags onnx) — mesma politica de
+# deploy/local/Dockerfile. Ativar o backend ONNX nativo em producao e uma
+# decisao explicita e separada (fora do escopo deste Dockerfile generico).
+
+FROM golang:1.26 AS build
+WORKDIR /src
+
+ARG SERVICE
+
+# Cache o module graph primeiro.
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Depois o source (gen/ incluido — codigo gerado versionado).
+COPY . .
+
+RUN test -n "$SERVICE" || (echo "SERVICE build-arg is required" && false)
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
+    -o /out/app ./services/${SERVICE}/cmd/${SERVICE}/
+
+# Distroless static: sem shell, superficie de ataque minima (mesmo alvo de
+# deploy/local/Dockerfile) — nonroot por padrao na propria imagem base.
+FROM gcr.io/distroless/static-debian12:nonroot AS runtime
+
+ARG SERVICE
+ARG REVISION=unknown
+
+LABEL org.opencontainers.image.title="adserver-${SERVICE}" \
+      org.opencontainers.image.source="https://github.com/hojexnews/AdServer" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.vendor="Hojex" \
+      org.opencontainers.image.licenses="UNLICENSED" \
+      org.opencontainers.image.description="AdServer ${SERVICE} — imagem de producao (distroless nonroot, CGO_ENABLED=0, sem segredo estatico)."
+
+COPY --from=build /out/app /app
+USER nonroot:nonroot
+ENTRYPOINT ["/app"]

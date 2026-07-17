@@ -1,0 +1,287 @@
+# .github/workflows/supply-chain.yml — pipeline de supply chain de imagem
+# (mandato item 4, §2.7, E8). Fecha os 3 controles que faltavam (cosign real
+# + SBOM + Trivy); Kyverno (admissao) ja tinha codigo real; Falco (runtime)
+# esta em platform/observability/falco-rules.yaml.
+#
+# Este arquivo e o PIPELINE/TEMPLATE entregue pela plataforma — nao a
+# imagem de cada app (mandato E8: "platform-infra-engineer entrega o
+# pipeline/template de CI, nao a imagem de cada app"; Dockerfiles de
+# producao sao co-mantidos com os donos de camada).
+#
+# Dois modos, para nunca publicar a partir de PR nao confiavel:
+#
+#   1) pull_request -> job "build-and-scan": build local (sem push, sem
+#      cosign) + Trivy scan. Valida cedo (achados de vulnerabilidade e
+#      Dockerfile quebrado) sem tocar o registry.
+#
+#   2) push de tag "v*.*.*" (ou release publicada) -> job "build-sign-push":
+#      build -> SBOM (SPDX + CycloneDX) -> Trivy scan (fail em CRITICAL,
+#      HIGH por criterio de seguranca — ajustavel via TRIVY_SEVERITY) ->
+#      push ghcr.io -> cosign sign KEYLESS (OIDC do GitHub Actions via
+#      Fulcio + Rekor, decisao registrada abaixo).
+#
+#      Nota de ordem: o Trivy roda ANTES do push (nao publicamos imagem
+#      vulneravel) e o cosign sign roda DEPOIS do push (a assinatura
+#      keyless referencia o digest ja publicado no registry — cosign nao
+#      assina um artefato que nao existe em um registry enderecavel).
+#      SBOM e gerado a partir da imagem local (docker-daemon) antes do
+#      push, para nao depender de round-trip extra ao registry.
+#
+# cosign KEYLESS (decisao, nao par de chaves gerenciado):
+#   - Sem chave privada para gerar/guardar/rotacionar (nada estatico em
+#     git/imagem, §2.7). A identidade do assinante = o proprio workflow de
+#     CI (OIDC do GitHub Actions), certificado efemero via Fulcio, e o
+#     registro de transparencia e o Rekor publico — auditavel por terceiros.
+#   - kyverno-baseline.yaml (platform/k8s/policy/) verifica exatamente este
+#     issuer/subject: token.actions.githubusercontent.com +
+#     .github/workflows/supply-chain.yml@refs/tags/*.
+#   - Publicacao real (push a ghcr.io/hojex/*) depende de o token de CI ter
+#     permissao de escrita no namespace de pacotes correspondente — infra
+#     viva (E9), fora do escopo deste template. Se o namespace ghcr.io/hojex
+#     nao corresponder 1:1 ao owner do repositorio no GitHub, o step de
+#     login/push exigira um PAT dedicado com escopo write:packages (decisao
+#     operacional de E9, nao deste workflow).
+name: supply-chain
+
+on:
+  pull_request:
+    paths:
+      - "services/**"
+      - "go.mod"
+      - "go.sum"
+      - "deploy/docker/**"
+      - ".github/workflows/supply-chain.yml"
+  push:
+    tags:
+      - "v*.*.*"
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: hojex
+  # exit-code=1 se qualquer vulnerabilidade destas severidades for
+  # encontrada (fail-closed). HIGH incluido por criterio de seguranca do
+  # mandato ("e HIGH conforme criterio") — ajustavel aqui se necessario.
+  TRIVY_SEVERITY: "CRITICAL,HIGH"
+
+jobs:
+  # --------------------------------------------------------------------
+  # PR: build + scan cedo. Sem push, sem cosign — nunca publica a partir
+  # de codigo de PR (pode vir de fork nao confiavel).
+  # --------------------------------------------------------------------
+  build-and-scan:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: decision
+            dockerfile: deploy/docker/Dockerfile.go-service
+            context: "."
+            build_args: "SERVICE=decision"
+          - service: collector
+            dockerfile: deploy/docker/Dockerfile.go-service
+            context: "."
+            build_args: "SERVICE=collector"
+          - service: payments
+            dockerfile: deploy/docker/Dockerfile.go-service
+            context: "."
+            build_args: "SERVICE=payments"
+          - service: ranker-sidecar
+            dockerfile: deploy/docker/Dockerfile.go-service
+            context: "."
+            build_args: "SERVICE=ranker-sidecar"
+          - service: copilot
+            dockerfile: deploy/docker/Dockerfile.copilot
+            context: services/copilot
+            build_args: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: setup buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: build imagem (local, sem push) — ${{ matrix.service }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          build-args: ${{ matrix.build_args }}
+          push: false
+          load: true
+          tags: "local/${{ matrix.service }}:pr-${{ github.sha }}"
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+      - name: Trivy scan (validacao cedo — nao bloqueia merge sozinho, informa o PR)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: "local/${{ matrix.service }}:pr-${{ github.sha }}"
+          format: table
+          severity: ${{ env.TRIVY_SEVERITY }}
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+
+  # --------------------------------------------------------------------
+  # Tag/release: pipeline completo de supply chain. Publica ghcr.io e
+  # assina keyless. So roda fora de pull_request (nunca a partir de PR).
+  # --------------------------------------------------------------------
+  build-sign-push:
+    if: github.event_name == 'push' || github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # OIDC do GitHub Actions -> cosign keyless (Fulcio)
+      packages: write   # push para ghcr.io
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: decision
+            dockerfile: deploy/docker/Dockerfile.go-service
+            context: "."
+            build_args: "SERVICE=decision"
+          - service: collector
+            dockerfile: deploy/docker/Dockerfile.go-service
+            context: "."
+            build_args: "SERVICE=collector"
+          - service: payments
+            dockerfile: deploy/docker/Dockerfile.go-service
+            context: "."
+            build_args: "SERVICE=payments"
+          - service: ranker-sidecar
+            dockerfile: deploy/docker/Dockerfile.go-service
+            context: "."
+            build_args: "SERVICE=ranker-sidecar"
+          - service: copilot
+            dockerfile: deploy/docker/Dockerfile.copilot
+            context: services/copilot
+            build_args: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: resolver tag da imagem
+        id: vars
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "image=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.service }}" >> "$GITHUB_OUTPUT"
+
+      - name: setup buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: build imagem (local — SBOM/Trivy ANTES de publicar)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          build-args: |
+            ${{ matrix.build_args }}
+            REVISION=${{ github.sha }}
+          push: false
+          load: true
+          tags: "${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.tag }}"
+          labels: |
+            org.opencontainers.image.source=https://github.com/hojexnews/AdServer
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.vars.outputs.tag }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+      # ------------------------------------------------------------------
+      # SBOM (syft via anchore/sbom-action) — SPDX + CycloneDX, a partir da
+      # imagem local recem-buildada (antes do push, sem round-trip extra).
+      # ------------------------------------------------------------------
+      - name: SBOM SPDX (anchore/sbom-action + syft)
+        uses: anchore/sbom-action@v0
+        with:
+          image: "${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.tag }}"
+          format: spdx-json
+          output-file: "sbom-${{ matrix.service }}.spdx.json"
+          upload-artifact: false
+
+      - name: SBOM CycloneDX (anchore/sbom-action + syft)
+        uses: anchore/sbom-action@v0
+        with:
+          image: "${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.tag }}"
+          format: cyclonedx-json
+          output-file: "sbom-${{ matrix.service }}.cyclonedx.json"
+          upload-artifact: false
+
+      - name: anexar SBOMs (SPDX + CycloneDX) como artifact do workflow
+        uses: actions/upload-artifact@v4
+        with:
+          name: "sbom-${{ matrix.service }}"
+          path: |
+            sbom-${{ matrix.service }}.spdx.json
+            sbom-${{ matrix.service }}.cyclonedx.json
+          retention-days: 90
+
+      # ------------------------------------------------------------------
+      # Trivy — FALHA o job em CRITICAL (e HIGH, TRIVY_SEVERITY acima).
+      # Roda ANTES do push: nunca publicamos uma imagem que falhe o gate.
+      # ------------------------------------------------------------------
+      - name: Trivy scan (fail-closed, ANTES do push)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: "${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.tag }}"
+          format: table
+          severity: ${{ env.TRIVY_SEVERITY }}
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+
+      # ------------------------------------------------------------------
+      # Push — so acontece se o Trivy acima passou (gate hard).
+      # ------------------------------------------------------------------
+      - name: login ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: push imagem escaneada para ghcr.io
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          build-args: |
+            ${{ matrix.build_args }}
+            REVISION=${{ github.sha }}
+          push: true
+          tags: "${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.tag }}"
+          labels: |
+            org.opencontainers.image.source=https://github.com/hojexnews/AdServer
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.vars.outputs.tag }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+      # ------------------------------------------------------------------
+      # cosign sign KEYLESS — assina o digest recem-publicado. OIDC do
+      # próprio job (permissions.id-token: write) autentica no Fulcio;
+      # a assinatura + certificado ficam no Rekor (log de transparencia
+      # publico), sem chave privada para gerenciar.
+      # ------------------------------------------------------------------
+      - name: instalar cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: cosign sign (keyless — Fulcio + Rekor)
+        env:
+          # Compat com cosign < 2.0; nas versoes atuais o keyless via OIDC
+          # de CI e o caminho padrao e esta env var e apenas defensiva.
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cosign sign --yes \
+            "${{ steps.vars.outputs.image }}@${{ steps.push.outputs.digest }}"

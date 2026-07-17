@@ -7,10 +7,18 @@
 #   disallow-latest-tag      — :latest deve ser rejeitado; tag explicita aceita
 #   require-resource-limits  — pod sem limits rejeitado; com limits aceito
 #
-# NOTA: verifyImages com chave REPLACE_WITH_COSIGN_PUBLIC_KEY nunca aceita
-# imagem real sem assinatura valida — o teste verifica apenas a rejeicao de
-# imagens fora do registry ghcr.io/hojex/* (pattern que nao bate a regra).
-# Aceitacao real de imagem assinada so e testavel com chave real (integracao).
+# NOTA (E8 — nao ha mais placeholder de chave): verify-image-signatures usa
+# um attestor "keyless" (Sigstore/Fulcio+Rekor, identidade OIDC do workflow
+# .github/workflows/supply-chain.yml) em vez de chave publica estatica.
+# Aceitacao real de uma imagem assinada exige rede a Fulcio (emissao do
+# certificado efemero) e Rekor (log de transparencia) — nao e testavel
+# offline/hermeticamente pelo `kyverno test`. Confirmado empiricamente: rodar
+# `kyverno test` aqui contacta o registry (ghcr.io) para buscar a assinatura
+# e falha rapido (sem hang) quando a imagem/assinatura nao existe — por isso
+# verify-image-signatures continua fora dos `results` abaixo (nunca foi
+# testada aqui, mesmo antes do keyless). A aceitacao keyless real so e
+# validavel em integracao (cluster vivo com admissao real, E9) ou com fixture
+# de assinatura verdadeira via rede (fora do escopo hermetico deste teste).
 apiVersion: cli.kyverno.io/v1alpha1
 kind: Test
 metadata:

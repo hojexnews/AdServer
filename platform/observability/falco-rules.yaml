@@ -1,0 +1,169 @@
+# Falco — ruleset customizado de runtime security (§2.7, mandato item 4, E8).
+#
+# Fecha o 4º controle do mandato (cosign + SBOM + Kyverno + Trivy + Falco):
+# Kyverno cobre ADMISSÃO (platform/k8s/policy/kyverno-baseline.yaml), Trivy
+# + cosign + SBOM cobrem a CADEIA DE IMAGEM (.github/workflows/supply-chain.yml)
+# e este arquivo cobre RUNTIME — o que acontece DEPOIS que um Pod já está
+# rodando (defesa em profundidade: um Pod que passou no admission ainda
+# pode ser comprometido em tempo de execução).
+#
+# Formato: ConfigMap declarativo. O DAEMONSET real do Falco é ativação
+# pós-cluster (E9 — precisa de nó vivo com acesso ao kernel/eBPF); aqui o
+# ruleset é código validável hoje (kubeconform valida o envelope ConfigMap).
+# No E9, o Helm chart oficial do Falco monta esta ConfigMap em
+# /etc/falco/falco_rules.local.yaml (chave "falco_rules.local.yaml" abaixo é
+# o nome de arquivo esperado pelo chart — carregado JUNTO com o
+# falco_rules.yaml padrão, então as regras abaixo podem referenciar macros
+# do ruleset padrão: spawned_process, container, open_write, etc.).
+#
+# Foco: as duas células regulatórias (mandato item 7) — pci e aml-kyc
+# (nomes reais de namespace, ver platform/k8s/namespaces.yaml e
+# platform/cells/{pci,aml-kyc}/namespace.yaml) — sem excluir o resto do
+# cluster das regras gerais (defesa em profundidade não é exclusiva de
+# célula).
+#
+# Regras mínimas exigidas (E8):
+#   1. Exec em container privilegiado (geral + elevado nas células).
+#   2. Escrita fora de paths esperados nas células PCI/AML-KYC.
+#   3. Syscalls/binários suspeitos (shell reverso, cryptomining) com foco
+#      nas células PCI/AML-KYC.
+#
+# Gate: security-reviewer confirma que o ruleset cobre supply chain E
+# runtime (mandato item 4) antes do go-live (E9).
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: falco-custom-rules
+  namespace: platform-system
+  labels:
+    adserver.hojex/cell: platform
+    adserver.hojex/owner: platform-infra-engineer
+    adserver.hojex/component: falco-rules
+  annotations:
+    adserver.hojex/purpose: >
+      Ruleset Falco customizado (runtime security, mandato item 4/§2.7).
+      Deploy real do daemonset Falco é E9 (pós-cluster) — este ConfigMap
+      é o artefato de código montado como falco_rules.local.yaml.
+    adserver.hojex/scope: "Foco nas celulas regulatorias pci e aml-kyc (mandato item 7), sem excluir o restante do cluster."
+data:
+  falco_rules.local.yaml: |
+    # Listas e macros auxiliares --------------------------------------
+
+    - list: adserver_regulated_namespaces
+      items: [pci, aml-kyc]
+
+    - macro: adserver_regulated_cell
+      condition: (k8s.ns.name in (adserver_regulated_namespaces))
+
+    # Diretórios de escrita esperados nas imagens de produção (distroless
+    # nonroot / slim nonroot — ver deploy/docker/Dockerfile.go-service e
+    # Dockerfile.copilot): apenas paths efêmeros e o destino do Vault
+    # Agent. Qualquer escrita fora disso é anômala.
+    - list: adserver_allowed_write_dirs
+      items: [/tmp, /var/tmp, /vault/secrets, /app/tmp, /dev, /proc]
+
+    # Binários que uma imagem distroless/slim nonroot de produção nunca
+    # deveria spawnar em operação normal (sem shell interativo no path
+    # feliz) — forte indício de shell reverso / exfiltração / movimento
+    # lateral caso apareçam.
+    - list: adserver_suspicious_binaries
+      items: [sh, bash, ash, dash, zsh, nc, ncat, netcat, curl, wget, socat, telnet]
+
+    # Nomes de processo associados a malware/cryptomining de container
+    # observados publicamente em incidentes de supply chain.
+    - list: adserver_malware_process_names
+      items: [xmrig, kinsing, kdevtmpfsi, moneroocean, xmrigCC]
+
+    # Regra 1 — Exec em container privilegiado --------------------------
+
+    - rule: Exec em container privilegiado
+      desc: >
+        Um processo foi executado dentro de um container em modo
+        privilegiado. O Pod Security Standard "restricted" (ver
+        platform/k8s/namespaces.yaml, platform/cells/{pci,aml-kyc}/namespace.yaml)
+        já deveria ter bloqueado isso no admission — esta regra é a camada
+        de runtime (defesa em profundidade, mandato item 4).
+      condition: >
+        spawned_process and container and container.privileged=true
+      output: >
+        Exec em container PRIVILEGIADO (user=%user.name command=%proc.cmdline
+        container=%container.name image=%container.image.repository
+        namespace=%k8s.ns.name pod=%k8s.pod.name)
+      priority: CRITICAL
+      tags: [container, privileged, mandato-item-4]
+
+    - rule: Exec em container privilegiado na celula regulatoria (PCI/AML-KYC)
+      desc: >
+        Mesma condição da regra acima, escopada às células regulatórias
+        (ADR-0004 §F / mandato item 7). PCI/AML-KYC nunca deveriam sequer
+        tentar rodar privilegiado — se acontecer, é falha crítica de
+        conformidade (QSA/AML), prioridade máxima.
+      condition: >
+        spawned_process and container and container.privileged=true
+        and adserver_regulated_cell
+      output: >
+        ALERTA REGULATORIO: exec privilegiado na celula %k8s.ns.name
+        (command=%proc.cmdline container=%container.name
+        image=%container.image.repository pod=%k8s.pod.name)
+      priority: CRITICAL
+      tags: [container, privileged, pci, aml-kyc, compliance, mandato-item-4]
+
+    # Regra 2 — Escrita fora de paths esperados -------------------------
+
+    - rule: Escrita fora dos paths esperados na celula regulatoria
+      desc: >
+        Containers das células PCI/AML-KYC só deveriam escrever nos
+        diretórios efêmeros conhecidos (adserver_allowed_write_dirs) ou no
+        destino do Vault Agent (/vault/secrets — o app só lê de lá, nunca
+        escreve). Qualquer escrita fora desses paths é indício de
+        persistência indevida, exfiltração de dados ou comprometimento do
+        container.
+      condition: >
+        open_write and container and adserver_regulated_cell
+        and not (fd.name startswith /tmp)
+        and not (fd.name startswith /var/tmp)
+        and not (fd.name startswith /vault/secrets)
+        and not (fd.name startswith /app/tmp)
+        and not (fd.name startswith /dev)
+        and not (fd.name startswith /proc)
+      output: >
+        Escrita fora de path esperado na celula %k8s.ns.name (file=%fd.name
+        command=%proc.cmdline container=%container.name pod=%k8s.pod.name)
+      priority: WARNING
+      tags: [filesystem, pci, aml-kyc, mandato-item-4]
+
+    # Regra 3 — Syscalls/binários suspeitos ------------------------------
+
+    - rule: Binario suspeito (shell/rede) executado na celula regulatoria
+      desc: >
+        As imagens de produção (deploy/docker/Dockerfile.go-service,
+        deploy/docker/Dockerfile.copilot) são distroless/slim nonroot sem
+        shell interativo no caminho normal de execução. Um shell (sh/bash)
+        ou ferramenta de rede (nc/curl/wget/socat) spawnado dentro do
+        container nas células regulatórias é forte indício de shell
+        reverso, exfiltração ou movimento lateral.
+      condition: >
+        spawned_process and container and adserver_regulated_cell
+        and proc.name in (adserver_suspicious_binaries)
+      output: >
+        Binario suspeito executado na celula %k8s.ns.name (proc=%proc.name
+        command=%proc.cmdline container=%container.name pod=%k8s.pod.name)
+      priority: CRITICAL
+      tags: [process, shell, pci, aml-kyc, mandato-item-4]
+
+    - rule: Processo associado a cryptomining/malware conhecido
+      desc: >
+        Nomes de binários comumente associados a cryptojacking/malware de
+        container observados em incidentes públicos de supply chain. Foco
+        cluster-wide (não exclusivo das células regulatórias — defesa em
+        profundidade também vale para delivery/ml/data).
+      condition: >
+        spawned_process and container
+        and proc.name in (adserver_malware_process_names)
+      output: >
+        Possivel processo de cryptomining/malware (proc=%proc.name
+        command=%proc.cmdline container=%container.name
+        namespace=%k8s.ns.name pod=%k8s.pod.name)
+      priority: CRITICAL
+      tags: [process, malware, mandato-item-4]
