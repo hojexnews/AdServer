@@ -949,9 +949,64 @@ Verificação de 1ª mão (main loop) via `git diff`/`git status`: árvore com �
 bumpar a versão **deliberadamente** (documentado em comentário no próprio `buf.gen.yaml`); candidato a
 automação via PR (Renovate) mantendo a regeneração de `gen/` acoplada.
 
-> **G0 — progresso:** **4 de 7** itens de código fechados (E6/E10 na 17ª, E5 na 18ª, E11 na 19ª, **E8 na
-> 20ª**). Restam, sem exigir infra: **platform E8** (mandato item 4 — próximo), **frontend E9+E10**
-> (fail-closed + stack §2.5) e **copiloto E12** (higiene de layout).
+### ✅ Entregue na Fase 3 — 21ª onda: **supply chain do mandato item 4 (cosign keyless + SBOM + Trivy + Falco) + `policy-aml-kyc.hcl`** (G0/platform-E8; sob mandato item 4, sem ADR novo; gates verdes)
+
+Fecha o **5º item de código de G0** (platform-infra E8), o próximo após E8-schema (20ª onda). Leva o **item 4
+do mandato de 1/4 → 4/4** controles com código real, sem cloud. Dono `platform-infra-engineer`; verificação
+adversarial `security-reviewer` + `privacy-compliance-auditor` + `tech-lead-architect`. Refs: mandato item 4
+(cosign+SBOM+Kyverno+Trivy+Falco), `§2.7`, `CA-9`.
+
+- **Gap 1 — OpenBao `policy-aml-kyc.hcl`:** existia só como comentário em
+  [openbao-auth.yaml](platform/cells/aml-kyc/secrets/openbao-auth.yaml). Escrito
+  [platform/secrets/openbao/policy-aml-kyc.hcl](platform/secrets/openbao/policy-aml-kyc.hcl) espelhando
+  `policy-pci.hcl`: leitura só de `aml-kyc/data/{sumsub,chainalysis,custody}/*`, DB dinâmico
+  `aml-kyc/db/compliance`, transit `aml-kyc`, ciclo de vida do próprio lease — **nega por omissão** `pci/*`
+  e `platform/*` (isolamento de célula ADR-0004 §F).
+- **Gap 2 — item 4 do mandato (era 1/4, só Kyverno):** novo workflow
+  [.github/workflows/supply-chain.yml](.github/workflows/supply-chain.yml) (matrix dos 5 serviços): build →
+  **SBOM** (syft SPDX+CycloneDX) → **Trivy** (fail em CRITICAL/HIGH, `exit-code 1`, **antes** do push) →
+  push `ghcr.io` → **cosign sign keyless**. Job de PR faz build+scan sem publicar; publish só em tag/release
+  (`id-token: write` só nele). Dockerfiles de produção: [deploy/docker/Dockerfile.go-service](deploy/docker/Dockerfile.go-service)
+  (reusa a receita hermética distroless/nonroot/CGO-free de [deploy/local/Dockerfile](deploy/local/Dockerfile)
+  para os 4 Go) + [deploy/docker/Dockerfile.copilot](deploy/docker/Dockerfile.copilot) (1º do copiloto Python).
+- **cosign real via keyless (não placeholder):** adotado **keyless** (OIDC/Fulcio/Rekor) em vez de gerar par
+  de chaves estático — elimina a superfície de chave privada a versionar/rotacionar (§2.7 "nada estático em
+  git/imagem"). O bloco `publicKeys` com `REPLACE_WITH_COSIGN_PUBLIC_KEY` em
+  [kyverno-baseline.yaml](platform/k8s/policy/kyverno-baseline.yaml) virou um atestador `keyless` (issuer
+  GitHub OIDC + subject do workflow do repo + `rekor.url`). `grep` do placeholder agora **vazio** em todo código/config.
+- **Ruleset Falco:** [platform/observability/falco-rules.yaml](platform/observability/falco-rules.yaml)
+  (ConfigMap `falco-custom-rules`): exec em container privilegiado (geral + reforçado nas células reguladas),
+  escrita fora de paths esperados nas células `pci`/`aml-kyc`, e binários/syscalls suspeitos. O deploy do
+  daemonset é E9 (pós-cluster); o ruleset é código validável hoje.
+
+**Falso-positivo pré-existente corrigido na mesma onda** (descoberto ao verificar o gate do E8): o próprio
+`make platform-validate` estava **vermelho na main** — não por E8, mas por 3 bugs pré-existentes de outras
+ondas. (1) [httproute-webhook.yaml](platform/cells/pci/gateway/httproute-webhook.yaml) e o do Sumsub usavam
+um filtro `type: RequestTimeout` **que não existe** no Gateway API → movido para o campo correto
+`spec.rules[].timeouts.request` (kubeconform passa a validar). (2) `otel-collector.yaml` (config nativa OTel,
+sem `apiVersion`/`kind`) era varrido pelo kubeconform → excluído do `find` em
+[make/platform.mk](make/platform.mk) (é validado por `platform-otel-validate`). (3) As `Policy` **namespaced**
+das células eram **puladas como inválidas** pelo kyverno 1.13.4 (filtro `namespaces` proibido) → removido o
+filtro redundante + JMESPath **null-safe** (`(X || []）[]`) + `label_match` para não errar em Pod sem campo.
+As policies passaram a **carregar e enforçar** (antes não enforçavam nada). **Enforcement provado idêntico**
+via `kyverno apply` (mesmos pods maus reprovados; os que davam `error` viraram `pass`/`fail` correto; totais
+iguais).
+
+**Gates verdes (21ª onda):** **`security-reviewer` PASS** (cosign não é mais placeholder; SBOM+Trivy-fail+cosign
+cobrem supply chain e Falco cobre runtime; nenhum segredo versionado; `policy-aml-kyc.hcl` menor-privilégio;
+**`enforcement_weakened: false`** nas células) + **`privacy-compliance-auditor` PASS** (isolamento de célula,
+0 PII, TX-5/allowlists intactas) + **`tech-lead-architect` PASS** (keyless é config, não infra pesada; mandato
+item 4 genuinamente 4/4; falso-positivo do plano agora verdadeiro). Verificação de 1ª mão (main loop):
+`make platform-validate` genuinamente verde — `platform-tofu-validate` OK, `platform-kubeconform` OK (64
+recursos, 0 inválidos), `platform-kyverno-test` **22/22** (baseline 4 + pci 8 + aml-kyc 10), `platform-otel-validate`
+estrutural OK (semântico pula sem Docker local; CI tem Docker). **Diferido a E9** (honestamente, sem
+falso-fechamento): deploy do daemonset Falco, verificação real do cosign keyless (Fulcio/Rekor via rede) e o
+otel semântico. **Achado não-bloqueante** registrado (pré-existente, não introduzido): `proibir-env-secretkeyref`
+inspeciona só `spec.containers[]`, não `initContainers[]` — candidato a hardening de cobertura.
+
+> **G0 — progresso:** **5 de 7** itens de código fechados (E6/E10 na 17ª, E5 na 18ª, E11 na 19ª, E8-schema na
+> 20ª, **platform E8 na 21ª**). Restam, sem exigir infra: **frontend E9+E10** (fail-closed + stack §2.5 —
+> próximo) e **copiloto E12** (higiene de layout).
 
 ### ⏭️ Pendente da Fase 3
 
