@@ -8,6 +8,12 @@
 #   exigir-vault-agent-aml-kyc        — rejeita Pod sem anotacao vault-agent-inject
 #   proibir-label-delivery-em-aml-kyc — rejeita Pod com label cell=delivery
 #   proibir-label-pci-em-aml-kyc      — rejeita Pod com label cell=pci
+#
+# NOTA: em Policy (namespaced, ao contrario de ClusterPolicy), o kyverno CLI
+# identifica a policy internamente como "<namespace>/<nome>" — por isso o
+# campo "policy:" abaixo usa o prefixo "aml-kyc/". Sem o prefixo, o matching
+# falha com "Not found" e o teste inteiro fica silenciosamente quebrado
+# (falso-positivo: parecia gate verde, mas nunca executava nada).
 apiVersion: cli.kyverno.io/v1alpha1
 kind: Test
 metadata:
@@ -18,64 +24,64 @@ resources:
   - test-resources.yaml
 results:
   # --- proibir-secret-estatico-aml-kyc ---
-  - policy: proibir-secret-estatico-aml-kyc
+  - policy: aml-kyc/proibir-secret-estatico-aml-kyc
     rule: proibir-envfrom-secretref
     resource: pod-aml-secret-envfrom
     kind: Pod
     result: fail
 
-  - policy: proibir-secret-estatico-aml-kyc
+  - policy: aml-kyc/proibir-secret-estatico-aml-kyc
     rule: proibir-env-secretkeyref
     resource: pod-aml-secret-envkeyref
     kind: Pod
     result: fail
 
-  - policy: proibir-secret-estatico-aml-kyc
+  - policy: aml-kyc/proibir-secret-estatico-aml-kyc
     rule: proibir-envfrom-secretref
     resource: pod-aml-vault-agent
     kind: Pod
     result: pass
 
-  - policy: proibir-secret-estatico-aml-kyc
+  - policy: aml-kyc/proibir-secret-estatico-aml-kyc
     rule: proibir-env-secretkeyref
     resource: pod-aml-vault-agent
     kind: Pod
     result: pass
 
   # --- exigir-vault-agent-aml-kyc ---
-  - policy: exigir-vault-agent-aml-kyc
+  - policy: aml-kyc/exigir-vault-agent-aml-kyc
     rule: exigir-vault-agent-inject
     resource: pod-aml-no-vault
     kind: Pod
     result: fail
 
-  - policy: exigir-vault-agent-aml-kyc
+  - policy: aml-kyc/exigir-vault-agent-aml-kyc
     rule: exigir-vault-agent-inject
     resource: pod-aml-vault-agent
     kind: Pod
     result: pass
 
   # --- proibir-label-delivery-em-aml-kyc ---
-  - policy: proibir-label-delivery-em-aml-kyc
+  - policy: aml-kyc/proibir-label-delivery-em-aml-kyc
     rule: proibir-cell-delivery
     resource: pod-aml-label-delivery
     kind: Pod
     result: fail
 
-  - policy: proibir-label-delivery-em-aml-kyc
+  - policy: aml-kyc/proibir-label-delivery-em-aml-kyc
     rule: proibir-cell-delivery
     resource: pod-aml-vault-agent
     kind: Pod
     result: pass
 
   # --- proibir-label-pci-em-aml-kyc ---
-  - policy: proibir-label-pci-em-aml-kyc
+  - policy: aml-kyc/proibir-label-pci-em-aml-kyc
     rule: proibir-cell-pci
     resource: pod-aml-label-pci
     kind: Pod
     result: fail
 
-  - policy: proibir-label-pci-em-aml-kyc
+  - policy: aml-kyc/proibir-label-pci-em-aml-kyc
     rule: proibir-cell-pci
     resource: pod-aml-vault-agent
     kind: Pod

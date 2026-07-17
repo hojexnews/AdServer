@@ -57,14 +57,13 @@ spec:
             type: Exact
             value: /webhooks/stripe
           method: POST
+      # Timeout de request. Em Gateway API v1, o timeout e um campo da regra
+      # (spec.rules[].timeouts.request), NAO um HTTPRouteFilter — nao existe
+      # filtro do tipo RequestTimeout. Webhooks do Stripe tem timeout de 30s
+      # na entrega; processar em async (enfileirar) e responder 200 antes disso.
+      timeouts:
+        request: 25s
       backendRefs:
         - name: payments
           namespace: pci
           port: 8080
-      filters:
-        # Timeout: webhooks do Stripe tem timeout de 30s na entrega.
-        # Processar em async (enfileirar internamente) para responder 200
-        # antes do timeout do Stripe.
-        - type: RequestTimeout
-          requestTimeout:
-            request: 25s

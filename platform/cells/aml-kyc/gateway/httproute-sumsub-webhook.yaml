@@ -62,13 +62,13 @@ spec:
             type: Exact
             value: /webhooks/sumsub
           method: POST
+      # Timeout de request. Em Gateway API v1, o timeout e um campo da regra
+      # (spec.rules[].timeouts.request), NAO um HTTPRouteFilter — nao existe
+      # filtro do tipo RequestTimeout. Enfileirar async e responder 200 antes
+      # de 8s; o Sumsub reentrega se nao receber 200 dentro de 10s.
+      timeouts:
+        request: 8s
       backendRefs:
         - name: payments
           namespace: aml-kyc
           port: 8080
-      filters:
-        # Timeout: enfileirar async e responder 200 antes de 8s.
-        # O Sumsub reentrega se nao receber 200 dentro de 10s.
-        - type: RequestTimeout
-          requestTimeout:
-            request: 8s

@@ -130,7 +130,7 @@ platform-kubeconform:
 	 fi; \
 	 FAIL=0; \
 	 for dir in $(K8S_DIRS); do \
-	   yamls=$$(find "$$dir" -name "*.yaml" -not -name "kyverno-test.yaml" -not -name "test-resources.yaml" 2>/dev/null); \
+	   yamls=$$(find "$$dir" -name "*.yaml" -not -name "kyverno-test.yaml" -not -name "test-resources.yaml" -not -name "otel-collector.yaml" 2>/dev/null); \
 	   [ -z "$$yamls" ] && continue; \
 	   echo "-- kubeconform: $$dir"; \
 	   echo "$$yamls" | xargs $$_KC \

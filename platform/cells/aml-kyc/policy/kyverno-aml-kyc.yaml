@@ -59,7 +59,6 @@ spec:
         any:
           - resources:
               kinds: [Pod]
-              namespaces: [aml-kyc]
       validate:
         message: >
           [AML-KYC TX-3] Proibido envFrom[].secretRef na celula aml-kyc.
@@ -68,10 +67,10 @@ spec:
         deny:
           conditions:
             any:
-              - key: "{{ request.object.spec.containers[].envFrom[].secretRef | length(@) }}"
+              - key: "{{ (request.object.spec.containers || `[]`)[].envFrom[].secretRef | length(@) }}"
                 operator: GreaterThan
                 value: "0"
-              - key: "{{ request.object.spec.initContainers[].envFrom[].secretRef | length(@) }}"
+              - key: "{{ (request.object.spec.initContainers || `[]`)[].envFrom[].secretRef | length(@) }}"
                 operator: GreaterThan
                 value: "0"
 
@@ -80,7 +79,6 @@ spec:
         any:
           - resources:
               kinds: [Pod]
-              namespaces: [aml-kyc]
       validate:
         message: >
           [AML-KYC TX-3] Proibido env[].valueFrom.secretKeyRef na celula aml-kyc.
@@ -88,7 +86,7 @@ spec:
         deny:
           conditions:
             any:
-              - key: "{{ request.object.spec.containers[].env[].valueFrom.secretKeyRef | length(@) }}"
+              - key: "{{ (request.object.spec.containers || `[]`)[].env[].valueFrom.secretKeyRef | length(@) }}"
                 operator: GreaterThan
                 value: "0"
 ---
@@ -118,7 +116,6 @@ spec:
         any:
           - resources:
               kinds: [Pod]
-              namespaces: [aml-kyc]
       validate:
         message: >
           [AML-KYC TX-3] Todo Pod na celula aml-kyc deve ter as anotacoes:
@@ -156,7 +153,6 @@ spec:
         any:
           - resources:
               kinds: [Pod]
-              namespaces: [aml-kyc]
       validate:
         message: >
           [AML-KYC ADR-0004 §F] Pod na celula aml-kyc nao pode ter label
@@ -165,9 +161,9 @@ spec:
         deny:
           conditions:
             any:
-              - key: "{{ request.object.metadata.labels.\"adserver.hojex/cell\" }}"
+              - key: "{{ label_match(`{\"adserver.hojex/cell\":\"delivery\"}`, request.object.metadata.labels || `{}`) }}"
                 operator: Equals
-                value: "delivery"
+                value: true
 ---
 apiVersion: kyverno.io/v1
 kind: Policy
@@ -194,7 +190,6 @@ spec:
         any:
           - resources:
               kinds: [Pod]
-              namespaces: [aml-kyc]
       validate:
         message: >
           [AML-KYC / PCI SAQ-A] Pod na celula aml-kyc nao pode ter label
@@ -203,6 +198,6 @@ spec:
         deny:
           conditions:
             any:
-              - key: "{{ request.object.metadata.labels.\"adserver.hojex/cell\" }}"
+              - key: "{{ label_match(`{\"adserver.hojex/cell\":\"pci\"}`, request.object.metadata.labels || `{}`) }}"
                 operator: Equals
-                value: "pci"
+                value: true

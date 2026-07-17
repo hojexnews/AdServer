@@ -11,6 +11,12 @@
 # Apenas policies de namespace (Policy, nao ClusterPolicy) sao testadas aqui.
 # A baseline ClusterPolicy (verify-image, disallow-latest, require-limits)
 # e testada em platform/k8s/policy/kyverno-test.yaml.
+#
+# NOTA: em Policy (namespaced, ao contrario de ClusterPolicy), o kyverno CLI
+# identifica a policy internamente como "<namespace>/<nome>" — por isso o
+# campo "policy:" abaixo usa o prefixo "pci/". Sem o prefixo, o matching
+# falha com "Not found" e o teste inteiro fica silenciosamente quebrado
+# (falso-positivo: parecia gate verde, mas nunca executava nada).
 apiVersion: cli.kyverno.io/v1alpha1
 kind: Test
 metadata:
@@ -21,51 +27,51 @@ resources:
   - test-resources.yaml
 results:
   # --- proibir-secret-estatico-pci ---
-  - policy: proibir-secret-estatico-pci
+  - policy: pci/proibir-secret-estatico-pci
     rule: proibir-envfrom-secretref
     resource: pod-pci-secret-envfrom
     kind: Pod
     result: fail
 
-  - policy: proibir-secret-estatico-pci
+  - policy: pci/proibir-secret-estatico-pci
     rule: proibir-env-secretkeyref
     resource: pod-pci-secret-envkeyref
     kind: Pod
     result: fail
 
-  - policy: proibir-secret-estatico-pci
+  - policy: pci/proibir-secret-estatico-pci
     rule: proibir-envfrom-secretref
     resource: pod-pci-vault-agent
     kind: Pod
     result: pass
 
-  - policy: proibir-secret-estatico-pci
+  - policy: pci/proibir-secret-estatico-pci
     rule: proibir-env-secretkeyref
     resource: pod-pci-vault-agent
     kind: Pod
     result: pass
 
   # --- exigir-vault-agent-pci ---
-  - policy: exigir-vault-agent-pci
+  - policy: pci/exigir-vault-agent-pci
     rule: exigir-vault-agent-inject
     resource: pod-pci-no-vault
     kind: Pod
     result: fail
 
-  - policy: exigir-vault-agent-pci
+  - policy: pci/exigir-vault-agent-pci
     rule: exigir-vault-agent-inject
     resource: pod-pci-vault-agent
     kind: Pod
     result: pass
 
   # --- proibir-label-delivery-em-pci ---
-  - policy: proibir-label-delivery-em-pci
+  - policy: pci/proibir-label-delivery-em-pci
     rule: proibir-cell-delivery
     resource: pod-pci-label-delivery
     kind: Pod
     result: fail
 
-  - policy: proibir-label-delivery-em-pci
+  - policy: pci/proibir-label-delivery-em-pci
     rule: proibir-cell-delivery
     resource: pod-pci-vault-agent
     kind: Pod
