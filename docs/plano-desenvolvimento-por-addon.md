@@ -1068,6 +1068,43 @@ Fechar 4 desvios reais encontrados nesta varredura entre o código publicado e o
 
 **Subagente:** `frontend-bff-engineer` · **Doc:** `§2.5` · `WCAG 2.2 AA` · `ADR-0003` · **Gate:** tech-lead-architect — triagem de escopo mínimo (não reabrir arquitetura) + web-ci e novo a11y-ci verdes · **Depende de:** E1, E5
 
+> **Progresso sob triagem de escopo mínimo do tech-lead-architect.** Parte 1
+> (versões): Next 15.3.3→16.2.10, React 19.1.0→19.2.7, `eslint.config.mjs`
+> migrado pra flat nativa (Next 16 removeu `next lint`), `watch()` do RHF →
+> `useWatch` (React Compiler). Parte 2 (esta rodada): **a11y-ci fechado SEM
+> Playwright** (decisão do tech-lead — axe-core + `@axe-core/puppeteer` +
+> `puppeteer-core` contra o Chrome do sistema/runner via `executablePath`,
+> nenhum browser baixado) rodando contra uma rota `/a11y-harness` client-only
+> gated por `A11Y_HARNESS=1` (404 em qualquer build sem a env var — nunca
+> pública em produção) que monta os componentes REAIS com props-fixture, sem
+> BFF/tRPC vivo; alvo `make web-a11y`, workflow `.github/workflows/a11y.yml`
+> separado do `web.yml`. Achados do axe remediados cirurgicamente: contraste
+> insuficiente do botão "Aplicar (ciente do aviso)" no `hitl-diff-preview`
+> (`bg-amber-600`→`bg-amber-700`, 3.19:1→passa 4.5:1) e semântica de
+> `<dl>`/`<dt>`/`<dd>` quebrada (`DiffRow`/`MoneyRow` usavam `<span>` solto
+> dentro de `<dl>`, viola WCAG 1.3.1). **Sinalizado, não corrigido:** o
+> `hitl-diff-preview` (`role="dialog" aria-modal="true"`) não implementa
+> focus-trap (Tab/Shift+Tab escapam do diálogo) — axe-core não pega isso
+> (análise estática de DOM, não simula Tab), achado por inspeção manual;
+> como é o modal de aprovação HITL (TX-3/CA-4), fica para o
+> `security-reviewer` avaliar antes de qualquer correção. Alicerce shadcn/ui
+> instalado (`src/lib/utils.ts::cn()` com `clsx`+`tailwind-merge`,
+> `components.json` Base UI + Tailwind v4 CSS-first) sem reescrever os 4
+> componentes estáticos já gate-verdes (só trocou `[...].join(" ")` por
+> `cn(...)` em `status-badge.tsx`/`payment-status-badge.tsx`, zero mudança de
+> markup). **Diferido, fora deste escopo:** Zustand (estado de UI cross-page)
+> e migração de `lib/use-copilot-session.ts` para Vercel AI SDK v5 — nenhum
+> dos dois foi tocado. **Gatilho de reabertura do Zustand:** hoje todo estado
+> do console é page-local (TanStack Query cobre server state, `useState`
+> cobre UI state por página); Zustand só se justifica quando existir estado
+> de UI genuinamente cross-route — o candidato natural é o copiloto embutido
+> contextualmente (E12: `ChatPanel` teria que sobreviver à navegação entre
+> `/campaigns`, `/rules`, `/banners` etc. em vez de resetar por rota). Até
+> E12 disparar (sob gatilho de uso medido, ele mesmo gated por E11/infra
+> real), Zustand permanece fora da árvore de dependências. Vercel AI SDK v5:
+> gatilho de reabertura registrado em `docs/adr/0003-fase-2-sequenciamento-ml-copiloto.md`
+> (seção "Gatilho de reabertura").
+
 ##### E11 · Ativação em produção sob infra real (SESSION_SECRET/OpenBao, FQDNs, cutover) — ⏳ gated
 
 Ligar o console/BFF a segredos e endpoints reais de produção, completando o que o README classifica como pendência de infra (não de código) para fechar a Fase 1/2/3 no que toca este componente.
@@ -1086,6 +1123,7 @@ Evoluir o copiloto de página dedicada (/copilot) para um ponto de entrada conte
 - Instrumentar telemetria de uso da página /copilot standalone (ex.: taxa de sessões que navegam para /copilot vindo de campaigns/rules/banners)
 - Definir o gatilho mensurável: ex. ≥X% das sessões de edição de regra/campanha navegam manualmente para /copilot dentro de Y segundos
 - Sob gatilho confirmado: extrair ChatPanel para um launcher contextual reusável (mesmo componente, novo ponto de montagem), sem duplicar lógica de HITL/SSE
+- Reabre a avaliação de Zustand (diferido em E10): um launcher contextual sobrevivendo à navegação entre /campaigns, /rules, /banners etc. é o primeiro estado de UI genuinamente cross-route do console — até aqui, TanStack Query (server state) + useState local bastam
 
 **Subagente:** `frontend-bff-engineer` · **Doc:** `§2.5` · `ADR-0003 (J5)` · **Gate:** tech-lead-architect — valida o número medido antes de aprovar o investimento de UX (regra de ouro: tecnologia/feature pesada só sob medição) · **Depende de:** E5, E11 · **Bloqueador:** requer tráfego real em produção (E11) para medir o sinal de uso que justifica o investimento — não mensurável em ambiente local/CI
 

@@ -4,6 +4,8 @@
  * WCAG 2.2 AA: não usa apenas cor como diferenciador (texto + ícone).
  */
 
+import { cn } from "@/lib/utils";
+
 interface StatusBadgeProps {
   source: "consolidated" | "live";
   asOf?: string | null;
@@ -14,12 +16,12 @@ export function DataSourceBadge({ source, asOf }: StatusBadgeProps) {
 
   return (
     <span
-      className={[
+      className={cn(
         "inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium",
         isLive
           ? "bg-amber-100 text-amber-800 ring-1 ring-amber-300"
           : "bg-green-100 text-green-800 ring-1 ring-green-300",
-      ].join(" ")}
+      )}
       title={
         isLive
           ? "Dados ao vivo — NÃO faturáveis, podem diferir do consolidado"

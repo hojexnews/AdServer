@@ -150,8 +150,11 @@ export function HitlDiffPreview({
           disabled={busy}
           className={[
             "rounded-md px-4 py-2 text-sm font-semibold",
+            // amber-600/amber-700 com texto branco reprova WCAG 2.2 AA
+            // (contraste ~3.19:1, precisa 4.5:1) — amber-700/amber-800
+            // passa (achado do axe-core, make web-a11y, G0/frontend E10).
             contradictionWarning
-              ? "bg-amber-600 text-white hover:bg-amber-700"
+              ? "bg-amber-700 text-white hover:bg-amber-800"
               : "bg-brand-600 text-white hover:bg-brand-700",
             "focus-visible:ring-2 focus-visible:ring-brand-500",
             "disabled:opacity-50",
@@ -220,13 +223,18 @@ function DiffKindBadge({ kind, action }: { kind: string; action: string }) {
   );
 }
 
+// DiffRow/MoneyRow são filhos diretos de <dl> (ver CampaignDiff etc. abaixo).
+// axe-core (regra "definition-list"/WCAG 1.3.1) exige que <dl> só contenha
+// <dt>/<dd> (opcionalmente agrupados num <div>) — não <span> soltos. O <div>
+// aqui é o agrupamento permitido; <dt>/<dd> preservam a semântica de lista de
+// definição, o layout flex lado-a-lado é preservado via className.
 function DiffRow({ label, value }: { label: string; value: string | undefined | null }) {
   if (value == null) return null;
   return (
     <div className="flex gap-2">
-      <span className="w-32 shrink-0 text-gray-500">{label}:</span>
+      <dt className="w-32 shrink-0 text-gray-500">{label}:</dt>
       {/* Conteúdo escapado pelo React — sem dangerouslySetInnerHTML */}
-      <span className="text-gray-900">{value}</span>
+      <dd className="m-0 text-gray-900">{value}</dd>
     </div>
   );
 }
@@ -236,8 +244,8 @@ function MoneyRow({ label, money }: { label: string; money: MoneyWire | null | u
   // TX-2: formata a partir de string DECIMAL, nunca de Number
   return (
     <div className="flex gap-2">
-      <span className="w-32 shrink-0 text-gray-500">{label}:</span>
-      <span className="text-gray-900">{formatMoney(money)}</span>
+      <dt className="w-32 shrink-0 text-gray-500">{label}:</dt>
+      <dd className="m-0 text-gray-900">{formatMoney(money)}</dd>
     </div>
   );
 }

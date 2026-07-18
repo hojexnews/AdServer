@@ -385,6 +385,23 @@ ou poda/INT8 do modelo) — com o número medido anexado ao ADR sucessor. Não s
 amplia o budget total da decisão por aspiração; ou o modelo cabe, ou a Fase 2 serve
 um modelo mais barato, ou degrada para a cascata (fail-open) com mais frequência.
 
+**Gatilho específico de J5/frontend — Vercel AI SDK v5 (registrado no G0/frontend
+E10, dívida verificada e diferida).** O mandato §2.5 do addon front/BFF prescreve
+Vercel AI SDK v5 para o copiloto na UI; `lib/use-copilot-session.ts` implementa o
+mesmo contrato (streaming SSE + tool-calling + HITL obrigatório) com um parser SSE
+bespoke (`EventSource` + `parseSseEvent` via Zod, ver `lib/copilot-schemas.ts`)
+que já está em produção-de-código, gate-verde (`security-reviewer` PASS: IDOR
+cross-tenant fechado, tenant só server-side, CSRF no BFF). A migração para o SDK
+não foi feita nesta rodada — permanece **diferida**, e só deve ser reaberta sob
+**capacidade medida que o parser bespoke não sirva** (ex.: necessidade real de
+tool-calling multi-step tipado que o parser atual não cobre sem reescrita
+equivalente, ou custo de manutenção comprovado do parser hand-rolled vs. adotar o
+SDK). Reabertura exige um **ADR sucessor** que: (a) apresente o número/sintoma
+medido que motivou a reabertura; (b) re-valide isolamento de tenant e o contrato
+HITL (nenhuma escrita sem aprovação humana) contra a superfície nova do SDK antes
+do merge — `security-reviewer` gate obrigatório, mesmo padrão exigido de J5
+originalmente. Dono: `frontend-bff-engineer`.
+
 ## Alternativas consideradas
 
 - **ML como seletor de estrato (re-rank cross-cascata).** Rejeitada categoricamente:

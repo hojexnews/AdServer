@@ -1,0 +1,51 @@
+# a11y (WCAG 2.2 AA) — gate mecânico de acessibilidade do console.
+#
+# Materializa o alvo `make web-a11y` (G0/frontend E10): axe-core injetado via
+# @axe-core/puppeteer + puppeteer-core contra o Chrome JÁ INSTALADO no runner
+# (nenhum download de browser — puppeteer-core nunca baixa Chromium; ver
+# web/console/scripts/a11y-check.test.ts). Audita a rota /a11y-harness
+# (client-only, props-fixture, gated por A11Y_HARNESS=1 — nunca acessível em
+# produção real) contra as tags wcag2a/wcag2aa/wcag21a/wcag21aa/wcag22aa.
+#
+# Separado do workflow `web.yml` (make web-ci) de propósito: builda o Next.js
+# e sobe um browser real — mais lento que typecheck+lint+test, não deve
+# bloquear feedback rápido de PR.
+name: a11y (WCAG 2.2 AA)
+
+on:
+  pull_request:
+    paths:
+      - "web/console/**"
+      - "make/web.mk"
+      - ".github/workflows/a11y.yml"
+  push:
+    branches: [main]
+    paths:
+      - "web/console/**"
+      - "make/web.mk"
+      - ".github/workflows/a11y.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  a11y:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: install deps
+        run: make web-install
+      - name: resolve chrome do runner (sem download de browser)
+        run: |
+          CHROME_BIN="$(command -v google-chrome-stable || command -v google-chrome || command -v chromium-browser || command -v chromium || true)"
+          if [ -z "$CHROME_BIN" ]; then
+            echo "::error::Chrome/Chromium não encontrado no runner — verifique a imagem do runner (ubuntu-latest deveria trazer google-chrome-stable pré-instalado)." >&2
+            exit 1
+          fi
+          echo "Usando Chrome em: $CHROME_BIN"
+          echo "CHROME_PATH=$CHROME_BIN" >> "$GITHUB_ENV"
+      - name: a11y (make web-a11y — axe-core WCAG 2.2 AA)
+        run: make web-a11y

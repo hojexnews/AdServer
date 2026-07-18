@@ -6,6 +6,8 @@
  * Rail: fiat_stripe | fiat_asaas | fiat_mp | crypto_safe — espelha proto K4/K5.
  */
 
+import { cn } from "@/lib/utils";
+
 type PaymentStatus = "pending" | "posted" | "void";
 type PaymentRail = "fiat_stripe" | "fiat_asaas" | "fiat_mp" | "crypto_safe";
 
@@ -47,13 +49,11 @@ export function PaymentStatusBadge({
 
   return (
     <span
-      className={[
+      className={cn(
         "inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium",
         config.classes,
-        className ?? "",
-      ]
-        .join(" ")
-        .trim()}
+        className,
+      )}
       aria-label={config.ariaLabel}
     >
       {config.label}
@@ -104,13 +104,11 @@ export function PaymentRailBadge({
 
   return (
     <span
-      className={[
+      className={cn(
         "inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium",
         config.classes,
-        className ?? "",
-      ]
-        .join(" ")
-        .trim()}
+        className,
+      )}
       aria-label={config.ariaLabel}
     >
       {config.label}
