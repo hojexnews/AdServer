@@ -327,7 +327,9 @@ func TestCA3_DestURL_ServerSideBinding_TamperRejected(t *testing.T) {
 // Cross-reference gate: the CA-3 serving behaviours that live ONLY in collector
 // package main (buildAdTagJS image/HTML5 branches + /lg pixel, buildVAST4,
 // validateDestURL) cannot be imported here. This gate NAMES the co-located
-// collector tests that cover them so a rename fails CI — the same documentation
+// collector tests that cover them as a MANUALLY-MAINTAINED cross-reference — it
+// does NOT mechanically fail on a rename (the named tests are enforced by
+// `make go-test ./...`; keep this list in sync by hand). Same documentation
 // contract pattern as TestCA6_CollectorTestSuite_CrossRef.
 // ---------------------------------------------------------------------------
 

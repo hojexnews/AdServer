@@ -444,10 +444,14 @@ func TestCA6_VAST_NoVPAID(t *testing.T) {
 // At unit level, we verify the counting semantics: requests are counted at
 // /asyncjs, impressions at /lg — the difference is the deficit.
 //
-// We test the math here; the SQL view is tested in data/clickhouse/tests/.
+// We document the counting contract here (requests at /asyncjs, impressions at
+// /lg). The SQL live view (005_live_view.sql, inventory_loss = requests -
+// impressions) is NOT yet covered by a SQL test — deferred to G1 (ClickHouse
+// infra); do not treat this test as proof of the view.
 // ---------------------------------------------------------------------------
 
-// TestCA6_RequestMinusImpression_Metric documents the counting semantics.
+// TestCA6_RequestMinusImpression_Metric documents the counting semantics
+// (constant-fold contract marker; the enforceable sign lives in the G1 SQL test).
 func TestCA6_RequestMinusImpression_Metric(t *testing.T) {
 	// Simulate 3 ad requests and 2 impression pixels loaded.
 	// Request-Impression gap = 1 (one request that did not render a pixel).
@@ -476,7 +480,9 @@ func TestCA6_RequestMinusImpression_Metric(t *testing.T) {
 // TestCA6_CollectorTestSuite_CrossRef asserts that the collector test suite
 // (services/collector/cmd/collector/main_test.go) covers the CA-6 invariants
 // by naming the key tests. This test is a documentation contract, not
-// a re-implementation — it fails if the cross-referenced tests are renamed.
+// a re-implementation. It is MANUALLY MAINTAINED: it does NOT mechanically
+// detect renames — the named tests are enforced by `make go-test ./...` and
+// this list must be kept in sync by hand.
 //
 // The named tests must remain GREEN in CI as a CA-6 gate condition.
 func TestCA6_CollectorTestSuite_CrossRef(t *testing.T) {

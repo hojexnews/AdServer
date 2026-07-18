@@ -12,6 +12,7 @@ import (
 
 	decisionv1 "github.com/hojex/adserver/gen/go/adserver/decision/v1"
 	"github.com/hojex/adserver/internal/cascade"
+	mlranker "github.com/hojex/adserver/internal/ranker"
 	"github.com/hojex/adserver/internal/rules"
 	"github.com/hojex/adserver/internal/snapshot"
 	moneyv1 "github.com/hojex/adserver/gen/go/adserver/money/v1"
@@ -76,17 +77,42 @@ func buildTestSnap(tier snapshot.Tier) *snapshot.Snapshot {
 	return s
 }
 
-func newTestDecisionHandler(snap *snapshot.Snapshot, sink DecisionSink) *decisionHandler {
+// testHandlerOption configures optional fields on the *decisionHandler built
+// by newTestDecisionHandler, applied AFTER the base struct literal.  This
+// keeps newTestDecisionHandler(snap, sink) backward-compatible (zero-value
+// abRouter/banditML/etc, exactly as before) for every pre-existing caller,
+// while letting new tests opt in to J4 A/B wiring without duplicating the
+// handler construction boilerplate.
+type testHandlerOption func(*decisionHandler)
+
+// withTestABRouter wires an ABRouter + banditML into the test handler, the
+// same two fields main() wires at boot when AB_ENABLED=true (see main.go's
+// mux.Handle("POST /v1/decide", ...) literal). This is what lets a test
+// actually drive the h.abRouter != nil branch inside ServeHTTP's per-request
+// ranker-selection switch — no test in this package did this before (see
+// TestJ4_ABSwitch_* below).
+func withTestABRouter(router *mlranker.ABRouter, banditML *mlranker.MLRanker) testHandlerOption {
+	return func(h *decisionHandler) {
+		h.abRouter = router
+		h.banditML = banditML
+	}
+}
+
+func newTestDecisionHandler(snap *snapshot.Snapshot, sink DecisionSink, opts ...testHandlerOption) *decisionHandler {
 	store := snapshot.NewStore(snap)
 	rulesEngine := rules.New()
 	eng := cascade.New(rulesEngine)
-	return &decisionHandler{
+	h := &decisionHandler{
 		snap:        store,
 		cascade:     eng,
 		sink:        sink,
 		logger:      nil,
 		clickSigner: nil, // no click tokens in these unit tests
 	}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
 }
 
 func decideRequest(zoneID string) *http.Request {
@@ -386,5 +412,168 @@ func TestJ0_DecisionEmittedWithinDeadline(t *testing.T) {
 	}
 	if rr.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d", rr.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// J4: A/B routing switch — handler-level coverage (audit fix)
+//
+// Prior to these tests, NOTHING in this repository constructed a
+// *decisionHandler with a non-nil abRouter/banditML and drove it through
+// ServeHTTP. tests/parity/ab_parity_test.go exercises the ranker package's
+// cascade + MLRanker wiring directly (cascade.WithRanker), which never
+// touches the actual "inTreatment = !d.IsControl()" branch in ServeHTTP
+// (main.go, decisionHandler.ServeHTTP, the per-request ranker-selection
+// switch). newTestDecisionHandler's only constructor never set abRouter, so
+// h.abRouter was always nil in every prior test in this package — the `case
+// h.abRouter != nil && inTreatment && h.banditML != nil:` /
+// `case h.abRouter != nil:` arms of that switch were dead code as far as the
+// test suite was concerned.
+//
+// These two tests close that gap: they build a real *decisionHandler with
+// abRouter/banditML wired (via the new withTestABRouter option) and drive it
+// through the actual HTTP entry point (ServeHTTP), then inspect the Decision
+// the handler emits to the sink (the ONLY place Propensity/ExplorationPolicy/
+// MlFailOpen are observable — DecideResponse, the JSON body, does not carry
+// them).
+//
+// Mutation-tested (go test -overlay, tree untouched): flipping
+// "inTreatment = !d.IsControl()" to "inTreatment = d.IsControl()" turns both
+// tests red. See the audit note in this comment block's sibling commit for
+// the exact go test invocations and exit codes.
+// ---------------------------------------------------------------------------
+
+// TestJ4_ABSwitch_AllControl_MatchesCascadePure drives decisionHandler.ServeHTTP
+// with an ABRouter configured for 100% control (TreatmentBuckets: 0) and a
+// banditML pointing at a socket that does not exist. If the ranker-selection
+// switch ever mis-routes this all-control config into the treatment branch,
+// banditML.Rank is invoked, dials the nonexistent socket, and fails open —
+// which is externally observable via MlFailOpen flipping to true. That is
+// the assertion this test relies on to be non-tautological (see mutation
+// note above): the other invariants (propensity/model_version/policy/tier)
+// are unfortunately ALSO satisfied by the fail-open path (fail-open returns
+// the unmodified candidate order and leaves propensity/policy at their
+// pre-switch defaults), so MlFailOpen is the one field that actually
+// distinguishes "control never called ML" from "treatment called ML and
+// failed open".
+func TestJ4_ABSwitch_AllControl_MatchesCascadePure(t *testing.T) {
+	snap := buildTestSnap(snapshot.TierRemnant)
+
+	// Pure-cascade baseline: a handler with NO abRouter/banditML at all (the
+	// same construction every other test in this file already uses).
+	pureSink := &captureSink{}
+	pureHandler := newTestDecisionHandler(snap, pureSink)
+	pureRR := httptest.NewRecorder()
+	pureHandler.ServeHTTP(pureRR, decideRequest("z1"))
+	pureDecision := pureSink.last()
+	if pureDecision == nil {
+		t.Fatal("pure cascade baseline: no Decision emitted")
+	}
+
+	// AB handler: 100% control + a banditML wired to a socket that will
+	// never exist in a test environment (no infra, deterministic fail-open
+	// if — and only if — it is ever called).
+	router := mlranker.NewABRouter(mlranker.ABConfig{TreatmentBuckets: 0})
+	banditML := mlranker.New("/tmp/nonexistent-j4-allcontrol.sock", 5*time.Millisecond, nil)
+	sink := &captureSink{}
+	h := newTestDecisionHandler(snap, sink, withTestABRouter(router, banditML))
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, decideRequest("z1"))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	d := sink.last()
+	if d == nil {
+		t.Fatal("no Decision emitted")
+	}
+
+	if d.GetPropensity() != 1.0 {
+		t.Errorf("control: Propensity = %v, want 1.0", d.GetPropensity())
+	}
+	if d.GetEnvelope().GetModelVersion() != "" {
+		t.Errorf("control: Envelope.ModelVersion = %q, want \"\"", d.GetEnvelope().GetModelVersion())
+	}
+	wantPolicy := decisionv1.ExplorationPolicy_EXPLORATION_POLICY_DETERMINISTIC
+	if d.GetExplorationPolicy() != wantPolicy {
+		t.Errorf("control: ExplorationPolicy = %v, want DETERMINISTIC", d.GetExplorationPolicy())
+	}
+	// THE non-tautological assertion (see func doc): control must never
+	// attempt an ML call. If the switch mis-routes control traffic into the
+	// treatment arm, banditML dials the nonexistent socket and fails open,
+	// which flips MlFailOpen to true.
+	if d.GetMlFailOpen() {
+		t.Error("control: MlFailOpen = true, want false — ML must NOT be attempted on the control arm " +
+			"(if this fired, the A/B switch routed control traffic into the treatment branch)")
+	}
+	if d.GetCampaignId() != pureDecision.GetCampaignId() {
+		t.Errorf("control: campaign_id = %q, want cascade-pure %q", d.GetCampaignId(), pureDecision.GetCampaignId())
+	}
+	if d.GetServedTier() != pureDecision.GetServedTier() {
+		t.Errorf("control: served_tier = %v, want cascade-pure %v", d.GetServedTier(), pureDecision.GetServedTier())
+	}
+}
+
+// TestJ4_ABSwitch_AllTreatment_PreservesTierAndFailsOpen drives
+// decisionHandler.ServeHTTP with an ABRouter configured for 100% treatment
+// (TreatmentBuckets: mlranker.NumBuckets) and a banditML pointing at a
+// nonexistent socket — a deterministic fail-open with no live sidecar
+// required (this test has no network/infra dependency, per TX-4 fail-open
+// semantics). It is the companion to
+// TestJ4_ABSwitch_AllControl_MatchesCascadePure: together they bracket the
+// A/B switch from both sides.
+//
+// Non-tautological assertion: MlFailOpen must be true, because the
+// treatment arm DOES attempt the ML call (and, with no sidecar present,
+// fails open). If the switch mis-routes all-treatment config into the
+// control branch, banditML.Rank is never invoked and MlFailOpen stays false
+// — this flips under the same mutation described in the sibling test's doc.
+//
+// DA-3 is also checked directly: even though this is the treatment arm, the
+// served tier/campaign must be IDENTICAL to the pure cascade order, because
+// fail-open returns candidates unmodified (no live model to re-rank with).
+func TestJ4_ABSwitch_AllTreatment_PreservesTierAndFailsOpen(t *testing.T) {
+	snap := buildTestSnap(snapshot.TierRemnant)
+
+	pureSink := &captureSink{}
+	pureHandler := newTestDecisionHandler(snap, pureSink)
+	pureRR := httptest.NewRecorder()
+	pureHandler.ServeHTTP(pureRR, decideRequest("z1"))
+	pureDecision := pureSink.last()
+	if pureDecision == nil {
+		t.Fatal("pure cascade baseline: no Decision emitted")
+	}
+
+	router := mlranker.NewABRouter(mlranker.ABConfig{TreatmentBuckets: mlranker.NumBuckets})
+	banditML := mlranker.New("/tmp/nonexistent-j4-alltreatment.sock", 5*time.Millisecond, nil)
+	sink := &captureSink{}
+	h := newTestDecisionHandler(snap, sink, withTestABRouter(router, banditML))
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, decideRequest("z1"))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	d := sink.last()
+	if d == nil {
+		t.Fatal("no Decision emitted")
+	}
+
+	// THE non-tautological assertion (see func doc): treatment must attempt
+	// the ML call. With no sidecar present it fails open, so MlFailOpen must
+	// be true — the mirror image of the control test's assertion.
+	if !d.GetMlFailOpen() {
+		t.Error("treatment: MlFailOpen = false, want true — ML must be attempted on the treatment arm " +
+			"(if this fired, the A/B switch routed treatment traffic into the control branch)")
+	}
+	// DA-3: fail-open degrades treatment to the cascade pure order — tier and
+	// campaign must be unchanged, never blank, never a different stratum.
+	if d.GetServedTier() != pureDecision.GetServedTier() {
+		t.Errorf("treatment: served_tier = %v, want cascade-pure %v (DA-3)", d.GetServedTier(), pureDecision.GetServedTier())
+	}
+	if d.GetCampaignId() != pureDecision.GetCampaignId() {
+		t.Errorf("treatment: campaign_id = %q, want cascade-pure %q", d.GetCampaignId(), pureDecision.GetCampaignId())
 	}
 }

@@ -265,9 +265,11 @@ describe("PostgresPaymentsAdapter — sem segredos/PII nos campos públicos (DA-
 // Garante:
 //   (a) toda operação emite BEGIN, SET LOCAL adserver.tenant_id na MESMA conexão
 //       ANTES do SELECT, e COMMIT ao final (ou ROLLBACK no erro).
-//   (b) uma consulta de tenant A não retorna linhas de tenant B
-//       (simulado via mock: o WHERE usa current_setting que retornaria vazio
-//       se SET LOCAL fosse fora de transação).
+//   (b) set_config('adserver.tenant_id', ...) é chamado com o tenant_id correto
+//       e DISTINTO por adapter (o que habilita a RLS no Postgres real).
+//       NOTA: o mock retorna linhas CONSTANTES — NÃO modela current_setting/WHERE,
+//       logo NÃO prova isolamento por si só. A prova autoritativa de isolamento RLS
+//       é db/ledger/tests/rls_isolation_test.sql (Postgres real, TX-3/DA-11).
 //
 // Espelha o guard de DSN de in-memory-payments.test.ts:147 — sem banco real.
 // ---------------------------------------------------------------------------
@@ -475,9 +477,10 @@ describe("Fix-3 (LOW-1): isolamento por tenant — transação + set_config (CRI
     expect(poolCWithCalls._connectCalls.length).toBe(1);
   });
 
-  test("isolamento cross-tenant: tenant B não recebe linhas de tenant A (mock de filtragem RLS)", async () => {
-    // Simula: tenant A tem dados, mas o mock retorna [] para tenant B
-    // (como a RLS faria quando current_setting retorna o tenant_id do SET LOCAL).
+  test("set_config(adserver.tenant_id) é chamado com o tenant_id correto e distinto por adapter (habilita RLS; isolamento real provado em db/ledger/tests/rls_isolation_test.sql)", async () => {
+    // O mock de A retorna uma linha (constante de setup); o de B usa o default [].
+    // Isto NÃO modela current_setting/WHERE — a asserção real deste teste é a
+    // propagação do tenant_id via set_config (linhas abaixo), não o filtro RLS.
     const tenantAId = "aaaaaaaa-0000-0000-0000-000000000000";
     const tenantBId = "bbbbbbbb-0000-0000-0000-000000000000";
 
@@ -505,7 +508,7 @@ describe("Fix-3 (LOW-1): isolamento por tenant — transação + set_config (CRI
     const poolA = makeMockPool(clientA);
     const adapterA = new PostgresPaymentsAdapter(poolA);
 
-    // Adapter para tenant B — mock retorna [] (sem linhas — RLS filtra)
+    // Adapter para tenant B — mock default retorna [] (constante de setup, NÃO RLS)
     const { client: clientB, queries: queriesB } = makeMockClient();
     const poolB = makeMockPool(clientB);
     const adapterB = new PostgresPaymentsAdapter(poolB);
@@ -513,12 +516,12 @@ describe("Fix-3 (LOW-1): isolamento por tenant — transação + set_config (CRI
     const balancesA = await adapterA.getBalances(tenantAId);
     const balancesB = await adapterB.getBalances(tenantBId);
 
-    // Tenant A tem saldo (mock retornou linha)
+    // Tenant A tem saldo (mock retornou linha constante de setup)
     expect(balancesA.length).toBe(1);
-    // Tenant B não tem saldo (mock retornou [] — RLS bloqueou)
+    // Tenant B sem saldo (mock default [] — constante de setup, NÃO prova de RLS)
     expect(balancesB.length).toBe(0);
 
-    // set_config foi chamado com o tenantId correto para cada adapter
+    // ASSERÇÃO REAL: set_config foi chamado com o tenantId correto/distinto por adapter
     const setConfigA = queriesA.find((q) => q.text.includes("set_config"));
     const setConfigB = queriesB.find((q) => q.text.includes("set_config"));
     expect(setConfigA !== undefined && "values" in setConfigA ? setConfigA.values : undefined).toEqual([tenantAId]);
