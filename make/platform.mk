@@ -185,9 +185,11 @@ platform-kyverno-test:
 # pela mesma distro que os executa em producao — prevenindo falsa cobertura
 # de um kubeconform que ignora a config nativa (sem apiVersion/kind).
 #
-# Alem da validacao semantica, verifica estruturalmente:
-#   1. Os pipelines traces e logs contem transform/redact-pii (redacao por chave).
-#   2. Os pipelines traces e logs contem redaction/allowlist-* (fail-closed).
+# Alem da validacao semantica, verifica estruturalmente (MEMBRESIA no pipeline,
+# nao mera presenca no arquivo — um processador definido mas nao cabeado na lista
+# service.pipelines.<p>.processors seria fail-open silencioso):
+#   1. traces.processors e logs.processors contem transform/redact-pii (redacao por chave).
+#   2. traces.processors contem redaction/allowlist-traces; logs.processors, allowlist-logs (fail-closed).
 #   3. Nenhum pipeline usa allow_all_keys: true (abre a allowlist — quebra TX-5).
 #
 # FIX (11a onda): o "docker run" injeta as tres env-vars de endpoint com valores
@@ -206,13 +208,14 @@ platform-otel-validate:
 	@set -e; \
 	 CONFIG="$(OTEL_CONFIG)"; \
 	 FAIL=0; \
-	 echo "-- otel: verificando presenca dos processadores de redacao de PII nos pipelines..."; \
-	 grep -q "transform/redact-pii" "$$CONFIG" || { \
-	   echo "ERRO TX-5: transform/redact-pii ausente em $$CONFIG"; FAIL=1; }; \
-	 grep -q "redaction/allowlist-traces" "$$CONFIG" || { \
-	   echo "ERRO TX-5: redaction/allowlist-traces ausente em $$CONFIG"; FAIL=1; }; \
-	 grep -q "redaction/allowlist-logs" "$$CONFIG" || { \
-	   echo "ERRO TX-5: redaction/allowlist-logs ausente em $$CONFIG"; FAIL=1; }; \
+	 echo "-- otel: verificando MEMBRESIA dos processadores de redacao nos pipelines traces+logs (TX-5)..."; \
+	 for pl in "traces:redaction/allowlist-traces" "logs:redaction/allowlist-logs"; do \
+	   p="$${pl%%:*}"; al="$${pl##*:}"; \
+	   line=$$(awk -v pipe="$$p" '/^  pipelines:/{inpipe=1;next} inpipe&&/^  [a-zA-Z]/&&!/^    /{inpipe=0} inpipe&&/^    [a-zA-Z0-9_\/-]+:/{cur=$$1;sub(/:.*/,"",cur)} inpipe&&cur==pipe&&/^      processors:/{print;exit}' "$$CONFIG"); \
+	   [ -n "$$line" ] || { echo "ERRO TX-5: pipeline $$p sem linha .processors em $$CONFIG"; FAIL=1; }; \
+	   case "$$line" in *transform/redact-pii*) :;; *) echo "ERRO TX-5: pipeline $$p sem transform/redact-pii na lista .processors (nao apenas definido no arquivo)"; FAIL=1;; esac; \
+	   case "$$line" in *"$$al"*) :;; *) echo "ERRO TX-5: pipeline $$p sem $$al na lista .processors"; FAIL=1;; esac; \
+	 done; \
 	 if grep -q "allow_all_keys:[[:space:]]*true" "$$CONFIG"; then \
 	   echo "ERRO TX-5: allow_all_keys: true detectado em $$CONFIG — fail-closed violado; altere para false"; \
 	   FAIL=1; \

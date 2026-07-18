@@ -61,9 +61,13 @@ SKIP_TYPES = {
 # Cobre snake_case e variantes: amount, price, cpm, cpc, cpa, bid, budget,
 # revenue, cost, minor_units, money (e plurais/compostos comuns).
 # Float de feature ML (feature_vec, X_train, score, deficit, etc.) NAO casa.
+# Fronteiras via lookaround (nao \b): \b trata '_' como caractere de palavra, entao
+# '\bcost\b' NAO casa 'total_cost' (falso-negativo TX-2). Os lookarounds abaixo tratam
+# '_' e alfanumericos como delimitadores -> pega composicoes snake_case (total_cost,
+# ad_revenue, cost_minor_units) sem casar features ML (costume, pricey, bidirectional).
 MONEY_NAMES = re.compile(
-    r'\b(?:amount|price|cpm|cpc|cpa|bid|budget|revenue|cost|minor_units?|money'
-    r'|spend|payout|charge|rate_money|billing_amount)\b',
+    r'(?<![A-Za-z0-9])(?:amount|price|cpm|cpc|cpa|bid|budget|revenue|cost|minor_units?|money'
+    r'|spend|payout|charge|rate_money|billing_amount)(?![A-Za-z0-9])',
     re.IGNORECASE,
 )
 

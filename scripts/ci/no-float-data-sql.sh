@@ -27,8 +27,10 @@ check_sql_no_monetary_float() {
     #
     # Estrategia: grep por padrao 'word Float(32|64)' excluindo comentarios.
     local hits
+    # Vocabulario monetario ampliado (espelha scripts/ci/no-float-py.sh) — antes so
+    # (value|amount|rate|decimal), o que deixava 'revenue/cost/budget/... Float64' escapar (TX-2).
     hits=$(grep -inE '^\s+[a-z_][a-z0-9_]*\s+Float(32|64)' "$f" \
-           | grep -iE '(value|amount|rate|decimal)' \
+           | grep -iE '(value|amount|rate|decimal|revenue|cost|budget|price|cpm|cpc|cpa|bid|spend|payout|charge|billing|money|minor_units)' \
            | grep -vE 'propensity|score|epsilon|pct|probability' \
            || true)
     if [ -n "$hits" ]; then

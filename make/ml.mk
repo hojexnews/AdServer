@@ -46,14 +46,10 @@ ml-training-test:
 	PYTHONPATH=. $(PYTEST_ML) ml/training/ -v
 
 ## ml-calibration-test: calibracao isotonica (sem dados reais — usa sinteticos).
-## exit 5 = pytest "no tests collected" -> OK; qualquer outro exit != 0 = falha real -> propaga.
+## Cobertura real em ml/calibration/test_calibrate.py (compute_ece/fit/apply/save/run).
+## NAO mascarar exit 5: pytest "no tests collected" e FALHA (suite apagada = regressao).
 ml-calibration-test:
-	@PYTHONPATH=. $(PYTEST_ML) ml/calibration/ -v; rc=$$?; \
-	if [ $$rc -eq 0 ] || [ $$rc -eq 5 ]; then \
-		echo "[ml-calibration-test] OK (rc=$$rc)"; \
-	else \
-		echo "[ml-calibration-test] FALHOU (rc=$$rc)"; exit $$rc; \
-	fi
+	PYTHONPATH=. $(PYTEST_ML) ml/calibration/ -v
 
 ## ml-promote-test: gate de promocao J4 (recusa sem uplift; aceita com uplift valido)
 ## INVARIANTE: deve ser verde antes de ativar AB_ENABLED=true em producao.
