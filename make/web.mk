@@ -16,7 +16,7 @@ web-typecheck:
 web-build:
 	cd $(WEB_DIR) && npm run build
 
-## web-lint: next lint (max-warnings 0)
+## web-lint: eslint --max-warnings 0 (o Next 16 removeu `next lint`; flat config nativa)
 web-lint:
 	cd $(WEB_DIR) && npm run lint
 

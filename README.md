@@ -1052,6 +1052,43 @@ addon front/BFF E9). Dono `frontend-bff-engineer`; gate adversarial obrigatório
 > (alinhamento de stack §2.5: Next 16/React 19.2/shadcn/Zustand/Vercel AI SDK v5/a11y CI — **próximo**) e
 > **copiloto E12** (higiene de layout).
 
+### ✅ Entregue na Fase 3 — 23ª onda: **os 2 últimos itens de G0 (copiloto E12 + frontend E10) — G0 CÓDIGO-COMPLETO (7/7)** (sob triagem de escopo mínimo do tech-lead; gates verdes; mergeado na `main`)
+
+Fecha o **G0** (Onda de Ativação de Go-Live). Dois itens em 3 commits + o focus-trap; depois **FF direto para a `main`** (`d60cd34`→`b4cb624`), com o CI substituído por verificação local de 1ª mão (o PR #1 era cross-fork/stale e não pôde ser atualizado — ver [[git-remote-push]]).
+
+- **Copiloto E12 (`e3aca4c`)** — higiene de layout: os diretórios `services/copilot/guardrails/` e `rag/` eram
+  **scaffolding VAZIO** (0 arquivos, nunca versionados) e os globs `guardrails*`/`rag*` no
+  `[tool.setuptools.packages.find]` não casavam pacote nenhum (a funcionalidade real de guardrails/RAG vive em
+  [graph/nodes.py](services/copilot/graph/nodes.py) · [tools/gateway.py](services/copilot/tools/gateway.py) · `app/*`).
+  Removidos + `rmdir`. `find_packages`=`['app','graph','observability','tools']`; `make copilot-test` **126 passed**.
+- **Frontend E10 (`f109767` + `18a02fe` + `b0cc569`)** — alinhamento ao mandato §2.5, sob triagem de **escopo
+  mínimo** do `tech-lead-architect` (não reabrir arquitetura):
+  - **Versões:** Next 15.3.3→**16.2.10**, React 19.1.0→**19.2.7**, `eslint-config-next` 16. O Next 16 **removeu
+    `next lint`** → script migrado p/ `eslint` direto + `eslint.config.mjs` p/ a flat config nativa
+    (`eslint-config-next/core-web-vitals`; `FlatCompat.extends` quebra com "circular structure"). React Compiler
+    → `watch()`→`useWatch()` em [banners](web/console/src/app/banners/page.tsx)/[campaigns](web/console/src/app/campaigns/page.tsx).
+    `next build` (16 rotas) verde.
+  - **a11y-ci mecânico WCAG 2.2 AA — SEM Playwright:** axe-core + `@axe-core/puppeteer` + `puppeteer-core`
+    contra o **Chrome do sistema** via `executablePath` (nenhum browser baixado; `overrides` puppeteer→puppeteer-core).
+    Rota [/a11y-harness](web/console/src/app/a11y-harness/page.tsx) client-only, gated por `A11Y_HARNESS=1`
+    (404 em qualquer build de produção). Alvo `make web-a11y` + workflow [a11y.yml](.github/workflows/a11y.yml).
+  - **Alicerce shadcn** (`cn` util + `components.json`), **zero reescrita** dos 4 componentes estáticos gate-verdes.
+  - **Diferidos com gatilho documentado** (regra de ouro): Zustand (gatilho = E12, sem estado cross-route real
+    hoje) e Vercel AI SDK v5 (gatilho de reabertura anexado ao ADR-0003 — o SSE/HITL bespoke já passou no security gate).
+- **Focus-trap do modal HITL (`b4cb624`)** — o `hitl-diff-preview` (`aria-modal="true"`) não implementava
+  focus-trap (Tab escapava); adicionado (ciclo Tab/Shift+Tab no diálogo; Escape sai; restauração de foco SC 2.4.3),
+  com **verificação mecânica** no a11y-ci (puppeteer simula Tab e afirma que o foco fica no diálogo). Corrige o
+  achado que a E10 parte 2 havia **sinalizado, não corrigido**. + 2 achados do axe remediados na E10 (contraste
+  do botão HITL amber-600→700; `<dl>` sem `<dt>/<dd>`).
+
+**Gates (1ª mão):** `tech-lead-architect` (triagem de escopo mínimo) · `make web-ci` (tsc + `eslint --max-warnings 0`
++ node:test) · **`make web-a11y`** (0 violações axe + focus-trap) · `make copilot-test` (126) · `next build` (16 rotas)
+· `security-reviewer` **APROVADO** nas 3 mudanças que tocaram superfície sensível (middleware E9, modal HITL, harness a11y).
+
+> **G0 — CÓDIGO-COMPLETO (7/7).** E6/E10-HOT (17ª) · E5 (18ª) · E11 (19ª) · schema E8 (20ª) · platform E8 (21ª) ·
+> frontend E9 (22ª) · **copiloto E12 + frontend E10 (23ª)**. Não há mais item de código de G0. Mergeado na `main`
+> (`b4cb624`). **Próximo movimento real = G1 (cutover de infra)** — gated por cluster/OpenBao/FQDNs reais, não por código.
+
 ### ⏭️ Pendente da Fase 3
 
 **K8** (promoção do deep ranking sob **uplift A/B + kill-switch**) segue **gated por

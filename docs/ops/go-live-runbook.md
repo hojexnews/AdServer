@@ -209,7 +209,7 @@ numa maquina com `npm install` ja executado — ver `make/go.mk`).
 ### Passo 5 — Suites BFF/pytest
 
 ```bash
-# BFF (Node/TypeScript) — typecheck + lint + 51 testes
+# BFF (Node/TypeScript) — typecheck + lint + 73 testes
 make bff-ci
 
 # ML — OPE, features, training, calibration, promote (make ml-test)
@@ -222,8 +222,8 @@ make ml-test && make ml-batch-test && make data-validate
 # Fora do agregado ml-test para nao inflar o gate rapido de CI.
 make ml-deep-test
 
-# Copiloto — sem alvo make proprio; usar diretamente com PYTHONPATH correto
-PYTHONPATH=. ml/.venv/bin/python -m pytest services/copilot/tests/
+# Copiloto — alvo make canonico (126 testes: gateway/model-router/schemas/security)
+make copilot-test
 ```
 
 Os alvos `make` sao obrigatorios: os de Node filtram `node_modules/` (mesmo motivo do
