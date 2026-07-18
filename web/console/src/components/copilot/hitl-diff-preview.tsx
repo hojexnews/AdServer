@@ -10,8 +10,13 @@
  *
  * WCAG 2.2 AA:
  *   - role="dialog" + aria-modal + aria-labelledby + aria-describedby.
- *   - Foco gerenciado: ao montar, o foco vai para o primeiro botão de ação.
- *   - Navegação por teclado: Tab/Shift+Tab entre botões, Escape = cancelar.
+ *   - Foco gerenciado: ao montar, o foco vai para o primeiro botão de ação;
+ *     ao desmontar, o foco volta ao elemento que abriu o modal (SC 2.4.3).
+ *   - FOCUS-TRAP real: enquanto o foco está dentro do diálogo, Tab/Shift+Tab
+ *     ciclam entre os focáveis e nunca escapam para o fundo (aria-modal honrado);
+ *     Escape = cancelar (sem armadilha permanente, SC 2.1.2). Verificado
+ *     mecanicamente em `make web-a11y` (puppeteer simula Tab e afirma que o foco
+ *     permanece no diálogo — axe estático não detecta ausência de trap).
  */
 
 "use client";
@@ -42,10 +47,18 @@ export function HitlDiffPreview({
   onApprove,
   onReject,
 }: HitlDiffPreviewProps) {
+  const dialogRef = useRef<HTMLDivElement>(null);
   const applyBtnRef = useRef<HTMLButtonElement>(null);
   const cancelBtnRef = useRef<HTMLButtonElement>(null);
 
-  // Gerencia foco: ao montar, o foco vai para "Aplicar" (ou "Cancelar" se contradição)
+  // Restauração de foco (SC 2.4.3): guarda quem tinha o foco ao montar e o
+  // devolve ao desmontar (ex.: o campo do chat que disparou a proposta).
+  useEffect(() => {
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+    return () => previouslyFocused?.focus?.();
+  }, []);
+
+  // Foco inicial: ao montar, o foco vai para "Aplicar" (ou "Cancelar" se contradição).
   useEffect(() => {
     if (contradictionWarning) {
       cancelBtnRef.current?.focus();
@@ -53,6 +66,39 @@ export function HitlDiffPreview({
       applyBtnRef.current?.focus();
     }
   }, [contradictionWarning]);
+
+  // FOCUS-TRAP (aria-modal, SC 2.4.3): enquanto o foco está DENTRO do diálogo,
+  // Tab/Shift+Tab ciclam entre os focáveis e nunca escapam para o fundo. O guard
+  // `contains` faz o trap atuar SÓ quando o foco já está no diálogo — não "puxa"
+  // foco de fora, então é correto tanto no app real (modal isolado) quanto no
+  // harness do a11y-ci (onde o modal coexiste com outros componentes). Escape
+  // continua saindo (sem armadilha permanente, SC 2.1.2).
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Tab") return;
+      if (!dialog.contains(document.activeElement)) return;
+      const focusables = dialog.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+      );
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      if (!first || !last) {
+        e.preventDefault();
+        return;
+      }
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   // Escape fecha / rejeita
   useEffect(() => {
@@ -69,6 +115,7 @@ export function HitlDiffPreview({
 
   return (
     <div
+      ref={dialogRef}
       role="dialog"
       aria-modal="true"
       aria-labelledby="hitl-diff-title"

@@ -189,6 +189,64 @@ test(
     }
 
     // ---------------------------------------------------------------------
+    // 2b. Focus-trap do modal HITL (SC 2.4.3 / aria-modal). O axe-core faz
+    //     análise ESTÁTICA de DOM e NÃO simula Tab — ausência de focus-trap
+    //     passa despercebida. Aqui dirigimos o teclado de verdade: focamos o
+    //     1º focável do diálogo e afirmamos que Tab/Shift+Tab mantêm o foco
+    //     DENTRO do `[role="dialog"]` (o modal HITL do harness), nunca escapando
+    //     para o fundo. Guarda de regressão do fix de G0/frontend E10.
+    // ---------------------------------------------------------------------
+    {
+      const page = await browser.newPage();
+      await page.goto(`${BASE_URL}/a11y-harness`, { waitUntil: "networkidle0" });
+
+      const hasDialog = await page.$('[role="dialog"]');
+      assert.ok(hasDialog, "o harness deve montar o modal HITL (role=dialog)");
+
+      // Foca o primeiro botão focável do diálogo (API do puppeteer com seletor —
+      // roda no browser, sem referenciar `document` no TS do script).
+      await page.focus('[role="dialog"] button:not([disabled])');
+
+      // O callback roda NO BROWSER; o tsconfig do script (Node) não tem lib DOM
+      // — e adicioná-la colidiria com os globais fetch/Response do @types/node —
+      // então acessamos os globais do browser via globalThis tipado como any.
+      const focusInsideDialog = () =>
+        page.evaluate(() => {
+          const doc = (globalThis as { document?: unknown }).document as
+            | {
+                querySelector(sel: string): { contains(n: unknown): boolean } | null;
+                activeElement: unknown;
+              }
+            | undefined;
+          const d = doc?.querySelector('[role="dialog"]');
+          return !!(d && doc?.activeElement && d.contains(doc.activeElement));
+        });
+
+      assert.ok(await focusInsideDialog(), "foco inicial deveria estar dentro do modal HITL");
+
+      // Tab várias vezes (> nº de focáveis do diálogo) — o trap deve ciclar.
+      for (let i = 0; i < 6; i++) {
+        await page.keyboard.press("Tab");
+        assert.ok(
+          await focusInsideDialog(),
+          `focus-trap ausente: o foco escapou do modal HITL após Tab #${i + 1}`
+        );
+      }
+      // Shift+Tab no sentido inverso.
+      for (let i = 0; i < 6; i++) {
+        await page.keyboard.down("Shift");
+        await page.keyboard.press("Tab");
+        await page.keyboard.up("Shift");
+        assert.ok(
+          await focusInsideDialog(),
+          `focus-trap ausente: o foco escapou do modal HITL após Shift+Tab #${i + 1}`
+        );
+      }
+
+      await page.close();
+    }
+
+    // ---------------------------------------------------------------------
     // 3. Reporta cada violação (id/impact/help/targets) antes de falhar
     // ---------------------------------------------------------------------
     if (allViolations.length > 0) {

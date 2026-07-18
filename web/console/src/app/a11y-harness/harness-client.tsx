@@ -148,9 +148,10 @@ export function A11yHarness() {
           Diff HITL do copiloto (TX-3/CA-4)
         </h2>
         <p className="mt-1 text-xs text-gray-500">
-          NOTA (security-reviewer): este modal não implementa focus-trap —
-          Tab/Shift+Tab pode sair do diálogo. Sinalizado, não corrigido aqui
-          (gate HITL/segurança, fora do escopo cirúrgico deste E10).
+          NOTA: este modal implementa focus-trap (Tab/Shift+Tab ciclam dentro do
+          diálogo; Escape sai) — verificado mecanicamente por este gate a11y
+          (scripts/a11y-check.test.ts simula Tab e afirma que o foco fica no
+          diálogo), sob revisão do security-reviewer (G0/frontend E10).
         </p>
         <div className="mt-3">
           <HitlDiffPreview
