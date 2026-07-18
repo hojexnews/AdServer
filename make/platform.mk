@@ -17,12 +17,19 @@
 #
 # Para forccar modo CI (falha em ausencia de ferramenta):
 #   PLATFORM_STRICT=1 make platform-validate
+#
+# INVARIANTE (robustez a espaco no caminho): o repo pode viver num caminho COM ESPACO
+#   (ex.: '/home/agencia/Hojex News/AdServer'); $(BIN)=$(CURDIR)/.bin herda esse espaco.
+#   Todo uso de $(BIN)/$(CURDIR)/$(HOME) e de variavel-ferramenta ($$_TOFU/$$_KC/$$_KY,
+#   $(KUBECONFORM)/$(KYVERNO_CLI)) DEVE ficar ASPADO, e o xargs DEVE usar -d '\n'. O CI
+#   faz checkout num caminho SEM espaco e NAO pega uma regressao aqui (ficaria falso-verde
+#   no CI e falso-vermelho local) — mantenha o aspeamento ao editar este arquivo.
 
 PLATFORM_STRICT ?= 0
 
-TOFU          := $(shell command -v tofu 2>/dev/null || command -v ~/.local/bin/tofu 2>/dev/null || echo $(BIN)/tofu)
-KUBECONFORM   := $(shell command -v kubeconform 2>/dev/null || echo $(BIN)/kubeconform)
-KYVERNO_CLI   := $(shell command -v kyverno 2>/dev/null || echo $(BIN)/kyverno)
+TOFU          := $(shell command -v tofu 2>/dev/null || command -v ~/.local/bin/tofu 2>/dev/null || echo "$(BIN)/tofu")
+KUBECONFORM   := $(shell command -v kubeconform 2>/dev/null || echo "$(BIN)/kubeconform")
+KYVERNO_CLI   := $(shell command -v kyverno 2>/dev/null || echo "$(BIN)/kyverno")
 
 KUBECONFORM_VER := 0.7.0
 KYVERNO_CLI_VER := 1.13.4
@@ -62,7 +69,7 @@ KYVERNO_TEST_DIRS := \
 ##   Verifica SHA256 antes de extrair (sincronizado com M-1 do CI).
 ##   Fonte autoritativa dos hashes: .github/workflows/platform.yml
 platform-tools:
-	@mkdir -p $(BIN)
+	@mkdir -p "$(BIN)"
 	@if ! command -v kubeconform >/dev/null 2>&1 && [ ! -x "$(BIN)/kubeconform" ]; then \
 	  echo "== platform-tools: baixando kubeconform $(KUBECONFORM_VER) ->  $(BIN)/kubeconform"; \
 	  curl -fsSL -o /tmp/kubeconform.tar.gz \
@@ -70,8 +77,8 @@ platform-tools:
 	  echo "$(KUBECONFORM_SHA256)  /tmp/kubeconform.tar.gz" | sha256sum -c - || { \
 	    echo "ERRO: sha256sum kubeconform nao confere — remova /tmp/kubeconform.tar.gz e tente novamente"; \
 	    rm -f /tmp/kubeconform.tar.gz; exit 1; }; \
-	  tar -xzf /tmp/kubeconform.tar.gz -C $(BIN) kubeconform; \
-	  chmod +x $(BIN)/kubeconform; \
+	  tar -xzf /tmp/kubeconform.tar.gz -C "$(BIN)" kubeconform; \
+	  chmod +x "$(BIN)/kubeconform"; \
 	  rm -f /tmp/kubeconform.tar.gz; \
 	fi
 	@if ! command -v kyverno >/dev/null 2>&1 && [ ! -x "$(BIN)/kyverno" ]; then \
@@ -81,12 +88,12 @@ platform-tools:
 	  echo "$(KYVERNO_SHA256)  /tmp/kyverno.tar.gz" | sha256sum -c - || { \
 	    echo "ERRO: sha256sum kyverno nao confere — remova /tmp/kyverno.tar.gz e tente novamente"; \
 	    rm -f /tmp/kyverno.tar.gz; exit 1; }; \
-	  tar -xzf /tmp/kyverno.tar.gz -C $(BIN) kyverno; \
-	  chmod +x $(BIN)/kyverno; \
+	  tar -xzf /tmp/kyverno.tar.gz -C "$(BIN)" kyverno; \
+	  chmod +x "$(BIN)/kyverno"; \
 	  rm -f /tmp/kyverno.tar.gz; \
 	fi
-	@$(KUBECONFORM) --version 2>/dev/null || $(BIN)/kubeconform --version
-	@$(KYVERNO_CLI) version 2>/dev/null || $(BIN)/kyverno version
+	@"$(KUBECONFORM)" --version 2>/dev/null || "$(BIN)/kubeconform" --version
+	@"$(KYVERNO_CLI)" version 2>/dev/null || "$(BIN)/kyverno" version
 
 ## platform-tofu-validate: tofu init -backend=false && tofu validate (sem credenciais)
 # FIX (11a onda): guarda de skip e uso de ferramenta unificados num unico bloco de
@@ -110,8 +117,8 @@ platform-tofu-validate:
 	   fi; \
 	 fi; \
 	 cd $(TOFU_ROOT) && \
-	   $$_TOFU init -backend=false -input=false 2>&1 | sed '/^$$/d' && \
-	   $$_TOFU validate && \
+	   "$$_TOFU" init -backend=false -input=false 2>&1 | sed '/^$$/d' && \
+	   "$$_TOFU" validate && \
 	   echo "== platform-tofu-validate: OK =="
 
 ## platform-kubeconform: kubeconform sobre todos os manifests K8s/CRD (offline)
@@ -133,7 +140,7 @@ platform-kubeconform:
 	   yamls=$$(find "$$dir" -name "*.yaml" -not -name "kyverno-test.yaml" -not -name "test-resources.yaml" -not -name "otel-collector.yaml" 2>/dev/null); \
 	   [ -z "$$yamls" ] && continue; \
 	   echo "-- kubeconform: $$dir"; \
-	   echo "$$yamls" | xargs $$_KC \
+	   echo "$$yamls" | xargs -d '\n' "$$_KC" \
 	     -kubernetes-version 1.30.0 \
 	     -schema-location default \
 	     -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
@@ -164,7 +171,7 @@ platform-kyverno-test:
 	     echo "AVISO: sem kyverno-test.yaml em $$dir — pulando"; continue; \
 	   fi; \
 	   echo "-- kyverno test: $$dir"; \
-	   $$_KY test "$$dir" --detailed-results || FAIL=1; \
+	   "$$_KY" test "$$dir" --detailed-results || FAIL=1; \
 	 done; \
 	 if [ "$$FAIL" = "1" ]; then echo "== platform-kyverno-test: FALHOU =="; exit 1; fi; \
 	 echo "== platform-kyverno-test: OK =="
