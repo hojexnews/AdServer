@@ -54,7 +54,12 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["app*", "tools*", "guardrails*", "graph*", "rag*", "observability*"]
+# Pacotes reais do copiloto (cada um com __init__.py). Os diretórios
+# guardrails/ e rag/ eram scaffolding VAZIO (0 arquivos, nunca versionados) —
+# a funcionalidade real de guardrails (2 camadas) e RAG (pgvector) vive em
+# graph/nodes.py, tools/gateway.py e app/*; os globs guardrails*/rag* não
+# casavam pacote nenhum. Removidos (higiene de layout, G0/copiloto).
+include = ["app*", "tools*", "graph*", "observability*"]
 
 [tool.ruff]
 target-version = "py312"
