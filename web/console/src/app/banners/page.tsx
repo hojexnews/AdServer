@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { useForm } from "react-hook-form";
+import { useForm, useWatch } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import { trpc } from "@/lib/trpc";
@@ -41,13 +41,15 @@ export default function BannersPage() {
     },
   });
 
-  const { register, handleSubmit, watch, formState: { errors }, reset } =
+  const { register, handleSubmit, control, formState: { errors }, reset } =
     useForm<CreateValues>({
       resolver: zodResolver(CreateSchema),
       defaultValues: { creativeType: "image", width: 300, height: 250 },
     });
 
-  const creativeType = watch("creativeType");
+  // useWatch (não watch): compatível com o React Compiler do Next 16 (watch()
+  // não é memoizável → warning react-hooks/incompatible-library) + re-render escopado.
+  const creativeType = useWatch({ control, name: "creativeType" });
 
   if (isLoading) return <LoadingState label="Carregando banners..." />;
   if (error) return <ErrorState message={error.message} retry={() => { void refetch(); }} />;

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { useForm } from "react-hook-form";
+import { useForm, useWatch } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import { trpc } from "@/lib/trpc";
@@ -66,7 +66,7 @@ export default function CampaignsPage() {
   const {
     register,
     handleSubmit,
-    watch,
+    control,
     formState: { errors },
     reset,
   } = useForm<CreateValues>({
@@ -82,7 +82,9 @@ export default function CampaignsPage() {
     },
   });
 
-  const pricingModel = watch("pricingModel");
+  // useWatch (não watch): compatível com o React Compiler do Next 16 (watch()
+  // não é memoizável → warning react-hooks/incompatible-library) + re-render escopado.
+  const pricingModel = useWatch({ control, name: "pricingModel" });
 
   if (isLoading) return <LoadingState label="Carregando campanhas..." />;
   if (error) return <ErrorState message={error.message} retry={() => { void refetch(); }} />;
