@@ -83,7 +83,7 @@ import "math"
 // preserves the deterministic cascade order (eCPM-sorted by the cascade
 // itself).  The J1 golden tests remain green because: 0 × bid = 0 for all →
 // stable sort is a no-op → order identical to cascade input.
-func ScoreCandidate(pCTR float32, bidMinorUnits int64) int64 {
+func ScoreCandidate(pCTR float32, bidMinorUnits int64) int64 { //nolint:forbidigo // pCTR is a probability [0,1], not money (bid stays int64 minor-units)
 	if bidMinorUnits < 0 {
 		return 0
 	}

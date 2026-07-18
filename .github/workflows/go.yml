@@ -21,6 +21,7 @@ on:
       - "go.sum"
       - "make/go.mk"
       - "make/parity.mk"
+      - ".golangci.yml"
       - ".github/workflows/go.yml"
   push:
     branches: [main]
@@ -54,6 +55,8 @@ jobs:
         run: make go-build
       - name: vet
         run: make go-vet
+      - name: lint (forbidigo TX-2 — float PROIBIDO em codigo monetario)
+        run: make go-lint
       - name: test (unit + golden, -race)
         run: make go-test
       - name: parity golden (gate de cutover, sem infra)

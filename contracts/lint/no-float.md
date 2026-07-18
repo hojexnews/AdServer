@@ -28,39 +28,40 @@ Tudo fora desse escopo é ignorado pelos checks abaixo.
 ## 1. Go (hot path)
 
 Proibir `float32`/`float64` em pacotes/tipos de dinheiro; usar `Money` (int64+scale) ou
-`github.com/shopspring/decimal` no batch. Via **golangci-lint / `forbidigo`**:
+`github.com/shopspring/decimal` no batch. Via **golangci-lint / `forbidigo`** — **LIGADO** em
+[`.golangci.yml`](../../.golangci.yml) (schema v2) + `make go-lint` + o step _lint_ do workflow
+`go.yml` (Go 1.26). Antes deste wiring o `.golangci.yml` **não existia**: a metade "lint" da
+enforcement era só aspiracional — os ~105 `//nolint:forbidigo` do hot path não opt-avam de gate
+algum. (Falso-positivo detectado e corrigido: a doc afirmava "em CI — lint E teste", mas só o
+grep + os testes rodavam.)
+
+**Escopo** (via `path-except` no `.golangci.yml`): os pacotes **puro-dinheiro**
+(`internal/money`, `internal/ledger`, `services/payments`, `internal/chainconnector` — onde float
+NUNCA é legítimo) **mais** o único arquivo do **money-point eCPM** (`internal/ranker/score.go`, cujo
+float intermediário de probabilidade carrega `//nolint:forbidigo // <motivo>`). Os arquivos ML
+mistos (`ranker/bandit`, `ranker/featurize`, `cascade`) têm float legítimo pervasivo (pCTR,
+propensity, feature vector) e ficam **fora** do escopo — forbidigo proíbe o _tipo_ float por atacado
+e seria ruído lá; esses caminhos são cobertos por testes known-answer (ex.: `TestScoreCandidateECPM_*`).
 
 ```yaml
-# .golangci.yml  (aplicado aos pacotes financeiros — ver `issues.exclude-rules` p/ escopo)
+# .golangci.yml (v2) — trecho normativo; ver o arquivo real para o path-except completo.
 linters:
-  enable:
-    - forbidigo
-linters-settings:
-  forbidigo:
-    forbid:
-      - p: '\bfloat32\b'
-        msg: "float32 proibido em codigo monetario (TX-2): use Money/int64 ou shopspring/decimal"
-      - p: '\bfloat64\b'
-        msg: "float64 proibido em codigo monetario (TX-2): use Money/int64 ou shopspring/decimal"
-    analyze-types: true
-issues:
-  exclude-rules:
-    # forbidigo de float SO vale nos diretorios financeiros
-    - linters: [forbidigo]
-      path-except: '(money|ledger|billing|payments|asset.?registry)/'
+  default: none
+  enable: [forbidigo]
+  settings:
+    forbidigo:
+      forbid:
+        - pattern: '\bfloat32\b'
+        - pattern: '\bfloat64\b'
+      analyze-types: true
 ```
 
-Guard de CI complementar (grep restrito, falha o build):
-
-```bash
-# scripts/ci/no-float-go.sh
-set -euo pipefail
-hits=$(grep -RInE '\bfloat(32|64)\b' \
-  --include='*.go' \
-  $(git ls-files '*money*/*.go' '*ledger*/*.go' '*billing*/*.go' '*payments*/*.go') \
-  || true)
-[ -z "$hits" ] || { echo "float proibido em codigo monetario (Go/TX-2):"; echo "$hits"; exit 1; }
-```
+Backstop grep complementar (falha o build), rodado no workflow `no-float.yml` —
+[`scripts/ci/no-float-go.sh`](../../scripts/ci/no-float-go.sh): tokenizer Go (remove
+comentários/strings antes de testar `\bfloat(32|64)\b`, evitando falso-positivo em comentários
+que documentam a regra) sobre o escopo `git ls-files '*money*/*.go' '*ledger*/*.go'
+'*billing*/*.go' '*payments*/*.go' '*chainconnector*/*.go'`. Complementa o forbidigo
+(lint _type-aware_) acima — o grep é um backstop de path independente do golangci-lint.
 
 ---
 

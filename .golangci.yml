@@ -1,0 +1,38 @@
+# .golangci.yml — Gate de lint TX-2 (no-float) via forbidigo.
+#
+# Torna REAL a metade "lint" da enforcement descrita em contracts/lint/no-float.md
+# ("float PROIBIDO em codigo monetario, em CI — lint E teste"). Antes deste arquivo,
+# os ~105 //nolint:forbidigo espalhados pelo hot path NAO opt-avam de gate algum
+# (nenhum forbidigo rodava) — a doc canonica super-declarava a enforcement.
+#
+# Escopo: pacotes monetarios/hot-path onde float aplicado a DINHEIRO e proibido (TX-2).
+# Floats LEGITIMOS (probabilidade pCTR, ratio de pacing [0,1], score/propensity de
+# bandit) carregam //nolint:forbidigo // <motivo>. Fora deste escopo (ML, telemetria,
+# features) float e legitimo e nao e verificado.
+#
+# Complementa (nao substitui) scripts/ci/no-float-*.sh (grep restrito) + os testes
+# known-answer (ex.: internal/ranker/ranker_test.go TestScoreCandidateECPM_*).
+version: "2"
+linters:
+  default: none
+  enable:
+    - forbidigo
+  settings:
+    forbidigo:
+      forbid:
+        - pattern: '\bfloat32\b'
+          msg: "float32 proibido em codigo monetario (TX-2): use Money/int64 ou shopspring/decimal"
+        - pattern: '\bfloat64\b'
+          msg: "float64 proibido em codigo monetario (TX-2): use Money/int64 ou shopspring/decimal"
+      analyze-types: true
+  exclusions:
+    rules:
+      # forbidigo de float SO vale onde "float == bug de dinheiro" e o invariante:
+      # os pacotes PURO-DINHEIRO (money/ledger/payments/chainconnector — sem float
+      # legitimo) MAIS o unico arquivo do money-point eCPM (ranker/score.go, cujo
+      # float intermediario ja carrega //nolint). Os demais arquivos ML mistos
+      # (ranker/bandit, ranker/featurize, cascade) tem float legitimo pervasivo
+      # (pCTR, propensity, feature vector) e NAO entram no escopo — forbidigo,
+      # que proibe o TIPO float por atacado, seria ruido la.
+      - linters: [forbidigo]
+        path-except: '(internal/money/|internal/ledger/|internal/ranker/score\.go|services/payments/|internal/chainconnector/)'
