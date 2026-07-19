@@ -44,6 +44,8 @@ dev-db-setup:
 	@psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q -f db/ledger/migrations/0001_ledger_schema_up.sql
 	@psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q -f db/seed/dev_roles.sql
 	@psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q -f db/seed/dev_seed.sql
+	@# Provisionamento real do publisher Hojex News: zonas por-placement (E11).
+	@psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q -f db/seed/hojex_news_seed.sql
 	@echo "== dev-db-setup: OK. Loader DSN:"
 	@echo "   $(DEV_LOADER_DSN)"
 

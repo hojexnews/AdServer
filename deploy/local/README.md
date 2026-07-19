@@ -21,7 +21,7 @@ Redpanda, ClickHouse — mais os dois serviços Go do hot path, **sem cloud**.
 
 - `docker-compose.yml` — perfis `default` (core) e `streaming`.
 - `Dockerfile` — build multi-stage distroless de um serviço Go (`--build-arg SERVICE=decision|collector`); context = raiz do repo (gen/ versionado → build hermético).
-- `postgres/10-init.sh` — aplica migrations (`asset_registry`→`config`→`ledger`) + `db/seed/dev_roles.sql` + `db/seed/dev_seed.sql`.
+- `postgres/10-init.sh` — aplica migrations (`asset_registry`→`config`→`ledger`) + `db/seed/dev_roles.sql` + `db/seed/dev_seed.sql` + `db/seed/hojex_news_seed.sql` (zonas reais Hojex News 1001–1004).
 - `redpanda/topics.sh` — cria os 5 tópicos (partições espelham `data/redpanda/topics.yaml`; RF=1 em dev).
 - `clickhouse/10-ddl.sh` — renderiza e aplica `data/clickhouse/migrations/*.sql` em single-node.
 - `smoke.sh` — E2E: o decision serve anúncio real do seed (`make dev-smoke`).

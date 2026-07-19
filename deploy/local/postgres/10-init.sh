@@ -25,4 +25,7 @@ run /repo/db/seed/dev_roles.sql
 echo "[pg-init] demo seed (one tenant: contract BR + remnant house)"
 run /repo/db/seed/dev_seed.sql
 
+echo "[pg-init] provisionamento real Hojex News (zonas por-placement 1001-1004)"
+run /repo/db/seed/hojex_news_seed.sql
+
 echo "[pg-init] done"

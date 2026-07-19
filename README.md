@@ -87,8 +87,8 @@ transforma 3 dos pendentes de infra em artefatos **rodáveis localmente**:
 
 ```bash
 # Caminho A — Postgres local (sem Docker), VERIFICADO:
-make dev-db-setup      # cria adserver_dev, aplica migrations + roles + seed demo
-make dev-it            # teste de integração: loader Postgres→snapshot (papel BYPASSRLS)
+make dev-db-setup      # cria adserver_dev, aplica migrations + roles + seed demo + provisionamento Hojex News
+make dev-it            # integração: loader→snapshot + as 4 zonas reais Hojex (papel BYPASSRLS)
 make dev-decision-run  # sobe o decision; em outro shell:
 make dev-smoke         # E2E: BR→CONTRACT, US→REMNANT (regra de geo), zona desconhecida→BLANK
 
@@ -106,6 +106,22 @@ na cascata (zona→tenant), não na leitura. O **produtor↔ClickHouse** ganhou
 `TELEMETRY_WIRE_FORMAT=json` (`internal/telemetry/wire.go`) cujos nomes de campo
 casam exatamente com as colunas da kafka-engine (incl. `user_agent` = classe
 coarse → `user_agent_class` na MV); Protobuf segue como padrão de produção.
+
+#### E11 (lado-AdServer) — zonas reais do publisher Hojex News
+
+`db/seed/hojex_news_seed.sql` provisiona o **inventário first-party** do site: 4
+zonas por-placement com **IDs FIXADOS** — `1001` sidebar, `1002` in-article,
+`1003` leaderboard (728×90), `1004` listing (as três MREC são 300×250). Os IDs
+são a **fonte única da verdade** partilhada com o registo `ZONES` do site
+(`web/src/lib/ads/config.ts`) e com o teste
+`internal/configload/hojex_zones_integration_test.go`; ao (re)provisionar,
+mantenha-os (o `setval` protege inserts serial futuros do console). O inventário
+é **house/REMNANT** (uma campanha por tamanho, ligada só às zonas do seu tamanho,
+porque a cascata não casa dimensão banner↔zona — seleciona o 1.º banner
+elegível). `make dev-db-setup` aplica este seed a par do `dev_seed.sql` e
+`make dev-it` prova que cada zona serve o criativo do tamanho certo (REMNANT, geo
+encaminhado sem filtrar). Campanhas pagas (contract/override) entram pela
+demanda/console — fora do escopo do E11.
 
 ### ⏭️ Pendente de ambiente (não-código) para fechar a Fase 1
 
