@@ -21,6 +21,7 @@ COBERTURA:
 """
 from __future__ import annotations
 
+import importlib.util
 import math
 import sys
 from pathlib import Path
@@ -45,6 +46,26 @@ from ml.features.python.featurize import (
     ZoneInput,
     featurize,
 )
+
+# ---------------------------------------------------------------------------
+# selector.py de PRODUCAO (services/ranker-sidecar/internal/triton/selector.py)
+# ---------------------------------------------------------------------------
+# Carregado por caminho de arquivo (nao por `import`) porque
+# "ranker-sidecar" contem hifen e nao e um nome de pacote Python valido.
+# Isto garante que TestDeepGate exercite o MODULO REAL usado pelo sidecar,
+# nao uma copia/reimplementacao local — uma mutacao em selector.py (ex.:
+# trocar o AND por OR em should_use_deep) tem de derrubar este teste.
+_SELECTOR_PATH = (
+    _REPO_ROOT / "services" / "ranker-sidecar" / "internal" / "triton" / "selector.py"
+)
+_selector_spec = importlib.util.spec_from_file_location(
+    "ranker_sidecar_triton_selector", _SELECTOR_PATH
+)
+assert _selector_spec is not None and _selector_spec.loader is not None, (
+    f"nao foi possivel carregar o selector.py de producao em {_SELECTOR_PATH}"
+)
+selector = importlib.util.module_from_spec(_selector_spec)
+_selector_spec.loader.exec_module(selector)
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -345,25 +366,29 @@ class TestDeepGate:
       - "deep-*" → Triton/GPU (K8, gated)
       - qualquer outro → ONNX-CPU GBDT (producao atual)
 
-    Este teste verifica a logica de selecao sem instanciar o sidecar.
+    Este teste exercita DIRETAMENTE o modulo de producao
+    services/ranker-sidecar/internal/triton/selector.py (importado por
+    caminho de arquivo no topo deste arquivo como `selector`) — nao uma
+    copia local. Uma mutacao no selector real (ex.: inverter o AND por OR
+    em should_use_deep) tem de fazer este teste falhar.
     """
 
     def test_model_version_prefix_deep(self) -> None:
         """model_version com prefixo 'deep-' deve ser reconhecido como deep."""
-        assert _is_deep_version("deep-1.0.0-int8")
-        assert _is_deep_version("deep-two-tower-v1")
-        assert _is_deep_version("deep-k1-scaffold")
+        assert selector.is_deep_model_version("deep-1.0.0-int8")
+        assert selector.is_deep_model_version("deep-two-tower-v1")
+        assert selector.is_deep_model_version("deep-k1-scaffold")
 
     def test_model_version_prefix_gbdt(self) -> None:
         """model_version sem prefixo 'deep-' deve ser reconhecido como GBDT."""
-        assert not _is_deep_version("stub-j1")
-        assert not _is_deep_version("pctr_lgb_v3")
-        assert not _is_deep_version("1.0.0")
-        assert not _is_deep_version("")
+        assert not selector.is_deep_model_version("stub-j1")
+        assert not selector.is_deep_model_version("pctr_lgb_v3")
+        assert not selector.is_deep_model_version("1.0.0")
+        assert not selector.is_deep_model_version("")
 
     def test_default_model_version_is_not_deep(self) -> None:
         """O model_version padrao do sidecar (stub-j1) nao e deep."""
-        assert not _is_deep_version("stub-j1")
+        assert not selector.is_deep_model_version("stub-j1")
 
     def test_fail_open_on_deep_without_triton(self) -> None:
         """
@@ -375,19 +400,39 @@ class TestDeepGate:
         que a logica de fail-open possa ser acionada.
         """
         version = "deep-1.0.0"
-        assert _is_deep_version(version), (
+        assert selector.is_deep_model_version(version), (
             "Versao deep nao detectada; a logica de fail-open nao seria acionada."
         )
 
+    def test_should_use_deep_requires_both_flag_and_prefix(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """
+        should_use_deep() e um AND: DEEP_ENABLED=true E model_version 'deep-*'.
 
-def _is_deep_version(model_version: str) -> bool:
-    """
-    Logica de selecao de runtime: versao 'deep-*' → Triton; caso contrario → GBDT.
+        Este e o invariante central do gate K1->K8 (ADR-0004 §H): com
+        DEEP_ENABLED=false (default), NENHUM model_version aciona o Triton,
+        mesmo com prefixo 'deep-'. Uma regressao AND->OR no selector real
+        faria este teste falhar (deep_without_flag viraria True).
+        """
+        monkeypatch.setenv("DEEP_ENABLED", "false")
+        assert selector.should_use_deep("deep-1.0.0") is False, (
+            "DEEP_ENABLED=false deve bloquear o Triton mesmo com prefixo 'deep-' "
+            "(regressao AND->OR no gate)."
+        )
+        assert selector.should_use_deep("pctr_lgb_v3") is False
 
-    Espelha a logica em services/ranker-sidecar/internal/triton/selector.py
-    e a fiacao Go em internal/ranker/deep_flag.go.
-    """
-    return model_version.startswith("deep-")
+        monkeypatch.setenv("DEEP_ENABLED", "true")
+        assert selector.should_use_deep("deep-1.0.0") is True, (
+            "DEEP_ENABLED=true com model_version 'deep-*' deve acionar o Triton."
+        )
+        assert selector.should_use_deep("pctr_lgb_v3") is False, (
+            "DEEP_ENABLED=true sozinho, sem prefixo 'deep-', nao deve acionar o Triton."
+        )
+
+    def test_default_deep_enabled_is_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """DEEP_ENABLED ausente do ambiente deve ser tratado como false (fail-safe)."""
+        monkeypatch.delenv("DEEP_ENABLED", raising=False)
+        assert selector.is_deep_enabled() is False
+        assert selector.should_use_deep("deep-1.0.0") is False
 
 
 # ---------------------------------------------------------------------------

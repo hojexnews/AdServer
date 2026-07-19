@@ -2,11 +2,14 @@
 #
 # Jobs:
 #   ml-fast      — make ml-test-fast  (OPE + features + promote, ~10 s)
+#   ml-full      — make ml-test       (OPE + features + treino + calibracao +
+#                  promote — agregado completo, ~30-60 s, so onnxruntime/
+#                  onnxmltools Python, SEM PyTorch)
 #   ml-batch     — make ml-batch-test (pacing + fraud + unsup, ~30 s)
 #   copilot-test — make copilot-test  (126 testes HITL/gateway/security, ~5 s)
 #
-# ml-training e ml-deep ficam fora do caminho de PR/push por custo (PyTorch/ONNX).
-# Acionamento manual via workflow_dispatch (botao "Run workflow" no GitHub Actions).
+# ml-deep fica fora do caminho de PR/push por custo (PyTorch). Acionamento
+# manual via workflow_dispatch (botao "Run workflow" no GitHub Actions).
 # A job ml-deep-gate roda SOMENTE quando acionada por workflow_dispatch
 # (if: github.event_name == 'workflow_dispatch') — nao dispara em PR nem push.
 #
@@ -71,6 +74,45 @@ jobs:
 
       - name: ml-test-fast (OPE + features + promote)
         run: make ml-test-fast
+
+  # -----------------------------------------------------------------------
+  # ml-full: agregado completo `make ml-test` (OPE + features + TREINO +
+  # CALIBRACAO + promote). ml-training-test cobre o contrato de artefato
+  # ONNX (zipmap=False — G0/E11) e ml-calibration-test cobre ECE/reliability
+  # (calibracao isotonica). NAO precisa de PyTorch: so onnxruntime +
+  # onnxmltools Python (ja usado pelo export do treino).
+  #
+  # Backstop obrigatorio: e o UNICO sinal de CI automatizado contra uma
+  # regressao silenciosa de ZipMap no ONNX exportado (o parity test Go
+  # `-tags onnx` da t.Skip em CI sem libonnxruntime.so nativa).
+  # -----------------------------------------------------------------------
+  ml-full:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: instalar dependencias ML (core + treino + calibracao)
+        run: |
+          pip install --quiet \
+            numpy \
+            pandas \
+            scipy \
+            scikit-learn \
+            lightgbm \
+            mlflow-skinny \
+            onnx \
+            onnxmltools \
+            onnxruntime \
+            pytest \
+            pytest-asyncio \
+            pytest-cov
+
+      - name: ml-test (OPE + features + treino + calibracao + promote)
+        run: make ml-test
 
   # -----------------------------------------------------------------------
   # ml-batch: testes de pacing + fraud supervisionado + fraude nao-supervisionada.
