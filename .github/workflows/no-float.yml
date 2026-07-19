@@ -16,14 +16,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Proto — sem float/double em Money/Payments (TX-2, nivel de contrato)
+        run: bash scripts/ci/no-float-proto.sh
       - name: Go — sem float em dinheiro
         run: bash scripts/ci/no-float-go.sh
-      - name: TypeScript — lint financeiro (ESLint, se houver TS)
+      - name: TypeScript — lint financeiro (ESLint, arquivos reais de dinheiro do BFF)
         run: |
-          if git ls-files '*money*/*.ts' '*ledger*/*.ts' '*billing*/*.ts' '*payments*/*.ts' | grep -q .; then
-            npx --yes eslint "**/{money,ledger,billing,payments}/**/*.ts"
+          set -euo pipefail
+          # Convencao real do repo: ARQUIVO money.ts/payments.ts (nao diretorio
+          # money/, payments/ — o glob antigo '**/{money,...}/**/*.ts' so
+          # casava gen/ts/**, nunca a convencao real de arquivo do BFF).
+          FILES=$(git ls-files 'bff/src/**/*.ts' \
+            | grep -E '(^|/)[^/]*(money|ledger|billing|payments)[^/]*\.ts$' \
+            | grep -v '\.test\.ts$' || true)
+          if [ -n "$FILES" ]; then
+            npm ci --prefix bff
+            node bff/node_modules/eslint/bin/eslint.js --no-config-lookup -c eslint.config.mjs $FILES
           else
-            echo "sem TS financeiro (ok)"
+            echo "sem TS financeiro real (ok)"
           fi
       - name: Python — sem float em dinheiro
         run: bash scripts/ci/no-float-py.sh
