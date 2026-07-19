@@ -20,6 +20,36 @@ REQUIRED_STATS_COLS = {
 
 fail = 0
 
+
+# ---------------------------------------------------------------------------
+# Helpers de escopo por-statement (evita tautologia de substring no corpus
+# inteiro: um comentario ou uma tabela vizinha nao pode satisfazer um check
+# que deveria provar algo sobre UM statement especifico).
+# ---------------------------------------------------------------------------
+def strip_sql_comments(text: str) -> str:
+    """Remove comentarios de linha (--...) de cada linha, preservando quebras."""
+    out = []
+    for line in text.splitlines():
+        idx = line.find("--")
+        if idx != -1:
+            line = line[:idx]
+        out.append(line)
+    return "\n".join(out)
+
+
+def split_statements(code_text: str):
+    """Divide DDL (ja sem comentarios) em statements top-level por ';'."""
+    return [s.strip() for s in code_text.split(";") if s.strip()]
+
+
+def find_statement(statements, pattern: str):
+    """Retorna o primeiro statement cujo inicio (apos strip) casa com pattern."""
+    for s in statements:
+        if re.match(pattern, s, re.I):
+            return s
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Le todos os DDLs de ClickHouse
 # ---------------------------------------------------------------------------
@@ -32,26 +62,53 @@ ddl_text = ""
 for f in ddl_files:
     ddl_text += f.read_text()
 
+ddl_code = strip_sql_comments(ddl_text)
+ddl_statements = split_statements(ddl_code)
+
 # ---------------------------------------------------------------------------
-# Verifica que a VIEW stats_hourly existe
+# Verifica que a VIEW stats_hourly existe, escopado ao statement real
+# (nao satisfeito por 'stats_hourly_state' nem por comentarios/prosa)
 # ---------------------------------------------------------------------------
-if "stats_hourly" not in ddl_text:
-    print("ERRO: VIEW stats_hourly nao encontrada em DDL do ClickHouse.", file=sys.stderr)
+stats_hourly_view = find_statement(
+    ddl_statements,
+    r"CREATE\s+VIEW\s+IF\s+NOT\s+EXISTS\s+adserver\.stats_hourly\b",
+)
+if stats_hourly_view is None:
+    print(
+        "ERRO: VIEW adserver.stats_hourly (statement CREATE VIEW real, nao "
+        "prosa/comentario) nao encontrada em DDL do ClickHouse.",
+        file=sys.stderr,
+    )
     fail = 1
 
 # ---------------------------------------------------------------------------
-# Verifica colunas obrigatorias na VIEW/tabela stats_hourly
+# Verifica colunas obrigatorias DENTRO do statement da VIEW stats_hourly
+# (nao satisfeito por colunas de outras tabelas/MVs)
 # ---------------------------------------------------------------------------
-missing = [c for c in REQUIRED_STATS_COLS if c not in ddl_text]
-if missing:
-    print(f"ERRO: colunas faltando no contrato StatsHourly: {missing}", file=sys.stderr)
-    fail = 1
+if stats_hourly_view is not None:
+    missing = [c for c in REQUIRED_STATS_COLS if c not in stats_hourly_view]
+    if missing:
+        print(f"ERRO: colunas faltando no contrato StatsHourly (VIEW stats_hourly): {missing}", file=sys.stderr)
+        fail = 1
 
 # ---------------------------------------------------------------------------
-# Verifica que stats_hourly_state usa AggregatingMergeTree (DA-7)
+# Verifica que stats_hourly_state usa AggregatingMergeTree (DA-7), escopado
+# ao statement CREATE TABLE de stats_hourly_state (nao satisfeito por prosa
+# em outros arquivos nem por outra tabela com esse engine)
 # ---------------------------------------------------------------------------
-if "AggregatingMergeTree" not in ddl_text:
-    print("ERRO: AggregatingMergeTree nao encontrado; StatsHourly exige AggregatingMergeTree.", file=sys.stderr)
+stats_hourly_state_table = find_statement(
+    ddl_statements,
+    r"CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+adserver\.stats_hourly_state\b",
+)
+if stats_hourly_state_table is None:
+    print("ERRO: tabela adserver.stats_hourly_state nao encontrada (DA-7).", file=sys.stderr)
+    fail = 1
+elif not re.search(r"ENGINE\s*=\s*AggregatingMergeTree\b", stats_hourly_state_table, re.I):
+    print(
+        "ERRO: adserver.stats_hourly_state nao usa ENGINE = AggregatingMergeTree "
+        "(DA-7). StatsHourly exige AggregatingMergeTree na tabela de estado.",
+        file=sys.stderr,
+    )
     fail = 1
 
 # ---------------------------------------------------------------------------
@@ -141,6 +198,46 @@ if "ROW POLICY" in ddl_text.upper() and not has_substring_uuid:
     fail = 1
 
 # ---------------------------------------------------------------------------
+# Verifica que a tabela mais critica (stats_hourly_state, base da VIEW
+# faturavel stats_hourly) tem SUA PROPRIA row-policy de tenant fail-closed
+# (TX-3). Escopado ao statement: a presenca global de "ROW POLICY" (check
+# acima) e satisfeita por QUALQUER uma das 6 policies de tenant; este check
+# prova que especificamente a de stats_hourly_state nao foi removida.
+# ---------------------------------------------------------------------------
+stats_hourly_state_tenant_policy = None
+for _s in ddl_statements:
+    if (
+        re.match(r"CREATE\s+ROW\s+POLICY\s+IF\s+NOT\s+EXISTS\b", _s, re.I)
+        and re.search(r"\bON\s+adserver\.stats_hourly_state\b", _s, re.I)
+        and re.search(r"\bTO\s+tenant_role\b", _s, re.I)
+    ):
+        stats_hourly_state_tenant_policy = _s
+        break
+
+if stats_hourly_state_tenant_policy is None:
+    print(
+        "ERRO: row-policy de tenant para adserver.stats_hourly_state (TX-3) "
+        "nao encontrada. A tabela base da VIEW stats_hourly faturavel precisa "
+        "de sua PROPRIA ROW POLICY ... ON adserver.stats_hourly_state ... TO tenant_role.",
+        file=sys.stderr,
+    )
+    fail = 1
+else:
+    has_fail_closed_scoped = (
+        "startsWith(currentUser(), 'tenant_')" in stats_hourly_state_tenant_policy
+        and "match(" in stats_hourly_state_tenant_policy
+        and "[0-9a-f]{8}-[0-9a-f]{4}" in stats_hourly_state_tenant_policy
+        and "substring(currentUser()," in stats_hourly_state_tenant_policy
+    )
+    if not has_fail_closed_scoped:
+        print(
+            "ERRO: row-policy de tenant em adserver.stats_hourly_state existe "
+            "mas nao usa o padrao fail-closed (startsWith + match UUID + substring).",
+            file=sys.stderr,
+        )
+        fail = 1
+
+# ---------------------------------------------------------------------------
 # Invariantes de UA: contrato produtor Go <-> ingestao ClickHouse (HIGH privacy, TX-5)
 #
 # Campo proto `user_agent` (no 5, wire-locked BACKWARD, TX-1) carrega a CLASSE coarse.
@@ -226,11 +323,28 @@ else:
     print("AVISO: 003_kafka_to_raw_mvs.sql nao encontrado em data/clickhouse/migrations/.")
 
 # ---------------------------------------------------------------------------
-# Verifica que ReplacingMergeTree e usado para dedupe (TX-1)
+# Verifica que ReplacingMergeTree e usado para dedupe por event_id (TX-1),
+# escopado ao statement CREATE TABLE de CADA tabela raw_* (nao satisfeito
+# por prosa/diagrama em comentarios nem por outra tabela com esse engine)
 # ---------------------------------------------------------------------------
-if "ReplacingMergeTree" not in ddl_text:
-    print("ERRO: ReplacingMergeTree nao encontrado; necessario para dedupe por event_id (TX-1).", file=sys.stderr)
-    fail = 1
+RAW_TABLES_REQUIRING_DEDUPE = (
+    "raw_ad_request", "raw_impression", "raw_click", "raw_conversion", "raw_decision",
+)
+for _tbl in RAW_TABLES_REQUIRING_DEDUPE:
+    _stmt = find_statement(
+        ddl_statements,
+        rf"CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+adserver\.{_tbl}\b",
+    )
+    if _stmt is None:
+        print(f"ERRO: tabela adserver.{_tbl} nao encontrada (dedupe TX-1).", file=sys.stderr)
+        fail = 1
+    elif not re.search(r"ENGINE\s*=\s*ReplacingMergeTree\b", _stmt, re.I):
+        print(
+            f"ERRO: adserver.{_tbl} nao usa ENGINE = ReplacingMergeTree; "
+            f"necessario para dedupe por event_id (TX-1).",
+            file=sys.stderr,
+        )
+        fail = 1
 
 if fail == 0:
     print("data-schema-invariants: ok")

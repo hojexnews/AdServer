@@ -28,19 +28,11 @@ data-no-float:
 	@bash scripts/ci/no-float-data-sql.sh
 
 ## data-sql-check: verifica erros comuns de sintaxe SQL sem subir ClickHouse
+## (por-statement: cada CREATE TABLE precisa de ENGINE dentro do seu proprio
+## statement — ver scripts/ci/data-sql-check.py)
 data-sql-check:
 	@echo "== data-sql-check =="
-	@fail=0; \
-	for f in $(CH_DDL_DIR)/*.sql; do \
-		[ -f "$$f" ] || continue; \
-		echo "  verificando $$f"; \
-		if grep -qiE '^\s*CREATE\s+TABLE' "$$f" && ! grep -qiE 'ENGINE\s*=' "$$f"; then \
-			echo "  ERRO: CREATE TABLE sem ENGINE em $$f"; \
-			fail=1; \
-		fi; \
-	done; \
-	[ "$$fail" -eq 0 ] || exit 1; \
-	echo "data-sql-check: ok"
+	@python3 scripts/ci/data-sql-check.py
 
 ## data-yaml-check: verifica YAML bem-formado nas specs Iceberg e Redpanda
 data-yaml-check:
@@ -68,9 +60,15 @@ data-ivt-sql-check:
 	@python3 scripts/ci/data-ivt-sql-check.py
 
 ## data-ivt-test: executa testes unitarios do job de scoring IVT com o sample sintetico
+## Usa ml/.venv se existir (dev local); senao cai para python3 do PATH (CI, que
+## instala numpy/pandas/mmh3 via pip antes deste alvo — ver .github/workflows/data.yml).
 data-ivt-test:
 	@echo "== data-ivt-test (TX-6 / J6) =="
-	@ml/.venv/bin/python data/fraud/test_ivt_scoring_job.py
+	@if [ -x ml/.venv/bin/python ]; then \
+		ml/.venv/bin/python data/fraud/test_ivt_scoring_job.py; \
+	else \
+		python3 data/fraud/test_ivt_scoring_job.py; \
+	fi
 
 ## data-schema-invariants: verifica invariantes normativas do StatsHourly e billing
 data-schema-invariants:

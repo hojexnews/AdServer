@@ -216,12 +216,20 @@ else:
 
 # ---------------------------------------------------------------------------
 # Check 11: StatsHourly (004) preservado — ainda filtra ivt_status = '' (TX-6)
+#
+# Remove comentarios SQL antes de checar: a string 'ivt_status = ''' aparece
+# em prosa descritiva nos comentarios de 004_stats_hourly.sql (linhas 27 e
+# 105), o que satisfaria uma busca de substring ingenua mesmo se o filtro
+# real (linha 119, dentro de uniqStateIf) fosse removido do codigo.
 # ---------------------------------------------------------------------------
 if ddl_004:
-    if "ivt_status = ''" not in ddl_004:
+    ddl_004_code = "\n".join(
+        line for line in ddl_004.splitlines() if not line.strip().startswith("--")
+    )
+    if "ivt_status = ''" not in ddl_004_code:
         print(
-            "ERRO [11]: 004_stats_hourly.sql nao filtra ivt_status = ''. "
-            "A migration 007 nao deve alterar esta invariante.",
+            "ERRO [11]: 004_stats_hourly.sql nao filtra ivt_status = '' no codigo "
+            "(fora de comentarios). A migration 007 nao deve alterar esta invariante.",
             file=sys.stderr,
         )
         fail = 1

@@ -40,3 +40,7 @@ jobs:
         run: make data-validate
       - name: billing CPM floor (BILLING.md §4.1)
         run: make data-billing-test
+      - name: install deps for IVT scoring test (numpy/pandas/mmh3)
+        run: pip install --quiet numpy pandas mmh3
+      - name: IVT scoring job test (TX-6 / J6, sample sintetico)
+        run: make data-ivt-test
