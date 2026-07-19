@@ -231,16 +231,41 @@ function reducer(state: CopilotSessionState, action: Action): CopilotSessionStat
 
 // ---------------------------------------------------------------------------
 // Validação anti-contradição sobre sugestões de regras (CA-4)
-// Reutiliza detectContradictions de lib/contradiction.ts
+//
+// Reutiliza de fato detectContradictions() de lib/contradiction.ts — o MESMO
+// algoritmo usado pelo builder de segmentação (app/rules/page.tsx) — contra o
+// conjunto real [regras JÁ EXISTENTES do owner (ownerType/ownerId) + candidato
+// sugerido pela IA]. Sem as regras existentes, um candidato isolado nunca pode
+// contradizer a si mesmo (par precisa de 2+ elementos), então buscamos as
+// regras persistidas via trpc.cfg.deliveryRule.list antes de decidir.
+//
+// FIX #17 (achado da 27ª onda): a versão anterior comparava o candidato
+// consigo mesmo (`detectContradictions([candidate, candidate])`), um
+// self-compare que NUNCA detecta nada real, e descartava o resultado
+// (`void selfCheck`) — o aviso exibido era um heurístico textual solto,
+// não a validação anti-contradição que a doc/mandato prometiam. Corrigido
+// para buscar o contexto real e rodar a validação de verdade.
 // ---------------------------------------------------------------------------
 
-function checkDiffForContradictions(diff: WriteDiff): string | null {
+/**
+ * Verifica se o WriteDiff de uma regra sugerida contradiz o conjunto de
+ * regras existentes fornecido. Função pura e síncrona — testável sem
+ * trpc/React (ver use-copilot-session.test.ts).
+ *
+ * @param diff - WriteDiff recebido no evento SSE hitl_required.
+ * @param existingRules - Regras JÁ SALVAS do mesmo owner (ownerType/ownerId
+ *   do diff), tipicamente obtidas via trpc.cfg.deliveryRule.list.fetch().
+ *   Passe [] se a busca não for possível — o resultado será conservador
+ *   (nenhum falso-positivo, mas também nenhuma detecção sem contexto).
+ */
+export function checkDiffForContradictions(
+  diff: WriteDiff,
+  existingRules: RuleCandidate[] = []
+): string | null {
   if (diff.kind !== "rule") return null;
+  if (diff.action === "delete") return null;
   if (!diff.vector || !diff.operator || !diff.value || !diff.logicalOp) return null;
 
-  // Para um diff de regra única, não temos o conjunto completo de regras do owner.
-  // Sinalizamos que o usuário deve verificar contradições antes de aplicar.
-  // A validação completa acontece quando o builder de segmentação carrega as regras existentes.
   const candidate: RuleCandidate = {
     vector: diff.vector,
     operator: diff.operator,
@@ -248,22 +273,55 @@ function checkDiffForContradictions(diff: WriteDiff): string | null {
     logicalOp: diff.logicalOp as "AND" | "OR",
   };
 
-  // Auto-contradição interna (ex.: is e is not o mesmo valor)
-  const selfCheck = detectContradictions([candidate, candidate]);
-  // selfCheck seria sempre falso para um único candidato — verificamos contra si mesmo
-  // de forma que logicalOp AND com operadores opostos seja detectada
-  // Para uma regra única, a contradição real só aparece em contexto com as outras regras.
-  // Emitimos aviso preventivo quando logicalOp=AND e operator sugere exclusão.
-  if (candidate.logicalOp === "AND" && candidate.operator === "is not") {
-    return (
-      `Aviso: a regra sugerida usa AND + "is not". ` +
-      `Verifique se já existe uma regra AND "is" para o mesmo vetor "${candidate.vector}" — ` +
-      `a combinação pode ser contraditória.`
-    );
+  // Validação REAL: mesmo detectContradictions() do builder, sobre
+  // [regras existentes do owner + candidato sugerido].
+  const result = detectContradictions([...existingRules, candidate]);
+  if (!result.hasContradiction) return null;
+
+  // Reporta apenas os conflitos que envolvem o candidato sugerido — conflitos
+  // pré-existentes só entre regras já salvas não são responsabilidade desta
+  // sugestão específica (identidade de referência: candidate é o mesmo objeto
+  // inserido no array acima, detectContradictions não clona as entradas).
+  const relevant = result.conflicts.filter(
+    (c) => c.ruleA === candidate || c.ruleB === candidate
+  );
+  if (relevant.length === 0) return null;
+
+  return (
+    `Contradição detectada (CA-4): a regra sugerida entra em conflito com ` +
+    `${relevant.length} regra(s) já existente(s). ` +
+    relevant.map((c) => c.reason).join(" ")
+  );
+}
+
+/**
+ * Busca as regras existentes do owner do diff (quando aplicável) e roda
+ * checkDiffForContradictions() com o contexto real.
+ *
+ * `listExistingRules` é injetado (em vez de chamar trpc diretamente) para
+ * manter esta função pura/testável com um fetcher fake — a produção passa
+ * um wrapper sobre trpc.cfg.deliveryRule.list.fetch() (ver useCopilotSession).
+ */
+export async function resolveContradictionWarning(
+  diff: WriteDiff,
+  listExistingRules: (
+    ownerType: "campaign" | "banner",
+    ownerId: string
+  ) => Promise<RuleCandidate[]>
+): Promise<string | null> {
+  let existingRules: RuleCandidate[] = [];
+
+  if (diff.kind === "rule" && diff.ownerType && diff.ownerId) {
+    try {
+      existingRules = await listExistingRules(diff.ownerType, diff.ownerId);
+    } catch {
+      // Falha ao buscar regras existentes não deve travar o fluxo HITL —
+      // apenas seguimos sem esse contexto (conservador: não inventa contradição).
+      existingRules = [];
+    }
   }
 
-  void selfCheck; // não usado diretamente; detectContradictions é reutilizado no builder
-  return null;
+  return checkDiffForContradictions(diff, existingRules);
 }
 
 // ---------------------------------------------------------------------------
@@ -278,6 +336,31 @@ export function useCopilotSession() {
   const chatMutation = trpc.copilot.chat.useMutation();
   const approveMutation = trpc.copilot.hitlApprove.useMutation();
   const rejectMutation = trpc.copilot.hitlReject.useMutation();
+  const utils = trpc.useUtils();
+
+  // ---------------------------------------------------------------------------
+  // listExistingRules — busca as regras JÁ SALVAS do owner via o MESMO
+  // procedimento tRPC que o builder de segmentação usa (trpc.cfg.deliveryRule),
+  // para alimentar checkDiffForContradictions()/resolveContradictionWarning()
+  // com o contexto real (CA-4 / FIX #17).
+  // ---------------------------------------------------------------------------
+  const listExistingRules = useCallback(
+    async (
+      ownerType: "campaign" | "banner",
+      ownerId: string
+    ): Promise<RuleCandidate[]> => {
+      const rules = await utils.cfg.deliveryRule.list.fetch({ ownerType, ownerId });
+      return rules
+        .filter((r) => r.active)
+        .map((r) => ({
+          vector: r.vector,
+          operator: r.operator,
+          value: r.value,
+          logicalOp: r.logicalOp,
+        }));
+    },
+    [utils]
+  );
 
   // ---------------------------------------------------------------------------
   // Abre o EventSource SSE contra a rota Next.js (proxy BFF→copilot)
@@ -317,11 +400,15 @@ export function useCopilotSession() {
       es.addEventListener("hitl_required", (e) => {
         const ev = parseSseEvent(e.data);
         if (ev?.type === "hitl_required") {
-          // CA-4: verifica se o diff de regra sugere uma contradição
-          const warning = checkDiffForContradictions(ev.diff);
-          dispatch({ type: "HITL_REQUIRED", event: ev, warning });
           // Para o stream — o usuário deve aprovar antes de continuar
           closeEs();
+          // CA-4: busca as regras existentes do owner e roda a validação
+          // anti-contradição REAL (FIX #17) antes de exibir o diff ao usuário.
+          void resolveContradictionWarning(ev.diff, listExistingRules).then(
+            (warning) => {
+              dispatch({ type: "HITL_REQUIRED", event: ev, warning });
+            }
+          );
         }
       });
 
@@ -348,7 +435,7 @@ export function useCopilotSession() {
         closeEs();
       });
     },
-    []
+    [listExistingRules]
   );
 
   // ---------------------------------------------------------------------------

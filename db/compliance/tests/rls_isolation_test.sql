@@ -269,6 +269,61 @@ $$;
 
 
 -- ===========================================================================
+-- BLOCO 5.5 — Anti-tautologia: confirma WITH CHECK EXPLICITO no catalogo
+--   pg_policy, INDEPENDENTE do valor de USING.
+--
+-- POR QUE ESTE BLOCO E NECESSARIO
+--   As tres policies do cofre sao FOR ALL com USING === WITH CHECK (mesma
+--   expressao textual — 0001_compliance_schema_up.sql). Quando uma policy
+--   FOR ALL OMITE WITH CHECK, o Postgres reusa USING como verificacao de
+--   escrita EM TEMPO DE EXECUCAO (o mesmo SQLSTATE 42501/check_violation
+--   observado no Bloco 6 abaixo) — mas NAO grava nada em
+--   pg_policy.polwithcheck (verificado empiricamente contra Postgres 16.14
+--   nativo). Ou seja: o Bloco 6 sozinho passaria IDENTICO mesmo se o
+--   WITH CHECK fosse removido da migration — e tautologico em relacao a
+--   presenca do WITH CHECK. Este bloco fecha a lacuna introspectando o
+--   catalogo diretamente, sem depender do comportamento de fallback de
+--   USING — dado o mais sensivel do repo (PII KYC + sancoes + Travel Rule).
+-- ===========================================================================
+
+DO $$
+DECLARE
+    v_rec     RECORD;
+    v_missing TEXT := '';
+    v_found   INT  := 0;
+BEGIN
+    FOR v_rec IN
+        SELECT polname, polrelid::regclass::text AS relname, polwithcheck
+        FROM pg_policy
+        WHERE polname IN (
+            'kyc_subjects_tenant_isolation',
+            'screening_results_tenant_isolation',
+            'travel_rule_records_tenant_isolation'
+        )
+    LOOP
+        v_found := v_found + 1;
+        IF v_rec.polwithcheck IS NULL THEN
+            v_missing := v_missing || format('%s.%s ', v_rec.relname, v_rec.polname);
+        END IF;
+    END LOOP;
+
+    -- Guarda contra falso-positivo por vacuidade: se as policies fossem
+    -- renomeadas/removidas, a query acima retornaria 0 linhas e o loop
+    -- "passaria" sem checar nada. Exige encontrar exatamente as 3 esperadas.
+    PERFORM pg_temp.assert_count('pg_policy: 3 policies do compliance encontradas', v_found::bigint, 3::bigint);
+
+    IF v_missing <> '' THEN
+        RAISE EXCEPTION
+            'ASSERT FALHOU [WITH CHECK ausente no catalogo pg_policy, independente de USING]: %',
+            v_missing;
+    END IF;
+
+    RAISE NOTICE 'PASS [pg_policy.polwithcheck NOT NULL nas 3 policies do compliance — WITH CHECK explicito, independente de USING]';
+END;
+$$;
+
+
+-- ===========================================================================
 -- BLOCO 6 — WITH CHECK: o cofre rejeita ESCRITA cross-tenant (caso d)
 --
 -- Os BLOCOS 1-5 provam apenas LEITURA. Este prova a ESCRITA: com

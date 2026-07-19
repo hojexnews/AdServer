@@ -6,7 +6,7 @@
 #                  promote — agregado completo, ~30-60 s, so onnxruntime/
 #                  onnxmltools Python, SEM PyTorch)
 #   ml-batch     — make ml-batch-test (pacing + fraud + unsup, ~30 s)
-#   copilot-test — make copilot-test  (126 testes HITL/gateway/security, ~5 s)
+#   copilot-test — make copilot-test  (suite de seguranca/gateway/HITL do copiloto, ~5 s)
 #
 # ml-deep fica fora do caminho de PR/push por custo (PyTorch). Acionamento
 # manual via workflow_dispatch (botao "Run workflow" no GitHub Actions).
@@ -142,8 +142,9 @@ jobs:
         run: make ml-batch-test
 
   # -----------------------------------------------------------------------
-  # copilot-test: 126 testes de services/copilot/ (J5 — HITL, gateway,
-  # model-router, schemas, security). Aciona tambem em paths de copilot.
+  # copilot-test: suite de seguranca/gateway/HITL de services/copilot/ (J5 —
+  # HITL, gateway, model-router, schemas, security). Aciona tambem em paths
+  # de copilot. NAO hardcodar contagem de testes (a suite cresce a cada onda).
   # -----------------------------------------------------------------------
   copilot-test:
     runs-on: ubuntu-latest
@@ -158,7 +159,7 @@ jobs:
         working-directory: services/copilot
         run: pip install --quiet -e ".[dev]"
 
-      - name: copilot-test (J5 — 126 testes)
+      - name: copilot-test (J5 — suite de seguranca/gateway/HITL)
         run: PYTHONPATH=. python -m pytest services/copilot/tests/ -v
 
   # -----------------------------------------------------------------------
@@ -189,7 +190,44 @@ jobs:
             pytest-cov \
             torch --index-url https://download.pytorch.org/whl/cpu \
             onnx \
+            onnxscript \
             onnxruntime
 
+      # Sentinela contra re-drift do pip install acima: os 3 testes
+      # TestONNXParity (ml/deep/test_deep.py) usam pytest.importorskip
+      # para onnxruntime/onnxscript, entao se algum dia o pacote sair da
+      # lista acima, os testes viram SKIPPED em silencio e o job fica
+      # verde SEM validar a paridade PyTorch<->ONNX. Este passo falha
+      # duro e alto, antes mesmo de rodar pytest, se faltar qualquer um.
+      - name: sentinela onnxscript/onnxruntime (evita skip silencioso do TestONNXParity)
+        run: |
+          python -c "
+          import importlib, sys
+          faltando = [m for m in ('onnxscript', 'onnxruntime', 'onnxruntime.quantization') if importlib.util.find_spec(m) is None]
+          if faltando:
+              print(f'ERRO: pacote(s) ausente(s) no ambiente de CI: {faltando}.', file=sys.stderr)
+              print('Isso faria TestONNXParity (ml/deep/test_deep.py) SKIPPAR em silencio via pytest.importorskip,', file=sys.stderr)
+              print('mascarando o gate de paridade PyTorch<->ONNX pre-K8. Corrija o pip install acima.', file=sys.stderr)
+              sys.exit(1)
+          print('sentinela onnxscript/onnxruntime: OK — pacotes presentes.')
+          "
+
       - name: ml-deep-test (mandatorio pre-K8)
-        run: make ml-deep-test
+        run: |
+          set -o pipefail
+          make ml-deep-test 2>&1 | tee /tmp/ml-deep-test.log
+          # Blindagem adicional (defesa em profundidade, alem da sentinela
+          # de import acima): falha se QUALQUER teste tiver sido SKIPPED
+          # (nao so os de ONNX) e confirma explicitamente que os 3 testes
+          # de TestONNXParity rodaram e passaram — nunca skiparam em silencio.
+          if grep -qiE '[0-9]+ skipped' /tmp/ml-deep-test.log; then
+            echo "ERRO: ml-deep-test reportou teste(s) SKIPPED — gate mascarado em silencio (pre-K8 deve rodar 100% da suite)." >&2
+            exit 1
+          fi
+          for t in test_onnx_float32_parity test_onnx_int8_parity test_onnx_output_in_0_1; do
+            if ! grep -q "TestONNXParity::$t PASSED" /tmp/ml-deep-test.log; then
+              echo "ERRO: TestONNXParity::$t nao apareceu como PASSED no output — paridade ONNX nao foi validada." >&2
+              exit 1
+            fi
+          done
+          echo "ml-deep-test: TestONNXParity (3/3) confirmado PASSED, 0 skipped."

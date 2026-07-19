@@ -10,9 +10,15 @@
 #      Requer: golang-migrate CLI no PATH e DATABASE_URL exportado.
 #
 #   2. Postgres efêmero via Docker (db-test-all):
-#      Sobe um container postgres:16, aplica TODAS as migrations de todos
-#      os schemas em ordem, roda TODOS os rls_isolation_test.sql, aplica
-#      os _down e confirma reversão. Derruba o container ao fim.
+#      Sobe um container pgvector/pgvector:pg16 (postgres:16 + extensão
+#      pgvector — necessário porque a migration db/vector/0001 faz
+#      `CREATE EXTENSION vector`; a imagem stock postgres:16 não a traz e a
+#      migration abortaria antes de qualquer RLS test rodar — alinhado com
+#      .github/workflows/db.yml, que já usa pgvector/pgvector:pg16 por este
+#      mesmo motivo), aplica TODAS as migrations de todos os schemas em
+#      ordem, roda TODOS os rls_isolation_test.sql (+ postings_immutability_test.sql
+#      do ledger), aplica os _down e confirma reversão. Derruba o container
+#      ao fim.
 #      Requer: docker no PATH.
 #      Nenhuma credencial externa necessária — completamente efêmero.
 #
@@ -95,6 +101,17 @@ db-test-ledger: _db-check-url
 	      -f db/ledger/tests/rls_isolation_test.sql
 	@echo "== db-test-ledger: concluído =="
 
+## db-test-ledger-immutability: prova append-only de ledger.postings e imutabilidade
+##   de ledger.journal_entries pos-posted/void (achado HIGH #6 / migration 0004).
+##   Requer DATABASE_URL e que as migrations 0001..0004 do schema ledger tenham sido
+##   aplicadas. Roda dentro de ROLLBACK — não persiste dados.
+db-test-ledger-immutability: _db-check-url
+	@echo "== db-test-ledger-immutability: append-only postings + journal_entries (HIGH #6) =="
+	@psql "$(DATABASE_URL)" \
+	      -v ON_ERROR_STOP=1 \
+	      -f db/ledger/tests/postings_immutability_test.sql
+	@echo "== db-test-ledger-immutability: concluído =="
+
 ## db-test-vector: executa o teste de isolamento RLS do schema vector_store.
 ##   Requer DATABASE_URL e que as migrations do schema vector tenham sido aplicadas.
 ##   O teste roda dentro de ROLLBACK — não persiste dados.
@@ -106,10 +123,14 @@ db-test-vector: _db-check-url
 	@echo "== db-test-vector: concluído =="
 
 ## db-test-all: sobe Postgres efêmero (Docker), aplica TODAS as migrations,
-##   roda TODOS os rls_isolation_test.sql (config, ledger, vector, compliance),
-##   aplica _down e confirma reversão. Derruba o container ao fim.
+##   roda TODOS os rls_isolation_test.sql (config, ledger, vector, compliance)
+##   + postings_immutability_test.sql (ledger), aplica _down e confirma
+##   reversão. Derruba o container ao fim.
 ##   Sem DATABASE_URL externo — completamente efêmero e sem credenciais.
 ##   Requer: docker no PATH.
+##   Imagem: pgvector/pgvector:pg16 (postgres:16 + extensão pgvector — a
+##   stock postgres:16 não traz a extensão que db/vector/0001 exige via
+##   `CREATE EXTENSION vector`; alinhado com .github/workflows/db.yml).
 db-test-all:
 	@echo "== db-test-all: iniciando Postgres efêmero =="
 	@if ! command -v docker >/dev/null 2>&1; then \
@@ -122,14 +143,14 @@ db-test-all:
 	fi
 	@# Garante que não há container residual de execução anterior.
 	@docker rm -f $(_DB_TEST_CONTAINER) >/dev/null 2>&1 || true
-	@echo "-- subindo postgres:16 na porta $(_DB_TEST_PORT) ..."
+	@echo "-- subindo pgvector/pgvector:pg16 na porta $(_DB_TEST_PORT) ..."
 	@docker run -d \
 	  --name $(_DB_TEST_CONTAINER) \
 	  -e POSTGRES_USER=$(_DB_TEST_USER) \
 	  -e POSTGRES_PASSWORD=$(_DB_TEST_PASS) \
 	  -e POSTGRES_DB=$(_DB_TEST_DB) \
 	  -p $(_DB_TEST_PORT):5432 \
-	  postgres:16 >/dev/null
+	  pgvector/pgvector:pg16 >/dev/null
 	@echo "-- aguardando Postgres ficar pronto ..."
 	@_DSN="$(_DB_TEST_DSN)"; \
 	 for i in $$(seq 1 30); do \
@@ -165,7 +186,7 @@ db-test-all:
 	   psql "$$_DSN" -v ON_ERROR_STOP=1 -q \
 	     -f "db/config/migrations/$${f}_up.sql" || FAIL=1; \
 	 done; \
-	 for f in 0001_ledger_schema 0002_reconciliation_exceptions 0003_ledger_rls; do \
+	 for f in 0001_ledger_schema 0002_reconciliation_exceptions 0003_ledger_rls 0004_ledger_postings_immutable; do \
 	   echo "  up: ledger/$$f"; \
 	   psql "$$_DSN" -v ON_ERROR_STOP=1 -q \
 	     -f "db/ledger/migrations/$${f}_up.sql" || FAIL=1; \
@@ -184,12 +205,19 @@ db-test-all:
 	@# --------------------------------------------------------------------------
 	@# FASE 3: aplicar grants sobre os schemas criados pelas migrations.
 	@# dev_roles.sql cobre config + asset_registry; adicionar ledger/vector/compliance.
+	@# Least-privilege (achado HIGH #6): adserver_app nunca faz UPDATE/DELETE em
+	@# ledger.postings (internal/ledger/posting.go só faz INSERT/SELECT) — o REVOKE
+	@# abaixo estreita o grant amplo de ALL TABLES para esta tabela especificamente.
+	@# Mudança de comportamento ZERO para a aplicação; a garantia primária de
+	@# append-only é o trigger postings_immutable_trg (migration 0004), que vale
+	@# também para superusuário e para acesso direto a uma partição.
 	@# --------------------------------------------------------------------------
 	@echo "-- aplicando grants sobre os schemas ..."
 	@psql "$(_DB_TEST_DSN)" -v ON_ERROR_STOP=1 -q -f db/seed/dev_roles.sql
 	@psql "$(_DB_TEST_DSN)" -v ON_ERROR_STOP=1 -q \
 	  -c "GRANT USAGE ON SCHEMA ledger TO adserver_loader, adserver_app;" \
 	  -c "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ledger TO adserver_app;" \
+	  -c "REVOKE UPDATE, DELETE ON ledger.postings FROM adserver_app;" \
 	  -c "GRANT SELECT ON ALL TABLES IN SCHEMA ledger TO adserver_loader;" \
 	  -c "GRANT USAGE ON ALL SEQUENCES IN SCHEMA ledger TO adserver_app;" \
 	  -c "GRANT EXECUTE ON FUNCTION ledger.current_tenant_id() TO adserver_app, adserver_loader;" \
@@ -207,6 +235,7 @@ db-test-all:
 	 for schema_test in \
 	   "config:db/config/tests/rls_isolation_test.sql" \
 	   "ledger:db/ledger/tests/rls_isolation_test.sql" \
+	   "ledger-immutability:db/ledger/tests/postings_immutability_test.sql" \
 	   "vector:db/vector/tests/vector_rls_isolation_test.sql" \
 	   "compliance:db/compliance/tests/rls_isolation_test.sql"; do \
 	   schema=$$(echo "$$schema_test" | cut -d: -f1); \
@@ -237,7 +266,7 @@ db-test-all:
 	   psql "$$_DSN" -v ON_ERROR_STOP=1 -q \
 	     -f "db/vector/migrations/$${f}_down.sql" || FAIL=1; \
 	 done; \
-	 for f in 0003_ledger_rls 0002_reconciliation_exceptions 0001_ledger_schema; do \
+	 for f in 0004_ledger_postings_immutable 0003_ledger_rls 0002_reconciliation_exceptions 0001_ledger_schema; do \
 	   psql "$$_DSN" -v ON_ERROR_STOP=1 -q \
 	     -f "db/ledger/migrations/$${f}_down.sql" || FAIL=1; \
 	 done; \
@@ -266,5 +295,6 @@ _db-check-url:
 	fi
 
 .PHONY: db-lint db-migrate-up db-migrate-down db-migrate-status \
-        db-test db-test-compliance db-test-ledger db-test-vector db-test-all \
+        db-test db-test-compliance db-test-ledger db-test-ledger-immutability \
+        db-test-vector db-test-all \
         _db-check-url

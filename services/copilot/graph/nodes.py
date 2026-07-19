@@ -471,6 +471,16 @@ def make_apply_write_node(gateway: ToolGateway):
       Verifica que o tenant_id do estado (dono do diff) coincide com o
       tenant_id da sessão atual antes de aplicar. Se não coincidirem,
       retorna erro (proteção dupla — a primeira está no endpoint HITL).
+
+    SEGURANÇA (Achado #18 — gate de proveniência/anti-contradição é GATE,
+    não opção, §6/§7 do mandato + CA-4):
+      diff.validation_result (proveniência C2PA/SynthID/PII de validate_creative,
+      ou anti-contradição §4.6/CA-4 de validate_segmentation) é verificado
+      ANTES de qualquer chamada a gateway.apply_write. Se gate_passed=False
+      ou is_valid=False, a escrita é RECUSADA — nunca persiste, mesmo que o
+      humano tenha clicado em aprovar no HITL (a UI deve impedir aprovação de
+      diffs reprovados, mas o backend não pode confiar só nisso: fail-closed
+      em profundidade). Nenhuma exceção — retorna next_action='error'.
     """
 
     async def apply_write_node(state: CopilotState) -> dict[str, Any]:
@@ -496,6 +506,39 @@ def make_apply_write_node(gateway: ToolGateway):
                 "error_message": "apply_write: divergência de tenant entre diff e estado.",
                 "pending_diff": None,
             }
+
+        # Achado #18: gate de proveniência (C2PA/SynthID/PII) e anti-contradição
+        # (CA-4) NÃO são informativos — bloqueiam a persistência. Um diff cujo
+        # validation_result reprovou (gate_passed=False e/ou is_valid=False)
+        # NUNCA chega a gateway.apply_write, independentemente de hitl_approved.
+        validation = diff.validation_result
+        if validation is not None:
+            gate_passed = validation.get("gate_passed", True)
+            is_valid = validation.get("is_valid", True)
+            if gate_passed is False or is_valid is False:
+                violations = (
+                    validation.get("violations")
+                    or [c.get("description", str(c)) for c in validation.get("conflicts", [])]
+                    or ["Validação reprovada (proveniência/PII/anti-contradição CA-4)."]
+                )
+                log.error(
+                    "apply_write_node.validation_gate_blocked",
+                    tenant_id=tenant_id,
+                    operation=diff.operation,
+                    gate_passed=gate_passed,
+                    is_valid=is_valid,
+                    violations=violations,
+                )
+                return {
+                    "next_action": "error",
+                    "error_message": (
+                        "Escrita bloqueada: validação de proveniência (C2PA/SynthID/PII) "
+                        "ou anti-contradição (§4.6/CA-4) reprovou este diff. "
+                        "Corrija as violações e gere um novo draft antes de aplicar."
+                    ),
+                    "pending_diff": None,
+                    "hitl_approved": None,
+                }
 
         log.info(
             "apply_write_node.start",

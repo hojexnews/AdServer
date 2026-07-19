@@ -266,8 +266,17 @@ platform-openbao-policy-check:
 	@echo "== platform-openbao-policy-check: least-privilege por celula (HCL) =="
 	@python3 "$(CURDIR)/$(OPENBAO_DIR)/policy-check.py" "$(CURDIR)/$(OPENBAO_DIR)"
 
-## platform-validate: tofu validate + kubeconform + kyverno test + otel-validate + openbao-policy-check (tudo offline)
-platform-validate: platform-tofu-validate platform-kubeconform platform-kyverno-test platform-otel-validate platform-openbao-policy-check
-	@echo "OK — platform validado offline (tofu + kubeconform + kyverno test + otel-validate TX-5 + openbao-policy-check)."
+## platform-cell-consistency: gate cross-arquivo contra drift de nome de celula
+##   (root OpenTofu main.tf/variables.tf vs. layout real de platform/). tofu
+##   validate isolado passa verde mesmo com nome errado — so valida sintaxe HCL,
+##   nao consistencia cross-arquivo (achado #20 da auditoria 28a onda: "aml" no
+##   root vs. "aml-kyc" canonico em todo o resto de platform/).
+platform-cell-consistency:
+	@echo "== platform-cell-consistency: sem drift de nome de celula (cross-arquivo) =="
+	@python3 "$(CURDIR)/platform/tofu/check-cell-consistency.py"
 
-.PHONY: platform-tools platform-tofu-validate platform-kubeconform platform-kyverno-test platform-otel-validate platform-openbao-policy-check platform-validate
+## platform-validate: tofu validate + kubeconform + kyverno test + otel-validate + openbao-policy-check + cell-consistency (tudo offline)
+platform-validate: platform-tofu-validate platform-kubeconform platform-kyverno-test platform-otel-validate platform-openbao-policy-check platform-cell-consistency
+	@echo "OK — platform validado offline (tofu + kubeconform + kyverno test + otel-validate TX-5 + openbao-policy-check + cell-consistency)."
+
+.PHONY: platform-tools platform-tofu-validate platform-kubeconform platform-kyverno-test platform-otel-validate platform-openbao-policy-check platform-cell-consistency platform-validate

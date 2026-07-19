@@ -222,7 +222,7 @@ make ml-test && make ml-batch-test && make data-validate
 # Fora do agregado ml-test para nao inflar o gate rapido de CI.
 make ml-deep-test
 
-# Copiloto — alvo make canonico (126 testes: gateway/model-router/schemas/security)
+# Copiloto — alvo make canonico (suite gateway/model-router/schemas/security/HITL)
 make copilot-test
 ```
 

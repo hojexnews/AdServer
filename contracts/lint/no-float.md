@@ -10,15 +10,24 @@ linguagens da stack — Go, TypeScript, Python, SQL. Dinheiro usa `Money`/`NUMER
 
 ## Escopo (importante)
 
-O lint é **restrito aos diretórios/módulos financeiros** — **não** barra floats legítimos em
-ML, telemetria de performance, ranking (`pCTR`/`pCVR`), métricas etc. Escopo sugerido:
+O objetivo é barrar float em **dinheiro** sem barrar floats legítimos de ML, telemetria de
+performance, ranking (`pCTR`/`pCVR`), métricas etc. A **28ª onda** aprendeu que restringir o
+gate a diretórios/nomes "financeiros" é um ponto-cego ativo (um campo monetário podia ser
+adicionado fora de `money/`/`payments/`, ou um arquivo de dinheiro com nome não-convencional
+passava sem lint). Por isso o escopo real hoje é **abrangente com exceção explícita**, por linguagem:
 
-```
-# Diretórios/sufixos considerados "financeiros" (ajustar à árvore real do monorepo):
-**/money/**            **/ledger/**           **/billing/**
-**/payments/**         **/asset*registry*/**  **/*_money_*  **/*.money.*
-**/chainconnector/**   (manipula Money no limite on-chain — Fase 3)
-migrations/**          db/migrations/**       sql/**
+```text
+# Escopo REAL por linguagem (ver §1–§5 e os scripts em scripts/ci/):
+Proto  → TODO proto/adserver/**/*.proto; default-deny de double/float + allowlist
+         explícita por (arquivo, campo, tag) para os poucos double de ML (decision.proto).
+Go     → pacotes puro-dinheiro (internal/money, internal/ledger, internal/billing,
+         internal/ranker/score.go, services/payments, internal/chainconnector); barra
+         float32/64 E literais decimais (dinheiro é inteiro em minor units).
+TS     → ESLint por-nome de arquivo (bff/src/**/*{money,ledger,billing,payments}*.ts) +
+         backstop por CONTEÚDO (scripts/ci/no-float-ts.sh) sobre TODO bff/src, independente
+         do nome; console (web/console) via eslint.config.mjs em arquivos de dinheiro.
+Python → diretórios financeiros de ML (ml/pacing, ml/fraud) — floats de features ML livres.
+SQL    → migrations/** · db/**/migrations/** — sem FLOAT/MONEY em coluna monetária.
 ```
 
 Tudo fora desse escopo é ignorado pelos checks abaixo.
@@ -173,30 +182,76 @@ O marcador é **greppável e auditável** (`git grep no-float-ok`) — mesma fil
 
 ## 5. Job de CI (GitHub Actions)
 
-Roda os 4 checks; qualquer violação **falha o build**. Escopo financeiro embutido em cada script.
+Roda os checks (proto + 4 linguagens); qualquer violação **falha o build**. Escopo
+financeiro embutido em cada script. Bloco abaixo é **verbatim** ao workflow real —
+[`.github/workflows/no-float.yml`](../../.github/workflows/no-float.yml) — mantenha-os
+sincronizados a cada alteração:
 
 ```yaml
 # .github/workflows/no-float.yml
 name: no-float (TX-2)
+
 on:
   pull_request:
   push:
     branches: [main]
+
+permissions:
+  contents: read
+
 jobs:
   no-float:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Go - sem float em dinheiro
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Proto — sem float/double em Money/Payments (TX-2, nivel de contrato)
+        run: bash scripts/ci/no-float-proto.sh
+      - name: Go — sem float em dinheiro
         run: bash scripts/ci/no-float-go.sh
-      - name: TypeScript - lint financeiro (ESLint)
-        run: npx eslint "**/{money,ledger,billing,payments}/**/*.ts"
-      - name: Python - sem float em dinheiro
+      - name: TypeScript — lint financeiro (ESLint, arquivos reais de dinheiro do BFF)
+        run: |
+          set -euo pipefail
+          # Convencao real do repo: ARQUIVO money.ts/payments.ts (nao diretorio
+          # money/, payments/ — o glob antigo '**/{money,...}/**/*.ts' so
+          # casava gen/ts/**, nunca a convencao real de arquivo do BFF).
+          FILES=$(git ls-files 'bff/src/**/*.ts' \
+            | grep -E '(^|/)[^/]*(money|ledger|billing|payments)[^/]*\.ts$' \
+            | grep -v '\.test\.ts$' || true)
+          if [ -n "$FILES" ]; then
+            npm ci --prefix bff
+            node bff/node_modules/eslint/bin/eslint.js --no-config-lookup -c eslint.config.mjs $FILES
+          else
+            echo "sem TS financeiro real (ok)"
+          fi
+      - name: TypeScript — backstop por CONTEUDO (BFF, independente do nome do arquivo)
+        run: bash scripts/ci/no-float-ts.sh
+      - name: Python — sem float em dinheiro
         run: bash scripts/ci/no-float-py.sh
-      - name: SQL/migrations - sem FLOAT/MONEY
+      - name: SQL/migrations — sem FLOAT/MONEY
         run: bash scripts/ci/no-float-sql.sh
 ```
 
-**Resumo:** float **proibido** em código financeiro nas 4 linguagens; escopo restrito a
-`money/ledger/billing/payments/migrations` para **não** punir floats legítimos de ML e
-telemetria. Coerente com o contrato `Money` e o Asset Registry desta pasta.
+Nota sobre o step Proto: `no-float-proto.sh` varre **todo** `proto/adserver/**/*.proto`
+(não só `money/`/`payments/`) com default-deny + allowlist explícita para os poucos
+campos `double` legítimos de ML/ranking (`decision.proto`) — ver o cabeçalho do script
+para o porquê (falso-positivo corrigido: um campo monetário podia ser adicionado fora de
+`money/payments/` sem disparar o gate antigo).
+
+Nota sobre o step TypeScript: o glob usado é por **arquivo** (`*money*.ts`,
+`*ledger*.ts`, `*billing*.ts`, `*payments*.ts` dentro de `bff/src/`), não por
+**diretório** (`**/{money,...}/**/*.ts`) — o glob de diretório não casa nenhum arquivo
+real deste repo (a convenção do BFF é nome de arquivo, não pasta dedicada) e faria o
+step passar silenciosamente sem lintar nada. O step seguinte (**backstop por CONTEÚDO**,
+`scripts/ci/no-float-ts.sh`) fecha a lacuna complementar: varre **todo** `bff/src` (não só
+os nomes convencionais) e reprova `parseFloat`/`Number(`/literal-decimal em linhas que
+toquem identificadores de dinheiro, mesmo em arquivos cujo nome foge da convenção
+(achado nº 2 da 28ª onda — ex.: `refunds-cash.ts`).
+
+**Resumo:** float **proibido** em código financeiro nas linguagens do contrato (Proto,
+Go, TypeScript, Python, SQL); escopo restrito aos artefatos financeiros reais de cada
+linguagem (path para Go/TS/Python/SQL; default-deny + allowlist explícita para Proto)
+para **não** punir floats legítimos de ML e telemetria. Coerente com o contrato `Money`
+e o Asset Registry desta pasta.

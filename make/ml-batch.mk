@@ -62,13 +62,20 @@ ml-batch-pacing-dryrun:
 ## Padrão monetário: float() aplicado a amount/price/cpm/cpc/cpa/bid/budget/revenue/
 ## cost/minor_units/money. Float de feature ML (vetores numpy/ONNX) nao e flagrado.
 ## Plugado em ml-batch-test para garantir que CI sempre execute este gate.
+##
+## NOTA (fronteira de termo): usamos delimitadores explicitos [^A-Za-z0-9]/^/$
+## em vez de \b, porque '_' e caractere de palavra para \b — 'bid_minor_units'
+## ou 'daily_budget' NAO seriam flagrados com \b (o boundary fica entre letras
+## e '_', que \b nao enxerga). Com [^A-Za-z0-9] o '_' conta como fronteira,
+## entao identificadores snake_case com termo monetario embutido sao pegos.
 ml-batch-no-float:
 	@echo "== ml-batch-no-float (TX-2) =="
 	@fail=0; \
+	terms='(amount|price|cpm|cpc|cpa|bid|budget|revenue|cost|minor_units?|money|spend|payout|charge)'; \
 	for f in $(ML_PACING_DIR)/*.py $(ML_FRAUD_DIR)/*.py; do \
 		[ -f "$$f" ] || continue; \
 		if grep -nEi \
-			'float\s*\(.*\b(amount|price|cpm|cpc|cpa|bid|budget|revenue|cost|minor_units?|money|spend|payout|charge)\b|\b(amount|price|cpm|cpc|cpa|bid|budget|revenue|cost|minor_units?|money|spend|payout|charge)\b.*float\s*\(' \
+			"float\s*\(.*(^|[^A-Za-z0-9])$${terms}([^A-Za-z0-9]|\$$)|(^|[^A-Za-z0-9])$${terms}([^A-Za-z0-9]|\$$).*float\s*\(" \
 			"$$f"; then \
 			echo "  VIOLACAO TX-2: float monetario em $$f — use int64 minor-units"; \
 			fail=1; \

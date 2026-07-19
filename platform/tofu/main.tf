@@ -21,11 +21,11 @@ locals {
     ml       = "ml"
     data     = "data"
     pci      = "pci"
-    aml      = "aml"
+    aml-kyc  = "aml-kyc"
   }
 
   # Células de compliance recebem isolamento reforçado (conta separada no alvo).
-  compliance_cells = ["pci", "aml"]
+  compliance_cells = ["pci", "aml-kyc"]
 }
 
 # ----------------------------------------------------------------------------

@@ -28,9 +28,9 @@ variable "kubernetes_version" {
 }
 
 variable "cells" {
-  description = "Células de isolamento (TX-3/§2.7). PCI e AML são de escopo mínimo."
+  description = "Células de isolamento (TX-3/§2.7). PCI e AML/KYC são de escopo mínimo."
   type        = list(string)
-  default     = ["platform", "delivery", "ml", "data", "pci", "aml"]
+  default     = ["platform", "delivery", "ml", "data", "pci", "aml-kyc"]
 }
 
 variable "tags" {

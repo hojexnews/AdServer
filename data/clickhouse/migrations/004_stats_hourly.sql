@@ -151,6 +151,77 @@ GROUP BY hour_bucket, tenant_id, campaign_id, banner_id, zone_id, currency;
 -- =============================================================================
 -- Exclui conversions deduplicated=1 (duplicatas marcadas na ingestao).
 -- currency = conversion_value_asset_code (ledger por ativo, DA-10).
+--
+-- -----------------------------------------------------------------------------
+-- LACUNA CONHECIDA (achado #11, 28a onda) — conversion_value_state NAO e
+-- idempotente sob reentrega at-least-once do MESMO event_id em blocos de
+-- INSERT SEPARADOS. Documentado aqui em vez de "corrigido as cegas": ver
+-- justificativa completa e teste-guarda em
+-- data/clickhouse/tests/stats_hourly_conversion_idempotency_test.sql.
+--
+-- MECANISMO EXATO:
+--   Uma MATERIALIZED VIEW "AS SELECT ... FROM raw_conversion" dispara UMA VEZ
+--   por BLOCO recem-inserido em raw_conversion (semantica nativa do ClickHouse:
+--   o SELECT roda apenas sobre as linhas daquele INSERT, nao sobre o estado
+--   merged da tabela inteira). Por isso — ao contrario de live_stats_exact
+--   (005_live_view.sql), que e uma VIEW PLANA reconsultada por request, onde
+--   "FROM raw_conversion FINAL" de fato deduplica a tabela inteira NO MOMENTO
+--   da query — aqui um "FROM raw_conversion FINAL" seria um NO-OP: o bloco que
+--   a MV enxerga e so as linhas do INSERT que a disparou; FINAL nao tem
+--   "o que" deduplicar dentro de um unico bloco recem-chegado. Reentregas
+--   Redpanda at-least-once do MESMO event_id que cheguem em DOIS INSERTs
+--   distintos (2 blocos) disparam esta MV DUAS VEZES; o AggregatingMergeTree
+--   ACUMULA (soma) os dois estados parciais.
+--
+-- BLAST RADIUS PRECISO (mais estreito do que parece a primeira vista):
+--   - requests_state/impressions_state/clicks_state/conversions_state usam
+--     uniqState/uniqStateIf(event_id, ...): combinators de CARDINALIDADE
+--     DISTINTA. uniqMerge(state_a, state_b), quando ambos os estados contem
+--     o MESMO event_id, conta esse valor UMA vez (propriedade de uniao de
+--     sketch/conjunto). Ou seja, as CONTAGENS de requests/impressions/
+--     clicks/conversions em stats_hourly JA SAO idempotentes sob reentrega,
+--     mesmo disparando a MV 2x em blocos separados.
+--   - conversion_value_state usa sumState/sumStateIf: SUM nao tem nenhuma
+--     nocao de distinct-por-chave — soma cegamente cada linha processada.
+--     Duas reentregas do mesmo event_id = o MESMO conversion_value somado
+--     2x. NAO existe combinator nativo "sum distinto por event_id" no
+--     ClickHouse (o combinator -Distinct dedupe pelo VALOR agregado, nao por
+--     uma coluna-chave arbitraria — usa-lo aqui subcontaria conversoes
+--     legitimas com o mesmo valor monetario, um bug pior). Por isso o
+--     conversion_value de stats_hourly (e SOMENTE ele) pode ficar
+--     temporariamente inflado sob reentrega, ate a proxima reconciliacao.
+--
+-- POR QUE ISTO NAO QUEBRA O FATURAMENTO REAL (ADR-0001):
+--   O Iceberg (data/iceberg/jobs/billing_batch_hourly.py) e a UNICA fonte
+--   normativa de faturamento (idempotente via MERGE INTO por hour_bucket);
+--   o billing NUNCA le o streaming ClickHouse (ver internal/ledger/recon.go:
+--   "NUNCA use ClickHouse ou qualquer fonte de streaming"). O numero afetado
+--   aqui e apenas o StatsHourly admin-facing ("consolidado <=1h", DA-7/CA-6),
+--   que pode superestimar conversion_value ate a reconciliacao Iceberg<->
+--   ClickHouse (money-ledger-guardian) detectar a divergencia (ClickHouse >
+--   Iceberg) e abrir excecao — nunca autocorrigir (regra de ouro do mandato).
+--
+-- TODO PRECISO (exige decisao arquitetural — escalar para tech-lead-architect
+-- / ADR sucessor da ADR-0001; NAO implementado as cegas nesta migration):
+--   (a) insert_deduplication_token=event_id no INSERT do Kafka engine +
+--       deduplicate_blocks_in_dependent_materialized_views=1, para que o
+--       MESMO bloco (mesmo token) tambem pule a MV dependente. Limitacao:
+--       so funciona se o token cobrir o BLOCO INTEIRO reenviado identico
+--       (nao uma mistura parcial de linhas novas+duplicadas no mesmo flush
+--       do Kafka engine) — exige reworkar o batching do consumidor.
+--   (b) Substituir esta MV incremental por um job periodico (ex.: a cada
+--       poucos minutos) que recalcula/sobrescreve o estado do hour_bucket
+--       corrente a partir de "raw_conversion FINAL" (mesmo padrao de dedupe
+--       de live_stats_exact, porem como refresh agendado, nao MV push-based).
+--       Muda o pipeline "MV encadeada, sem Flink" endossado pela ADR-0001;
+--       precisa de decisao explicita (nao e mudanca puramente local deste
+--       arquivo).
+--   (c) Aceitar o limite como conhecido/documentado (impacto restrito ao
+--       dashboard admin, nao ao faturamento) e formalizar, na reconciliacao
+--       Iceberg<->ClickHouse, que divergencia unidirecional (ClickHouse >
+--       Iceberg) sob reentrega e uma causa ESPERADA dentro da tolerancia
+--       declarada — nao uma alarme de billing.
+-- -----------------------------------------------------------------------------
 CREATE MATERIALIZED VIEW IF NOT EXISTS adserver.mv_conversion_to_hourly
 ON CLUSTER '{cluster}'
 TO adserver.stats_hourly_state

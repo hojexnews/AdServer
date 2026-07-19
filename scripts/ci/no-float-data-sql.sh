@@ -15,6 +15,48 @@ set -euo pipefail
 FAIL=0
 
 # ---------------------------------------------------------------------------
+# Normalizacao: junta definicao de coluna quebrada em 2+ linhas fisicas numa
+# unica linha logica ANTES do match por-linha (TX-2).
+#
+# MOTIVACAO (achado #9, 28a onda): o match por-linha abaixo (nome_coluna +
+# Float32/64 na MESMA linha) e escapado por um DDL formatado como:
+#     conversion_value_broken
+#         Float64,
+# porque o nome da coluna e o tipo ficam em linhas fisicas diferentes.
+#
+# ESTRATEGIA (sem parser SQL completo, suficiente para DDL ClickHouse real):
+#   uma linha indentada que contem SOMENTE um identificador valido (sem tipo,
+#   sem virgula, sem parenteses) e tratada como o INICIO de uma definicao de
+#   coluna cujo tipo continua na proxima linha nao-vazia; as duas linhas sao
+#   concatenadas (preservando a indentacao original da 1a, exigida pelo
+#   ancora '^\s+' do regex de match) numa unica linha logica.
+# ---------------------------------------------------------------------------
+join_wrapped_column_lines() {
+    local f="$1"
+    awk '
+        {
+            line = $0
+            trimmed = line
+            gsub(/^[ \t]+|[ \t]+$/, "", trimmed)
+            if (pending_full != "") {
+                if (trimmed == "") { next }  # aguarda proxima linha nao-vazia
+                print pending_full " " trimmed
+                pending_full = ""
+                next
+            }
+            # Candidato a "nome de coluna sem tipo": indentado, so identificador,
+            # sem virgula/parenteses/dois-pontos.
+            if (line ~ /^[ \t]/ && trimmed ~ /^[A-Za-z_][A-Za-z0-9_]*$/) {
+                pending_full = line
+                next
+            }
+            print line
+        }
+        END { if (pending_full != "") print pending_full }
+    ' "$f"
+}
+
+# ---------------------------------------------------------------------------
 # Funcao auxiliar: strip de comentarios SQL e verifica tipo Float em colunas
 # ---------------------------------------------------------------------------
 check_sql_no_monetary_float() {
@@ -25,16 +67,21 @@ check_sql_no_monetary_float() {
     # Excluir: linhas de comentario (-- ou #), linhas com ENGINE, ORDER BY, etc.
     # Incluir apenas linhas onde o segundo token e o tipo Float32 ou Float64.
     #
-    # Estrategia: grep por padrao 'word Float(32|64)' excluindo comentarios.
+    # Estrategia: grep por padrao 'word Float(32|64)' excluindo comentarios,
+    # sobre o conteudo NORMALIZADO (join_wrapped_column_lines) para que uma
+    # coluna monetaria com tipo Float quebrada em 2 linhas fisicas nao escape.
+    local normalized
+    normalized="$(join_wrapped_column_lines "$f")"
+
     local hits
     # Vocabulario monetario ampliado (espelha scripts/ci/no-float-py.sh) — antes so
     # (value|amount|rate|decimal), o que deixava 'revenue/cost/budget/... Float64' escapar (TX-2).
-    hits=$(grep -inE '^\s+[a-z_][a-z0-9_]*\s+Float(32|64)' "$f" \
+    hits=$(printf '%s\n' "$normalized" | grep -inE '^\s+[a-z_][a-z0-9_]*\s+Float(32|64)' \
            | grep -iE '(value|amount|rate|decimal|revenue|cost|budget|price|cpm|cpc|cpa|bid|spend|payout|charge|billing|money|minor_units)' \
            | grep -vE 'propensity|score|epsilon|pct|probability' \
            || true)
     if [ -n "$hits" ]; then
-        echo "ERRO no-float-data-sql: Float em coluna monetaria em $f:"
+        echo "ERRO no-float-data-sql: Float em coluna monetaria em $f (apos normalizar linhas quebradas):"
         echo "$hits"
         return 1
     fi

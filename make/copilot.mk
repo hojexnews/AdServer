@@ -7,17 +7,20 @@
 #        (ver .github/workflows/ml.yml, job copilot-test).
 #
 # ALVO:
-#   copilot-test  — pytest de services/copilot/tests/ (126 testes, J5)
-#                   Inclui: gateway, model-router, schemas, security (HITL/auth).
+#   copilot-test  — pytest de services/copilot/tests/ (J5)
+#                   Suite de seguranca/gateway/HITL do copiloto: gateway,
+#                   model-router, schemas, security (HITL/auth).
 #                   Gate obrigatorio antes de merge em qualquer PR que toque
 #                   services/copilot/.
+#                   NAO hardcodar a contagem de testes aqui — a suite cresce
+#                   a cada onda; o numero real vem do output do pytest.
 
 COPILOT_PYTHON := ml/.venv/bin/python
 COPILOT_DIR    := services/copilot
 
 .PHONY: copilot-test
 
-## copilot-test: pytest de services/copilot/tests/ (gate J5 — 126 testes)
+## copilot-test: pytest de services/copilot/tests/ (gate J5 — suite de seguranca/gateway/HITL)
 copilot-test:
 	@echo "== copilot-test (J5 — gateway + model-router + schemas + security) =="
 	PYTHONPATH=. $(COPILOT_PYTHON) -m pytest $(COPILOT_DIR)/tests/ -v

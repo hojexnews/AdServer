@@ -50,6 +50,46 @@ def find_statement(statements, pattern: str):
     return None
 
 
+def join_wrapped_column_lines(text: str):
+    """Junta uma linha DDL que contem SOMENTE um identificador (nome de coluna
+    sem tipo) com a proxima linha nao-vazia, produzindo uma lista de linhas
+    logicas (achado #9, 28a onda).
+
+    MOTIVACAO: os checks por-linha abaixo (ex.: 'conversion_value' + Float na
+    MESMA linha, TX-2) sao escapados por um DDL formatado como:
+        conversion_value_broken
+            Float64,
+    porque nome de coluna e tipo ficam em linhas fisicas diferentes. Este
+    helper normaliza o texto ANTES do match por-linha, sem exigir um parser
+    SQL completo: uma linha indentada contendo somente um identificador valido
+    (sem virgula/parenteses/dois-pontos) e tratada como inicio de coluna cujo
+    tipo continua na proxima linha nao-comentario nao-vazia.
+    """
+    lines = text.splitlines()
+    out = []
+    bare_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        trimmed = line.strip()
+        if trimmed.startswith("--"):
+            out.append(line)
+            i += 1
+            continue
+        if bare_re.match(trimmed) and re.match(r"^[ \t]", line):
+            j = i + 1
+            while j < n and lines[j].strip() == "":
+                j += 1
+            if j < n and not lines[j].strip().startswith("--"):
+                out.append(f"{line} {lines[j].strip()}")
+                i = j + 1
+                continue
+        out.append(line)
+        i += 1
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Le todos os DDLs de ClickHouse
 # ---------------------------------------------------------------------------
@@ -113,8 +153,12 @@ elif not re.search(r"ENGINE\s*=\s*AggregatingMergeTree\b", stats_hourly_state_ta
 
 # ---------------------------------------------------------------------------
 # Verifica que conversion_value nao usa Float em colunas monetarias (TX-2)
+#
+# Normaliza linhas quebradas ANTES do match (achado #9, 28a onda): um tipo
+# Float monetario partido em 2 linhas fisicas (nome da coluna numa linha,
+# 'Float64' na seguinte) escapava do match por-linha ingenuo.
 # ---------------------------------------------------------------------------
-for line in ddl_text.splitlines():
+for line in join_wrapped_column_lines(ddl_text):
     stripped = line.strip()
     if stripped.startswith("--"):
         continue
@@ -198,41 +242,66 @@ if "ROW POLICY" in ddl_text.upper() and not has_substring_uuid:
     fail = 1
 
 # ---------------------------------------------------------------------------
-# Verifica que a tabela mais critica (stats_hourly_state, base da VIEW
-# faturavel stats_hourly) tem SUA PROPRIA row-policy de tenant fail-closed
-# (TX-3). Escopado ao statement: a presenca global de "ROW POLICY" (check
-# acima) e satisfeita por QUALQUER uma das 6 policies de tenant; este check
-# prova que especificamente a de stats_hourly_state nao foi removida.
+# Verifica que CADA tabela sensivel tem SUA PROPRIA row-policy de tenant
+# fail-closed (TX-3), escopada ao statement 'CREATE ROW POLICY ... ON
+# adserver.<tabela> ... TO tenant_role' (achado #10, 28a onda).
+#
+# ANTES (tautologico): so stats_hourly_state tinha este check escopado; as
+# outras 5 raw_* + raw_ivt_score/raw_ivt_unsup_score dependiam apenas do
+# check global-corpus acima (has_substring_uuid), que e satisfeito por
+# QUALQUER UMA das N policies presentes no corpus inteiro — ou seja, quebrar
+# o fail-closed de UMA tabela especifica (ex.: trocar por '1=1' ou por
+# replaceAll) nao derrubava o gate, desde que outra tabela em outro arquivo
+# mantivesse o padrao correto em algum lugar do texto.
+#
+# AGORA: cada tabela da lista abaixo precisa ter, DENTRO do proprio statement
+# CREATE ROW POLICY que a referencia, o padrao completo fail-closed
+# (startsWith + match UUID + substring). Nenhuma tabela pode "pegar carona"
+# na policy correta de outra.
 # ---------------------------------------------------------------------------
-stats_hourly_state_tenant_policy = None
-for _s in ddl_statements:
-    if (
-        re.match(r"CREATE\s+ROW\s+POLICY\s+IF\s+NOT\s+EXISTS\b", _s, re.I)
-        and re.search(r"\bON\s+adserver\.stats_hourly_state\b", _s, re.I)
-        and re.search(r"\bTO\s+tenant_role\b", _s, re.I)
-    ):
-        stats_hourly_state_tenant_policy = _s
-        break
+TENANT_ROW_POLICY_TABLES = (
+    "stats_hourly_state",   # base da VIEW faturavel stats_hourly (DA-7/CA-6)
+    "raw_ad_request",
+    "raw_impression",
+    "raw_click",
+    "raw_conversion",
+    "raw_decision",
+    "raw_ivt_score",
+    "raw_ivt_unsup_score",
+)
 
-if stats_hourly_state_tenant_policy is None:
-    print(
-        "ERRO: row-policy de tenant para adserver.stats_hourly_state (TX-3) "
-        "nao encontrada. A tabela base da VIEW stats_hourly faturavel precisa "
-        "de sua PROPRIA ROW POLICY ... ON adserver.stats_hourly_state ... TO tenant_role.",
-        file=sys.stderr,
-    )
-    fail = 1
-else:
-    has_fail_closed_scoped = (
-        "startsWith(currentUser(), 'tenant_')" in stats_hourly_state_tenant_policy
-        and "match(" in stats_hourly_state_tenant_policy
-        and "[0-9a-f]{8}-[0-9a-f]{4}" in stats_hourly_state_tenant_policy
-        and "substring(currentUser()," in stats_hourly_state_tenant_policy
-    )
-    if not has_fail_closed_scoped:
+for _tbl in TENANT_ROW_POLICY_TABLES:
+    _tenant_policy_stmt = None
+    for _s in ddl_statements:
+        if (
+            re.match(r"CREATE\s+ROW\s+POLICY\s+IF\s+NOT\s+EXISTS\b", _s, re.I)
+            and re.search(rf"\bON\s+adserver\.{re.escape(_tbl)}\b", _s, re.I)
+            and re.search(r"\bTO\s+tenant_role\b", _s, re.I)
+        ):
+            _tenant_policy_stmt = _s
+            break
+
+    if _tenant_policy_stmt is None:
         print(
-            "ERRO: row-policy de tenant em adserver.stats_hourly_state existe "
-            "mas nao usa o padrao fail-closed (startsWith + match UUID + substring).",
+            f"ERRO: row-policy de tenant para adserver.{_tbl} (TX-3) nao "
+            f"encontrada. A tabela precisa de SUA PROPRIA "
+            f"'CREATE ROW POLICY ... ON adserver.{_tbl} ... TO tenant_role'.",
+            file=sys.stderr,
+        )
+        fail = 1
+        continue
+
+    _has_fail_closed_scoped = (
+        "startsWith(currentUser(), 'tenant_')" in _tenant_policy_stmt
+        and "match(" in _tenant_policy_stmt
+        and "[0-9a-f]{8}-[0-9a-f]{4}" in _tenant_policy_stmt
+        and "substring(currentUser()," in _tenant_policy_stmt
+    )
+    if not _has_fail_closed_scoped:
+        print(
+            f"ERRO: row-policy de tenant em adserver.{_tbl} existe mas nao "
+            f"usa o padrao fail-closed (startsWith + match UUID + substring) "
+            f"DENTRO do proprio statement (TX-3).",
             file=sys.stderr,
         )
         fail = 1

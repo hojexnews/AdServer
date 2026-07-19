@@ -80,35 +80,26 @@ def _make_hmac_sig(tenant_id: str, timestamp: str, secret: str) -> str:
 
 # =============================================================================
 # H1 — HMAC fail-closed
-# Nota: app/auth.py importa fastapi que pode não estar instalado em CI mínimo.
-# Extraímos a lógica pura de HMAC para testes isolados sem fastapi.
-# Testes que precisam das funções do módulo usam inspect.getsource.
+#
+# NOTA (follow-up do Achado #18 / lição das ondas 25-27 — "testar cópia !=
+# testar produção"): esta seção usava uma cópia pura '_verify_hmac_pure'
+# (re-implementação local de app.auth._verify_hmac) com a justificativa de que
+# "app/auth.py importa fastapi que pode não estar instalado em CI mínimo".
+# Essa premissa não se sustenta: fastapi ESTÁ disponível neste venv de teste —
+# veja TestHmacRealFunctionRejectsForgedAndReplayed abaixo, que importa
+# 'from app.auth import _verify_hmac' e 'from fastapi import HTTPException'
+# diretamente. A cópia foi ELIMINADA. Todos os casos que ela cobria (sentinela
+# 'dev-skip', HMAC válido, timestamp replayed, secret errado, formato de
+# assinatura inválido, assinatura vazia, timestamp não-numérico) têm agora
+# equivalente exercitando a FUNÇÃO REAL app.auth._verify_hmac — ver
+# TestHmacRealFunctionRejectsForgedAndReplayed (casos previamente só cobertos
+# pela cópia: dev-skip, formato inválido, assinatura vazia, timestamp
+# não-numérico; os demais já tinham teste contra a função real).
+#
+# Mantido aqui: '_check_auth_config_production_pure' (cópia de
+# check_auth_config_on_startup — achado/escopo diferente, fora deste
+# follow-up) e os testes de inspeção de código-fonte.
 # =============================================================================
-
-def _verify_hmac_pure(
-    tenant_id: str,
-    timestamp: str,
-    received_sig: str,
-    secret: str,
-) -> bool:
-    """
-    Re-implementação local da lógica de _verify_hmac para testes sem fastapi.
-    Deve ser idêntica à lógica em app/auth.py.
-    """
-    # H1: nunca aceitar a sentinela "dev-skip"
-    if received_sig == "dev-skip":
-        return False
-    try:
-        ts = int(timestamp)
-    except ValueError:
-        return False
-    now = int(time.time())
-    if abs(now - ts) > 60:
-        return False
-    message = f"{tenant_id}:{timestamp}".encode()
-    expected = hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, received_sig)
-
 
 def _check_auth_config_production_pure(
     app_env: str,
@@ -131,36 +122,6 @@ def _check_auth_config_production_pure(
 class TestH1HmacFailClosed:
     """H1: HMAC deve ser fail-closed — nenhum bypass em produção."""
 
-    def test_dev_skip_sentinel_rejected_always(self) -> None:
-        """A sentinela 'dev-skip' NUNCA é aceita como assinatura válida."""
-        secret = "any-real-secret"
-        ts = str(int(time.time()))
-        result = _verify_hmac_pure(TENANT_A, ts, "dev-skip", secret)
-        assert result is False, "Sentinela 'dev-skip' deve ser sempre rejeitada"
-
-    def test_valid_hmac_accepted(self) -> None:
-        """HMAC correto é aceito."""
-        secret = "my-test-secret"
-        ts = str(int(time.time()))
-        sig = _make_hmac_sig(TENANT_A, ts, secret)
-        result = _verify_hmac_pure(TENANT_A, ts, sig, secret)
-        assert result is True
-
-    def test_replayed_timestamp_rejected(self) -> None:
-        """Timestamp fora da janela de ±60s → rejeitado (anti-replay)."""
-        secret = "my-test-secret"
-        old_ts = str(int(time.time()) - 120)  # 2 minutos atrás
-        sig = _make_hmac_sig(TENANT_A, old_ts, secret)
-        result = _verify_hmac_pure(TENANT_A, old_ts, sig, secret)
-        assert result is False
-
-    def test_wrong_secret_rejected(self) -> None:
-        """HMAC assinado com secret errado → rejeitado."""
-        ts = str(int(time.time()))
-        sig = _make_hmac_sig(TENANT_A, ts, "wrong-secret")
-        result = _verify_hmac_pure(TENANT_A, ts, sig, "correct-secret")
-        assert result is False
-
     def test_startup_check_production_blocks_skip_auth(self) -> None:
         """check_auth_config lança RuntimeError se SKIP_AUTH_DEV=true em produção."""
         with pytest.raises(RuntimeError, match="PROIBIDO em APP_ENV=production"):
@@ -180,24 +141,6 @@ class TestH1HmacFailClosed:
         """Em produção com secret vazio → RuntimeError (fail-closed)."""
         with pytest.raises(RuntimeError, match="vazio em APP_ENV=production"):
             _check_auth_config_production_pure("production", skip_auth=False, secret_value="")
-
-    def test_invalid_signature_format_rejected(self) -> None:
-        """Assinatura com formato inválido → rejeitada."""
-        ts = str(int(time.time()))
-        # Assinatura curta demais (não é um hexdigest SHA256 de 64 chars)
-        result = _verify_hmac_pure(TENANT_A, ts, "abc123", "secret")
-        assert result is False
-
-    def test_empty_signature_rejected(self) -> None:
-        """Assinatura vazia → rejeitada."""
-        ts = str(int(time.time()))
-        result = _verify_hmac_pure(TENANT_A, ts, "", "secret")
-        assert result is False
-
-    def test_invalid_timestamp_rejected(self) -> None:
-        """Timestamp não-inteiro → rejeitado."""
-        result = _verify_hmac_pure(TENANT_A, "not-a-timestamp", "some-sig", "secret")
-        assert result is False
 
     def test_auth_source_has_sentinel_rejection(self) -> None:
         """
@@ -1226,20 +1169,24 @@ class TestHitlResumeContract:
 
 # =============================================================================
 # Achado #10/#11 — HMAC real (_verify_hmac) + anti-replay: testes BEHAVIORAIS
-# contra o CODIGO REAL (nao a copia _verify_hmac_pure usada acima em
-# TestH1HmacFailClosed). Uma mutacao accept-all em auth.py:144 ou que desliga
-# a janela de anti-replay em auth.py:134 deve fazer estes testes falharem.
+# contra o CODIGO REAL. Originalmente so a copia _verify_hmac_pure (em
+# TestH1HmacFailClosed) era exercitada com sig invalida/timestamp fora da
+# janela; a copia foi eliminada no follow-up do Achado #18 e todos os casos
+# migraram para cá (ver bloco logo abaixo). Uma mutacao accept-all em
+# auth.py:144 ou que desliga a janela de anti-replay em auth.py:134 deve
+# fazer estes testes falharem.
 # =============================================================================
 
 class TestHmacRealFunctionRejectsForgedAndReplayed:
     """
     Achado #10: nenhum teste anterior chamava a FUNCAO REAL _verify_hmac (ou
     get_authorized_session) com uma assinatura presente-porem-ERRADA — so a
-    copia _verify_hmac_pure era exercitada com sig invalida. Aqui chamamos a
-    funcao real.
+    copia _verify_hmac_pure (ja eliminada) era exercitada com sig invalida.
+    Aqui chamamos a funcao real.
 
     Achado #11: nenhum teste anterior chamava a funcao real com timestamp fora
-    da janela de +-60s — so a copia. Aqui testamos o anti-replay real.
+    da janela de +-60s — so a copia (ja eliminada). Aqui testamos o anti-replay
+    real.
     """
 
     def test_real_verify_hmac_rejects_wrong_signature(self) -> None:
@@ -1275,6 +1222,54 @@ class TestHmacRealFunctionRejectsForgedAndReplayed:
         sig = _make_hmac_sig(TENANT_A, old_ts, secret)  # assinatura correta, porem velha
         assert _verify_hmac(TENANT_A, old_ts, sig, secret) is False, (
             "_verify_hmac REAL deve rejeitar timestamp replayed (fora de +-60s)"
+        )
+
+    def test_real_verify_hmac_rejects_dev_skip_sentinel(self) -> None:
+        """
+        _verify_hmac REAL (auth.py:124): a sentinela 'dev-skip' NUNCA é aceita
+        como assinatura válida, mesmo com o secret correto/conhecido. Migrado
+        de TestH1HmacFailClosed (que só testava isso contra a cópia pura
+        _verify_hmac_pure, eliminada neste follow-up).
+        """
+        from app.auth import _verify_hmac
+
+        secret = "correct-secret-32-chars-long!!!"
+        ts = str(int(time.time()))
+        assert _verify_hmac(TENANT_A, ts, "dev-skip", secret) is False, (
+            "_verify_hmac REAL deve rejeitar sempre a sentinela 'dev-skip'"
+        )
+
+    def test_real_verify_hmac_rejects_invalid_signature_format(self) -> None:
+        """
+        _verify_hmac REAL rejeita assinatura com formato inválido (não é um
+        hexdigest SHA256 de 64 chars). Migrado de TestH1HmacFailClosed.
+        """
+        from app.auth import _verify_hmac
+
+        ts = str(int(time.time()))
+        assert _verify_hmac(TENANT_A, ts, "abc123", "secret") is False, (
+            "_verify_hmac REAL deve rejeitar assinatura com formato inválido"
+        )
+
+    def test_real_verify_hmac_rejects_empty_signature(self) -> None:
+        """_verify_hmac REAL rejeita assinatura vazia. Migrado de TestH1HmacFailClosed."""
+        from app.auth import _verify_hmac
+
+        ts = str(int(time.time()))
+        assert _verify_hmac(TENANT_A, ts, "", "secret") is False, (
+            "_verify_hmac REAL deve rejeitar assinatura vazia"
+        )
+
+    def test_real_verify_hmac_rejects_non_numeric_timestamp(self) -> None:
+        """
+        _verify_hmac REAL (auth.py:129) rejeita timestamp não-numérico
+        (int(timestamp) lança ValueError → False). Migrado de
+        TestH1HmacFailClosed.
+        """
+        from app.auth import _verify_hmac
+
+        assert _verify_hmac(TENANT_A, "not-a-timestamp", "some-sig", "secret") is False, (
+            "_verify_hmac REAL deve rejeitar timestamp não-numérico"
         )
 
     @pytest.mark.asyncio
@@ -1585,3 +1580,218 @@ class TestC1IdorRealExecution:
             result = await server_module.get_session_state("thread-a-1", session)
 
         assert result["tenant_id"] == TENANT_A
+
+
+# =============================================================================
+# Achado #18 — o gate de proveniencia C2PA/SynthID/ausencia-de-PII (mandato
+# §6/§7, "gate nao opcao", EU AI Act Art. 50) e o gate anti-contradicao CA-4
+# eram apenas INFORMATIVOS: apply_write_node persistia via gateway.apply_write
+# SEM checar diff.validation_result. Um criativo/regra que reprovou a
+# validacao era salvo do mesmo jeito, mesmo apos aprovacao HITL. Corrigido:
+# apply_write_node agora recusa (next_action='error') ANTES de chamar
+# gateway.apply_write quando validation_result reprovou (gate_passed=False
+# e/ou is_valid=False) — nunca persiste.
+# =============================================================================
+
+class TestValidationGateBlocksApplyWrite:
+    """
+    Achado #18: apply_write_node REAL nunca chama gateway.apply_write quando
+    diff.validation_result reprovou — nem mesmo com hitl_approved=True.
+    """
+
+    @pytest.mark.asyncio
+    async def test_apply_write_node_blocks_when_creative_validation_gate_failed(self) -> None:
+        """
+        diff.validation_result com gate_passed=False (proveniencia C2PA/SynthID
+        ausente — validate_creative) -> apply_write_node recusa persistir,
+        MESMO com hitl_approved=True.
+        """
+        from graph.nodes import make_apply_write_node
+
+        gw = make_gateway()
+        gw.apply_write = AsyncMock(return_value={"status": "applied", "tenant_id": TENANT_A})
+        node = make_apply_write_node(gw)
+
+        diff = WriteDiff(
+            operation="create_banner",
+            entity_type="banner",
+            after={"tenant_id": TENANT_A, "name": "Banner IA sem C2PA"},
+            validation_result={
+                "is_valid": False,
+                "gate_passed": False,
+                "c2pa_manifest_attached": False,
+                "syntid_watermark_confirmed": False,
+                "disclosure_embedded": False,
+                "pii_detected": False,
+                "violations": ["Manifesto C2PA ausente ou inválido."],
+            },
+        )
+
+        state: dict[str, Any] = {
+            "tenant_id": TENANT_A,
+            "session_id": "s1",
+            "requested_model_tier": None,
+            "messages": [],
+            "pending_diff": diff,
+            "hitl_approved": True,
+            "hitl_rejection_reason": None,
+            "last_tool_result": None,
+            "judge_result": None,
+            "langfuse_trace_id": None,
+            "input_tokens_used": 0,
+            "output_tokens_used": 0,
+            "next_action": None,
+            "error_message": None,
+        }
+
+        result = await node(state)
+
+        assert result["next_action"] == "error", (
+            "apply_write_node deve recusar diff com gate de proveniencia reprovado"
+        )
+        gw.apply_write.assert_not_called()  # NUNCA persiste com gate reprovado
+
+    @pytest.mark.asyncio
+    async def test_apply_write_node_blocks_when_segmentation_ca4_invalid(self) -> None:
+        """
+        diff.validation_result com is_valid=False (contradicao §4.6/CA-4 do
+        validate_segmentation, sem a chave gate_passed) -> apply_write_node
+        recusa persistir.
+        """
+        from graph.nodes import make_apply_write_node
+
+        gw = make_gateway()
+        gw.apply_write = AsyncMock(return_value={"status": "applied", "tenant_id": TENANT_A})
+        node = make_apply_write_node(gw)
+
+        diff = WriteDiff(
+            operation="create_delivery_rules",
+            entity_type="delivery_rule",
+            after={"tenant_id": TENANT_A},
+            validation_result={
+                "is_valid": False,
+                "conflicts": [
+                    {
+                        "rule_index_a": 0,
+                        "rule_index_b": 1,
+                        "description": "Contradição AND: zero delivery.",
+                    }
+                ],
+                "warning": "Este conjunto de regras AND resultará em zero delivery.",
+            },
+        )
+
+        state: dict[str, Any] = {
+            "tenant_id": TENANT_A,
+            "session_id": "s1",
+            "requested_model_tier": None,
+            "messages": [],
+            "pending_diff": diff,
+            "hitl_approved": True,
+            "hitl_rejection_reason": None,
+            "last_tool_result": None,
+            "judge_result": None,
+            "langfuse_trace_id": None,
+            "input_tokens_used": 0,
+            "output_tokens_used": 0,
+            "next_action": None,
+            "error_message": None,
+        }
+
+        result = await node(state)
+
+        assert result["next_action"] == "error", (
+            "apply_write_node deve recusar diff com contradição CA-4 (segmentação)"
+        )
+        gw.apply_write.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_apply_write_node_persists_when_validation_passed(self) -> None:
+        """
+        Contraste: diff.validation_result com gate_passed=True e is_valid=True
+        -> apply_write_node CHAMA gateway.apply_write normalmente (o gate nao
+        introduz falso-positivo bloqueando validacoes aprovadas).
+        """
+        from graph.nodes import make_apply_write_node
+
+        gw = make_gateway()
+        gw.apply_write = AsyncMock(return_value={"status": "applied", "tenant_id": TENANT_A})
+        node = make_apply_write_node(gw)
+
+        diff = WriteDiff(
+            operation="create_banner",
+            entity_type="banner",
+            after={"tenant_id": TENANT_A, "name": "Banner OK"},
+            validation_result={
+                "is_valid": True,
+                "gate_passed": True,
+                "c2pa_manifest_attached": True,
+                "syntid_watermark_confirmed": True,
+                "disclosure_embedded": True,
+                "pii_detected": False,
+                "violations": [],
+            },
+        )
+
+        state: dict[str, Any] = {
+            "tenant_id": TENANT_A,
+            "session_id": "s1",
+            "requested_model_tier": None,
+            "messages": [],
+            "pending_diff": diff,
+            "hitl_approved": True,
+            "hitl_rejection_reason": None,
+            "last_tool_result": None,
+            "judge_result": None,
+            "langfuse_trace_id": None,
+            "input_tokens_used": 0,
+            "output_tokens_used": 0,
+            "next_action": None,
+            "error_message": None,
+        }
+
+        result = await node(state)
+
+        assert result["next_action"] == "respond"
+        gw.apply_write.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_apply_write_node_persists_when_no_validation_result(self) -> None:
+        """
+        Contraste: diff sem validation_result (None) -> apply_write_node segue
+        o fluxo normal (sem regressao para operacoes que nao passam por
+        validate_creative/validate_segmentation, ex.: create_campaign_draft).
+        """
+        from graph.nodes import make_apply_write_node
+
+        gw = make_gateway()
+        gw.apply_write = AsyncMock(return_value={"status": "applied", "tenant_id": TENANT_A})
+        node = make_apply_write_node(gw)
+
+        diff = WriteDiff(
+            operation="create_campaign",
+            entity_type="campaign",
+            after={"tenant_id": TENANT_A, "name": "Campanha X"},
+        )
+
+        state: dict[str, Any] = {
+            "tenant_id": TENANT_A,
+            "session_id": "s1",
+            "requested_model_tier": None,
+            "messages": [],
+            "pending_diff": diff,
+            "hitl_approved": True,
+            "hitl_rejection_reason": None,
+            "last_tool_result": None,
+            "judge_result": None,
+            "langfuse_trace_id": None,
+            "input_tokens_used": 0,
+            "output_tokens_used": 0,
+            "next_action": None,
+            "error_message": None,
+        }
+
+        result = await node(state)
+
+        assert result["next_action"] == "respond"
+        gw.apply_write.assert_called_once()

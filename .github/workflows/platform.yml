@@ -135,3 +135,12 @@ jobs:
       # ------------------------------------------------------------------
       - name: openbao policy-check (least-privilege por celula, HCL)
         run: make platform-openbao-policy-check
+
+      # ------------------------------------------------------------------
+      # Consistencia cross-arquivo de nome de celula (achado #20, 28a onda):
+      # tofu validate isolado passa verde com nome de celula errado (so valida
+      # sintaxe HCL). Este gate confere que main.tf/variables.tf batem com o
+      # layout real de platform/ (namespaces.yaml + platform/cells/*).
+      # ------------------------------------------------------------------
+      - name: cell-consistency (sem drift de nome de celula, cross-arquivo)
+        run: make platform-cell-consistency

@@ -478,6 +478,70 @@ $$;
 
 
 -- ===========================================================================
+-- BLOCO 5.5 — Anti-tautologia: confirma WITH CHECK EXPLICITO no catalogo
+--   pg_policy, INDEPENDENTE do valor de USING.
+--
+-- POR QUE ESTE BLOCO E NECESSARIO
+--   As oito policies abaixo sao FOR ALL com USING === WITH CHECK (mesma
+--   expressao textual — 0002_config_rls_up.sql). Quando uma policy FOR ALL
+--   OMITE WITH CHECK, o Postgres reusa USING como verificacao de escrita EM
+--   TEMPO DE EXECUCAO (o mesmo SQLSTATE 42501 observado no Bloco 6 abaixo)
+--   — mas NAO grava nada em pg_policy.polwithcheck (verificado empiricamente
+--   contra Postgres 16.14 nativo). Ou seja: o Bloco 6 sozinho passaria
+--   IDENTICO mesmo se o WITH CHECK fosse removido da migration — e
+--   tautologico em relacao a presenca do WITH CHECK. Este bloco fecha a
+--   lacuna introspectando o catalogo diretamente, sem depender do
+--   comportamento de fallback de USING.
+--
+--   Nota: config.campaign_zones_tenant_isolation e INTENCIONALMENTE
+--   USING-only (0003_campaign_zones_rls_up.sql) — tabela de juncao sem
+--   tenant_id proprio, isolamento via subquery EXISTS em campaigns. Nao
+--   entra nesta lista.
+-- ===========================================================================
+
+DO $$
+DECLARE
+    v_rec     RECORD;
+    v_missing TEXT := '';
+    v_found   INT  := 0;
+BEGIN
+    FOR v_rec IN
+        SELECT polname, polrelid::regclass::text AS relname, polwithcheck
+        FROM pg_policy
+        WHERE polname IN (
+            'advertisers_tenant_isolation',
+            'campaigns_tenant_isolation',
+            'banners_tenant_isolation',
+            'sites_tenant_isolation',
+            'zones_tenant_isolation',
+            'delivery_rule_sets_tenant_isolation',
+            'delivery_rules_tenant_isolation',
+            'caps_tenant_isolation'
+        )
+    LOOP
+        v_found := v_found + 1;
+        IF v_rec.polwithcheck IS NULL THEN
+            v_missing := v_missing || format('%s.%s ', v_rec.relname, v_rec.polname);
+        END IF;
+    END LOOP;
+
+    -- Guarda contra falso-positivo por vacuidade: se as policies fossem
+    -- renomeadas/removidas, a query acima retornaria 0 linhas e o loop
+    -- "passaria" sem checar nada. Exige encontrar exatamente as 8 esperadas.
+    PERFORM pg_temp.assert_count('pg_policy: 8 policies do config encontradas', v_found::bigint, 8::bigint);
+
+    IF v_missing <> '' THEN
+        RAISE EXCEPTION
+            'ASSERT FALHOU [WITH CHECK ausente no catalogo pg_policy, independente de USING]: %',
+            v_missing;
+    END IF;
+
+    RAISE NOTICE 'PASS [pg_policy.polwithcheck NOT NULL nas 8 policies do config — WITH CHECK explicito, independente de USING]';
+END;
+$$;
+
+
+-- ===========================================================================
 -- BLOCO 6 — WITH CHECK: o banco REJEITA escrita cross-tenant (INSERT/UPDATE)
 --   Os BLOCOS 1–4 provam só a LEITURA. Este bloco prova a ESCRITA — espelha o
 --   Bloco 7 do rls_isolation_test.sql do ledger. Como adserver_app com o tenant

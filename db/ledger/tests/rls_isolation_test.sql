@@ -418,6 +418,62 @@ $$;
 
 
 -- ===========================================================================
+-- BLOCO 6.5 — Anti-tautologia: confirma WITH CHECK EXPLICITO no catalogo
+--   pg_policy, INDEPENDENTE do valor de USING.
+--
+-- POR QUE ESTE BLOCO E NECESSARIO
+--   As tres policies deste schema sao FOR ALL com USING === WITH CHECK
+--   (mesma expressao textual). Quando uma policy FOR ALL OMITE WITH CHECK,
+--   o Postgres reusa USING como verificacao de escrita EM TEMPO DE EXECUCAO
+--   (o mesmo SQLSTATE check_violation/42501 observado no Bloco 7 abaixo) —
+--   mas NAO grava nada em pg_policy.polwithcheck (verificado empiricamente
+--   contra Postgres 16.14 nativo: `CREATE POLICY ... USING (...)` sem
+--   WITH CHECK produz polwithcheck IS NULL no catalogo, mesmo a policy
+--   continuando a rejeitar INSERT/UPDATE cross-tenant via o fallback de
+--   USING). Ou seja: o Bloco 7 sozinho passaria IDENTICO mesmo se o
+--   WITH CHECK fosse removido da migration 0003 — e tautologico em relacao
+--   a presenca do WITH CHECK. Este bloco fecha a lacuna introspectando o
+--   catalogo diretamente, sem depender do comportamento de USING.
+-- ===========================================================================
+
+DO $$
+DECLARE
+    v_rec     RECORD;
+    v_missing TEXT := '';
+    v_found   INT  := 0;
+BEGIN
+    FOR v_rec IN
+        SELECT polname, polrelid::regclass::text AS relname, polwithcheck
+        FROM pg_policy
+        WHERE polname IN (
+            'accounts_tenant_isolation',
+            'journal_entries_tenant_isolation',
+            'postings_tenant_isolation'
+        )
+    LOOP
+        v_found := v_found + 1;
+        IF v_rec.polwithcheck IS NULL THEN
+            v_missing := v_missing || format('%s.%s ', v_rec.relname, v_rec.polname);
+        END IF;
+    END LOOP;
+
+    -- Guarda contra falso-positivo por vacuidade: se as policies fossem
+    -- renomeadas/removidas, a query acima retornaria 0 linhas e o loop
+    -- "passaria" sem checar nada. Exige encontrar exatamente as 3 esperadas.
+    PERFORM pg_temp.assert_count('pg_policy: 3 policies do ledger encontradas', v_found::bigint, 3::bigint);
+
+    IF v_missing <> '' THEN
+        RAISE EXCEPTION
+            'ASSERT FALHOU [WITH CHECK ausente no catalogo pg_policy, independente de USING]: %',
+            v_missing;
+    END IF;
+
+    RAISE NOTICE 'PASS [pg_policy.polwithcheck NOT NULL nas 3 policies do ledger — WITH CHECK explicito, independente de USING]';
+END;
+$$;
+
+
+-- ===========================================================================
 -- BLOCO 7 — WITH CHECK: banco rejeita INSERT/UPDATE cross-tenant (caso d)
 --
 -- Prova que, com adserver.tenant_id = tenant_A, qualquer tentativa de:
@@ -434,6 +490,24 @@ $$;
 -- INITIALLY DEFERRED — o check_violation de RLS dispara ANTES do trigger de
 -- balance (a policy e avaliada linha a linha no momento do INSERT/UPDATE),
 -- portanto o teste nao precisa montar um par balanceado.
+--
+-- Nota (migration 0004 — imutabilidade, achado HIGH #6): desde 0004,
+-- ledger.postings e BEFORE UPDATE/DELETE incondicionalmente bloqueado
+-- (append-only) e ledger.journal_entries com status IN ('posted','void') e
+-- imutavel. Esses triggers BEFORE disparam ANTES da avaliacao do WITH CHECK
+-- de RLS (a NEW row so e checada contra a policy DEPOIS dos triggers BEFORE
+-- rodarem — comportamento documentado do Postgres). Para nao confundir o
+-- teste de RLS (7d) com o teste de imutabilidade (ja coberto em
+-- db/ledger/tests/postings_immutability_test.sql), o UPDATE de 7d usa uma
+-- entry PENDING dedicada (unica transicao em que UPDATE de journal_entries
+-- ainda e permitido pelo trigger de imutabilidade) — assim a rejeicao
+-- observada e garantidamente a de RLS (WITH CHECK), nao a de imutabilidade.
+-- Para postings (7f), NAO ha transicao equivalente (append-only e
+-- incondicional, sem excecao de status) — o sub-bloco aceita tanto o
+-- check_violation/insufficient_privilege de RLS quanto o raise_exception do
+-- trigger de imutabilidade, documentando que a garantia de "UPDATE
+-- cross-tenant em postings nunca e aceito" hoje e feita por um mecanismo
+-- ainda mais forte (bloqueio incondicional), que subsume o WITH CHECK.
 -- ===========================================================================
 
 DO $$
@@ -442,6 +516,7 @@ DECLARE
     v_tenant_b  UUID   := 'dddddddd-0000-0000-0000-000000000001';
     v_acct_a_id BIGINT;
     v_entry_a_id BIGINT;
+    v_entry_a_pending_id BIGINT;
     v_posting_a_id BIGINT;
 BEGIN
     -- Obtemos IDs de tenant_a como superuser (antes de SET ROLE)
@@ -453,6 +528,14 @@ BEGIN
 
     SELECT id INTO v_posting_a_id
     FROM ledger.postings WHERE tenant_id = v_tenant_a AND posted_at = '2026-06-15 10:00:00+00' LIMIT 1;
+
+    -- Entry PENDING dedicada para 7d (ver nota acima): isola o teste de RLS
+    -- WITH CHECK do teste (separado) de imutabilidade pos-posted.
+    INSERT INTO ledger.journal_entries
+        (tenant_id, idempotency_key, description, status, effective_at)
+    VALUES
+        (v_tenant_a, 'rls-test-idem-a-pending-7d', 'Entrada pending p/ teste RLS 7d', 'pending', now())
+    RETURNING id INTO v_entry_a_pending_id;
 
     SET LOCAL ROLE adserver_app;
     SET LOCAL adserver.tenant_id = 'cccccccc-0000-0000-0000-000000000001';
@@ -497,11 +580,15 @@ BEGIN
 
     -- -----------------------------------------------------------------------
     -- 7d. journal_entries: UPDATE mudando tenant_id para B -> falha
+    --     Usa a entry PENDING dedicada (v_entry_a_pending_id) para que o
+    --     trigger de imutabilidade (0004) NAO intercepte antes do WITH CHECK
+    --     de RLS — pending e a unica transicao onde UPDATE ainda alcanca a
+    --     avaliacao da policy (ver nota no cabecalho do BLOCO 7).
     -- -----------------------------------------------------------------------
     BEGIN
         UPDATE ledger.journal_entries
         SET tenant_id = v_tenant_b
-        WHERE id = v_entry_a_id;
+        WHERE id = v_entry_a_pending_id;
         RAISE EXCEPTION 'ASSERT FALHOU [7d journal_entries UPDATE tenant_id cross-tenant]: banco NAO rejeitou';
     EXCEPTION
         WHEN check_violation OR insufficient_privilege THEN
@@ -528,6 +615,22 @@ BEGIN
 
     -- -----------------------------------------------------------------------
     -- 7f. postings: UPDATE mudando tenant_id para B -> falha
+    --     Desde a migration 0004 (achado HIGH #6), ledger.postings e
+    --     append-only INCONDICIONAL: (i) o GRANT de adserver_app em
+    --     ledger.postings foi estreitado para SELECT, INSERT (sem
+    --     UPDATE/DELETE — ver make/db.mk), entao este UPDATE hoje e
+    --     rejeitado JA no permission-check (insufficient_privilege), antes
+    --     de RLS ou do trigger rodarem; e (ii) mesmo que o GRANT fosse
+    --     alargado, o trigger postings_immutable_trg dispara ANTES do WITH
+    --     CHECK de RLS e bloqueia QUALQUER UPDATE, cross-tenant ou nao.
+    --     Aceitamos aqui as tres classes de rejeicao possiveis
+    --     (insufficient_privilege do GRANT, check_violation/insufficient_privilege
+    --     de RLS, ou raise_exception do trigger de imutabilidade) — em
+    --     qualquer caso o INVARIANTE testado ("UPDATE cross-tenant em
+    --     postings nunca e aceito") se mantem, agora garantido por DUAS
+    --     camadas independentes mais fortes que subsumem o WITH CHECK.
+    --     Cobertura dedicada da imutabilidade em si:
+    --     db/ledger/tests/postings_immutability_test.sql.
     -- -----------------------------------------------------------------------
     BEGIN
         UPDATE ledger.postings
@@ -538,6 +641,12 @@ BEGIN
     EXCEPTION
         WHEN check_violation OR insufficient_privilege THEN
             RAISE NOTICE 'PASS [7f postings: UPDATE tenant_id cross-tenant rejeitado pelo banco (check_violation)]';
+        WHEN raise_exception THEN
+            IF SQLERRM LIKE '%append-only%' THEN
+                RAISE NOTICE 'PASS [7f postings: UPDATE cross-tenant rejeitado pelo trigger de imutabilidade (subsume WITH CHECK)]: %', SQLERRM;
+            ELSE
+                RAISE;
+            END IF;
     END;
 
     RESET ROLE;

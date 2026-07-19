@@ -557,7 +557,7 @@ endurecimento de CI/contratos/concorrência da mesma classe. Os dois itens regis
 **Gates verdes (12ª onda) — números reais re-triados:** `make go-build` + `make go-vet` + `make go-test`
 (**28 pacotes**, `-race` clean) + `make verify` (buf TX-1 BACKWARD + no-float TX-2) + `make proto-gen-check` +
 `make parity-golden-short` (3 pacotes) + `make ml-test` (**29**) + `make ml-deep-test` (**22**) +
-`make ml-batch-test` (**25**) + `make data-validate` (12 invariantes) + `make copilot-test` (**126**) +
+`make ml-batch-test` (**25**) + `make data-validate` (12 invariantes) + `make copilot-test` (**139**) +
 `make bff-ci` (**54**) + `make web-ci` + `make db-lint` — **todos verdes**. `parity-golden-test-guardian`
 **PASS** (golden/shadow/dual-run intactos; o fix de capping serve uncapped sem alterar a autoridade da cascata
 DA-3; deep default-off preservado, K8 não promovido); `money-ledger-guardian` **PASS** (trigger double-entry
@@ -578,7 +578,7 @@ re-triagem fresca da `main` pós-12ª onda. Sweep de saúde **todo verde com sa�
 (`make go-build` 38 pacotes, `make go-vet`, `make go-test` **28 pacotes `-race`** sem corrida, `make verify`
 = buf TX-1 BACKWARD + no-float TX-2, `make proto-gen-check`, `make parity-golden-short` 3 pacotes, `make
 ml-test` **29**, `make ml-deep-test` **22**, `make ml-batch-test`, `make data-validate` 12 invariantes,
-`make copilot-test` **126**, `make bff-ci` **54**, `make web-ci`, `make db-lint`; `-race -count=10` em
+`make copilot-test` **139**, `make bff-ci` **92**, `make web-ci`, `make db-lint`; `-race -count=10` em
 ranker/capping/telemetry/clicktoken **0 flakes**); veredito de esgotamento de **feature** reconfirmado — e,
 como nas ondas 5–11, a re-triagem achou **três defeitos código-endereçáveis reais** da classe "a spec/gate
 não mente": gates que reportavam verde sem verificar de fato (o filão mais sério, igual à 11ª onda):
@@ -1082,7 +1082,7 @@ Fecha o **G0** (Onda de Ativação de Go-Live). Dois itens em 3 commits + o focu
   do botão HITL amber-600→700; `<dl>` sem `<dt>/<dd>`).
 
 **Gates (1ª mão):** `tech-lead-architect` (triagem de escopo mínimo) · `make web-ci` (tsc + `eslint --max-warnings 0`
-+ node:test) · **`make web-a11y`** (0 violações axe + focus-trap) · `make copilot-test` (126) · `next build` (16 rotas)
++ node:test) · **`make web-a11y`** (0 violações axe + focus-trap) · `make copilot-test` (139) · `next build` (16 rotas)
 · `security-reviewer` **APROVADO** nas 3 mudanças que tocaram superfície sensível (middleware E9, modal HITL, harness a11y).
 
 > **G0 — CÓDIGO-COMPLETO (7/7).** E6/E10-HOT (17ª) · E5 (18ª) · E11 (19ª) · schema E8 (20ª) · platform E8 (21ª) ·
