@@ -23,6 +23,16 @@ on:
       - "make/parity.mk"
       - ".golangci.yml"
       - ".github/workflows/go.yml"
+      # Paridade cross-language (anti-skew treino<->serving): o lado Go
+      # internal/ranker/parity_test.go::TestParityFromFixtures le a fixture
+      # COMPARTILHADA ml/features/testdata/parity_cases.json (gerada a partir da
+      # impl Python ml/features/python/featurize.py contra ml/features/spec/).
+      # Sem estes paths, um PR que edite SO a featurizacao Python + a fixture
+      # (ambos ml/**) nunca dispararia este job -> o gate Go de paridade nao
+      # rodaria para a exata classe de mudanca que ele existe para barrar.
+      - "ml/features/testdata/parity_cases.json"
+      - "ml/features/python/**"
+      - "ml/features/spec/**"
   push:
     branches: [main]
     paths:
@@ -32,6 +42,11 @@ on:
       - "gen/go/**"
       - "go.mod"
       - "go.sum"
+      # merges = FF push direto -> push.paths deve espelhar pull_request.paths
+      # (mesma paridade cross-language; ver comentario acima).
+      - "ml/features/testdata/parity_cases.json"
+      - "ml/features/python/**"
+      - "ml/features/spec/**"
 
 permissions:
   contents: read

@@ -54,6 +54,47 @@ spec:
           cpu: "200m"
           memory: "256Mi"
 ---
+# pod-pci-secret-envkeyref-initcontainer: deve ser rejeitado por proibir-secret-estatico-pci
+# (usa env[].valueFrom.secretKeyRef num initContainer — mesmo bypass do container
+# principal, mas via spec.initContainers[]; a regra irma proibir-envfrom-secretref
+# ja cobria initContainers, mas proibir-env-secretkeyref nao cobria ate o fix do
+# achado #6, 29a onda de auditoria)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-pci-secret-envkeyref-initcontainer
+  namespace: pci
+  annotations:
+    vault.hashicorp.com/agent-inject: "true"
+    vault.hashicorp.com/role: "pci-payments"
+spec:
+  initContainers:
+    - name: seed
+      image: busybox:1.36
+      env:
+        - name: STRIPE_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: stripe-secret
+              key: secret_key
+      resources:
+        requests:
+          cpu: "50m"
+          memory: "64Mi"
+        limits:
+          cpu: "100m"
+          memory: "128Mi"
+  containers:
+    - name: payments
+      image: ghcr.io/hojex/payments:v1.0.0
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "200m"
+          memory: "256Mi"
+---
 # pod-pci-vault-agent: conforme — Vault Agent injetado, sem K8s Secrets,
 # sem label delivery. Deve passar em todas as policies PCI.
 apiVersion: v1

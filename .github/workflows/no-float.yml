@@ -38,7 +38,7 @@ jobs:
           else
             echo "sem TS financeiro real (ok)"
           fi
-      - name: TypeScript — backstop por CONTEUDO (BFF, independente do nome do arquivo)
+      - name: TypeScript/TSX — backstop por CONTEUDO (BFF + console, independente do nome do arquivo)
         run: bash scripts/ci/no-float-ts.sh
       - name: Python — sem float em dinheiro
         run: bash scripts/ci/no-float-py.sh

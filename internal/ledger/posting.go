@@ -220,6 +220,16 @@ func checkBalance(postings []PostingLine) error {
 	return nil
 }
 
+// CheckBalanceForTest expoe a funcao de producao checkBalance para testes de
+// balanco. checkBalance e unexported e o pacote de teste externo (ledger_test)
+// nao a alcanca; este wrapper FINO delega diretamente, sem logica propria, para
+// que TestCheckBalance_* exercite o caminho REAL (posting.go) — nao uma
+// reimplementacao. checkBalance recebe []PostingLine puro, sem Postgres, entao
+// o teste roda em memoria. Nao usar em codigo de producao.
+func CheckBalanceForTest(postings []PostingLine) error {
+	return checkBalance(postings)
+}
+
 // insertJournalEntry insere o cabecalho da entry e retorna o id gerado.
 func insertJournalEntry(ctx context.Context, tx pgx.Tx, p RecordEntryParams) (int64, error) {
 	const insertSQL = `

@@ -21,7 +21,7 @@ GOLANGCI_VER    := 2.12.2
 GOLANGCI_SHA256 := 8df580d2670fed8fa984aac0507099af8df275e665215f5c7a2ae3943893a553
 # Escopo do gate forbidigo: pacotes PURO-DINHEIRO + o arquivo do money-point eCPM (score.go).
 # O reporte e' estreitado por path-except no .golangci.yml; aqui listamos as arvores a analisar.
-GO_MONEY_PKGS   := ./internal/money/... ./internal/ledger/... ./internal/ranker/... ./services/payments/... ./internal/chainconnector/...
+GO_MONEY_PKGS   := ./internal/money/... ./internal/ledger/... ./internal/ranker/... ./services/payments/... ./internal/chainconnector/... ./internal/configload/...
 
 # Pacotes Go do modulo, EXCLUINDO node_modules/ (web/ e bff/ sao projetos npm;
 # algumas deps npm vendoram .go benignos — ex.: flatted — que NAO devem entrar

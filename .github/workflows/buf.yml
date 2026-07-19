@@ -37,7 +37,19 @@ jobs:
           format: true
           # compat BACKWARD obrigatoria vs. main (TX-1). WIRE_JSON (buf.yaml).
           breaking: true
-          breaking_against: "https://github.com/${{ github.repository }}.git#branch=main,subdir=proto"
+          # ATENCAO (self-diff): no evento `push`, o GitHub JA avancou
+          # refs/heads/main para o commit sob validacao ANTES de disparar o
+          # workflow, entao comparar contra `#branch=main` compararia o commit
+          # com ele mesmo -> diff sempre vazio -> `buf breaking` sempre verde,
+          # mesmo sob quebra de wire. Como o merge canonico deste repo e FF push
+          # direto via SSH, o push-trigger e o UNICO ponto de avaliacao pos-merge;
+          # um self-diff aqui neutralizaria o gate de compat. Por isso, no push
+          # comparamos contra o PAI do commit (github.event.before), via ref
+          # git LOCAL (`.git#ref=`, disponivel por causa do fetch-depth: 0) — o
+          # que tambem funciona para PRs de fork sem acesso ao remoto. No
+          # pull_request continuamos comparando contra a `main` do repositorio
+          # base (o HEAD do PR vs. a base = diff real).
+          breaking_against: "${{ github.event_name == 'push' && format('.git#ref={0},subdir=proto', github.event.before) || format('https://github.com/{0}.git#branch=main,subdir=proto', github.repository) }}"
           # nao publicamos no BSR a partir da CI (sem token); so validamos.
           push: false
 

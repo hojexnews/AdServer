@@ -54,6 +54,47 @@ spec:
           cpu: "200m"
           memory: "256Mi"
 ---
+# pod-aml-secret-envkeyref-initcontainer: deve ser rejeitado por proibir-secret-estatico-aml-kyc
+# (usa env[].valueFrom.secretKeyRef num initContainer — mesmo bypass do container
+# principal, mas via spec.initContainers[]; a regra irma proibir-envfrom-secretref
+# ja cobria initContainers, mas proibir-env-secretkeyref nao cobria ate o fix do
+# achado #6, 29a onda de auditoria)
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-aml-secret-envkeyref-initcontainer
+  namespace: aml-kyc
+  annotations:
+    vault.hashicorp.com/agent-inject: "true"
+    vault.hashicorp.com/role: "aml-kyc-payments"
+spec:
+  initContainers:
+    - name: seed
+      image: busybox:1.36
+      env:
+        - name: SUMSUB_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: sumsub-api-secret
+              key: api_key
+      resources:
+        requests:
+          cpu: "50m"
+          memory: "64Mi"
+        limits:
+          cpu: "100m"
+          memory: "128Mi"
+  containers:
+    - name: kyc-screener
+      image: ghcr.io/hojex/kyc-screener:v1.0.0
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "200m"
+          memory: "256Mi"
+---
 # pod-aml-vault-agent: conforme — Vault Agent injetado, sem K8s Secrets,
 # sem labels de outras celulas. Deve passar em todas as policies AML/KYC.
 apiVersion: v1

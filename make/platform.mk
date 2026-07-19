@@ -201,7 +201,12 @@ platform-kyverno-test:
 # service.pipelines.<p>.processors seria fail-open silencioso):
 #   1. traces.processors e logs.processors contem transform/redact-pii (redacao por chave).
 #   2. traces.processors contem redaction/allowlist-traces; logs.processors, allowlist-logs (fail-closed).
-#   3. Nenhum pipeline usa allow_all_keys: true (abre a allowlist — quebra TX-5).
+#   3. Nenhum allow_all_keys resolve para "true" (checagem default-deny,
+#      case-insensitive): toda ocorrencia de "allow_all_keys:" no arquivo deve
+#      resolver textualmente para false/off/no/n; qualquer outra grafia truthy
+#      do resolver YAML 1.1 usado pelo yaml.v3 do otelcol (True/TRUE/yes/YES/on/ON/
+#      1/y/t) ou valor ausente/nao-reconhecido reprova o gate (achado #7, 29a onda:
+#      grep antigo era case-sensitive e so pegava "true" minusculo literal).
 #
 # FIX (11a onda): o "docker run" injeta as tres env-vars de endpoint com valores
 # placeholder/dummy SOMENTE para a etapa de validacao estrutural do otelcol.
@@ -227,14 +232,16 @@ platform-otel-validate:
 	   case "$$line" in *transform/redact-pii*) :;; *) echo "ERRO TX-5: pipeline $$p sem transform/redact-pii na lista .processors (nao apenas definido no arquivo)"; FAIL=1;; esac; \
 	   case "$$line" in *"$$al"*) :;; *) echo "ERRO TX-5: pipeline $$p sem $$al na lista .processors"; FAIL=1;; esac; \
 	 done; \
-	 if grep -q "allow_all_keys:[[:space:]]*true" "$$CONFIG"; then \
-	   echo "ERRO TX-5: allow_all_keys: true detectado em $$CONFIG — fail-closed violado; altere para false"; \
+	 ALLOW_ALL_TOTAL=$$(grep -icE "allow_all_keys:" "$$CONFIG"); \
+	 ALLOW_ALL_FALSE=$$(grep -icE "allow_all_keys:[[:space:]]*(false|off|no|n)([[:space:]]|#|$$)" "$$CONFIG"); \
+	 if [ "$$ALLOW_ALL_TOTAL" != "$$ALLOW_ALL_FALSE" ]; then \
+	   echo "ERRO TX-5: allow_all_keys nao resolve explicita e inequivocamente para false (default-deny) em $$CONFIG — cada bloco redaction/* deve conter 'allow_all_keys: false' textual; qualquer outra grafia (True/TRUE/yes/on/1/ausente/nao-reconhecida) quebra o fail-closed TX-5"; \
 	   FAIL=1; \
 	 fi; \
 	 if [ "$$FAIL" = "1" ]; then \
 	   echo "== platform-otel-validate: FALHOU (verificacao estrutural) =="; exit 1; \
 	 fi; \
-	 echo "-- otel: verificacao estrutural OK (redact-pii + allowlists presentes, allow_all_keys=false)"; \
+	 echo "-- otel: verificacao estrutural OK (redact-pii + allowlists presentes, allow_all_keys=false default-deny)"; \
 	 if ! command -v docker >/dev/null 2>&1; then \
 	   if [ "$(PLATFORM_STRICT)" = "1" ]; then \
 	     echo "ERRO: docker nao encontrado — necessario para otelcol validate. Instale o Docker."; \

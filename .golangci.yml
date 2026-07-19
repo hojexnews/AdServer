@@ -34,5 +34,9 @@ linters:
       # (ranker/bandit, ranker/featurize, cascade) tem float legitimo pervasivo
       # (pCTR, propensity, feature vector) e NAO entram no escopo — forbidigo,
       # que proibe o TIPO float por atacado, seria ruido la.
+      # internal/configload/{loader,assemble}.go montam o Money/ECPM AUTORITATIVO
+      # (decimalToMinor NUMERIC->minor-units + moneyv1.Money.Amount) a partir do
+      # Postgres — pertencem ao escopo puro-dinheiro (29a onda #1: escopar por
+      # diretorio/NOME "financeiro" deixava este modulo escapar; float ali e bug).
       - linters: [forbidigo]
-        path-except: '(internal/money/|internal/ledger/|internal/ranker/score\.go|services/payments/|internal/chainconnector/)'
+        path-except: '(internal/money/|internal/ledger/|internal/ranker/score\.go|internal/configload/loader\.go|internal/configload/assemble\.go|services/payments/|internal/chainconnector/)'

@@ -6,12 +6,29 @@ import { defineConfig, globalIgnores } from "eslint/config";
 import nextVitals from "eslint-config-next/core-web-vitals";
 
 // GLOB por CONVENCAO DE NOME (mesma filosofia do MONEY_GLOBS do eslint.config.mjs
-// raiz do repo, escopo BFF) — casa os arquivos de dinheiro REAIS do console:
-// nome de arquivo com money/ledger/billing/payments E, adicionalmente, tudo sob
-// app/billing/** (a pagina de faturamento nao tem "billing" no NOME do arquivo —
-// page.tsx — so no diretorio; um glob so-por-nome a deixaria de fora).
-// Ver contracts/lint/no-float.md §2 e web/console/src/lib/money.ts,
-// web/console/src/components/ui/money-display.tsx, web/console/src/app/billing/**.
+// raiz do repo, escopo BFF), MAIS toda pagina do App Router — casa:
+//   1. nome de arquivo com money/ledger/billing/payments (lib/, components/ui/
+//      fora de src/app/, ex.: web/console/src/lib/money.ts,
+//      web/console/src/components/ui/money-display.tsx); e
+//   2. TODO src/app/**/*.tsx — qualquer pagina do console e formulario/dashboard
+//      potencial de preco vindo do BFF (rate, budget, bid, cpm/cpc/cpa...). O
+//      glob por NOME sozinho (so item 1) deixava passar paginas cujo arquivo se
+//      chama so "page.tsx" sem "money"/"billing" no nome — FP #2 (29ª onda):
+//      src/app/campaigns/page.tsx captura Rate (rateAmount, string DECIMAL) e
+//      escapava por completo das regras de Number(.../literal-float abaixo
+//      (so a regra global de parseFloat rodava; prova:
+//      `npx eslint --print-config src/app/campaigns/page.tsx` antes do fix
+//      mostrava 1 seletor, contra 3 em src/lib/money.ts). MONEY_TSX_EXCLUDE
+//      abaixo existe para uma excecao pontual e documentada — vazia por
+//      padrao, pois nao ha hoje nenhuma pagina sob src/app/ comprovadamente
+//      livre de dado monetario.
+// Ver contracts/lint/no-float.md §2, web/console/src/lib/money.ts,
+// web/console/src/components/ui/money-display.tsx, web/console/src/app/billing/**,
+// e o backstop por CONTEUDO scripts/ci/no-float-ts.sh (defesa em profundidade:
+// esta config cobre por GLOB, aquele script cobre por CO-OCORRENCIA textual
+// independente de glob).
+const MONEY_TSX_EXCLUDE = [];
+
 const MONEY_GLOBS = [
   "src/**/*money*.ts",
   "src/**/*money*.tsx",
@@ -23,6 +40,8 @@ const MONEY_GLOBS = [
   "src/**/*payments*.tsx",
   "src/app/billing/**/*.ts",
   "src/app/billing/**/*.tsx",
+  "src/app/**/*.tsx",
+  ...MONEY_TSX_EXCLUDE.map((glob) => `!${glob}`),
 ];
 
 const eslintConfig = defineConfig([

@@ -4,9 +4,13 @@
 -- PROPOSITO
 --   Provar que o RLS habilitado em 0003_ledger_rls_up.sql impede tenant A de
 --   ler dados de tenant B nas tres tabelas core do ledger (accounts,
---   journal_entries, postings) e na view derivada account_balances.
---   Inclui o caso fail-closed obrigatorio: sem adserver.tenant_id setado
---   -> 0 linhas em tudo (nunca "todas as linhas").
+--   journal_entries, postings) e na view derivada account_balances, MAIS a
+--   tabela tenant ledger.reconciliation_exceptions (0002 — divergencias
+--   financeiras por tenant, BLOCO 9/9.5). Inclui o caso fail-closed
+--   obrigatorio: sem adserver.tenant_id setado -> 0 linhas em tudo (nunca
+--   "todas as linhas"). O BLOCO 6.5 introspecta o catalogo em modo default-deny:
+--   TODA policy tenant FORCE-RLS do schema tem WITH CHECK explicito (pega
+--   tabelas tenant futuras automaticamente, sem allowlist hardcoded).
 --
 -- PADRAO
 --   Identico ao db/config/tests/rls_isolation_test.sql e
@@ -418,22 +422,34 @@ $$;
 
 
 -- ===========================================================================
--- BLOCO 6.5 — Anti-tautologia: confirma WITH CHECK EXPLICITO no catalogo
+-- BLOCO 6.5 — Anti-tautologia DEFAULT-DENY: TODA policy sobre tabela FORCE-RLS
+--   com coluna tenant_id no schema ledger tem WITH CHECK EXPLICITO no catalogo
 --   pg_policy, INDEPENDENTE do valor de USING.
 --
 -- POR QUE ESTE BLOCO E NECESSARIO
---   As tres policies deste schema sao FOR ALL com USING === WITH CHECK
---   (mesma expressao textual). Quando uma policy FOR ALL OMITE WITH CHECK,
---   o Postgres reusa USING como verificacao de escrita EM TEMPO DE EXECUCAO
---   (o mesmo SQLSTATE check_violation/42501 observado no Bloco 7 abaixo) —
---   mas NAO grava nada em pg_policy.polwithcheck (verificado empiricamente
---   contra Postgres 16.14 nativo: `CREATE POLICY ... USING (...)` sem
---   WITH CHECK produz polwithcheck IS NULL no catalogo, mesmo a policy
---   continuando a rejeitar INSERT/UPDATE cross-tenant via o fallback de
---   USING). Ou seja: o Bloco 7 sozinho passaria IDENTICO mesmo se o
---   WITH CHECK fosse removido da migration 0003 — e tautologico em relacao
---   a presenca do WITH CHECK. Este bloco fecha a lacuna introspectando o
---   catalogo diretamente, sem depender do comportamento de USING.
+--   As policies deste schema sao FOR ALL com USING === WITH CHECK (mesma
+--   expressao textual). Quando uma policy FOR ALL OMITE WITH CHECK, o Postgres
+--   reusa USING como verificacao de escrita EM TEMPO DE EXECUCAO (o mesmo
+--   SQLSTATE 42501 observado no Bloco 7 abaixo) — mas NAO grava nada em
+--   pg_policy.polwithcheck (verificado empiricamente contra Postgres 16.14
+--   nativo: `CREATE POLICY ... USING (...)` sem WITH CHECK produz
+--   polwithcheck IS NULL no catalogo, mesmo a policy continuando a rejeitar
+--   INSERT/UPDATE cross-tenant via o fallback de USING). Ou seja: o Bloco 7
+--   sozinho passaria IDENTICO mesmo se o WITH CHECK fosse removido da
+--   migration — e tautologico em relacao a presenca do WITH CHECK. Este bloco
+--   fecha a lacuna introspectando o catalogo diretamente, sem depender do
+--   comportamento de USING.
+--
+-- POR QUE INTROSPECCAO DEFAULT-DENY (e nao allowlist hardcoded)
+--   Uma allowlist fixa de policies (o padrao antigo, 3 nomes) DEIXA ESCAPAR
+--   qualquer tabela tenant nova cuja policy nao seja adicionada a lista —
+--   foi exatamente o buraco de reconciliation_exceptions_tenant_policy (FP #5,
+--   29a onda): FORCE RLS + tenant_id, mas USING-only e fora da allowlist de 3,
+--   passando 100% desapercebida. Aqui derivamos o conjunto de policies do
+--   PROPRIO catalogo: toda tabela do schema ledger com relforcerowsecurity=true
+--   E coluna tenant_id DEVE ter todas as suas policies com polwithcheck NOT NULL.
+--   Uma tabela tenant futura sem WITH CHECK e pega automaticamente (fail-closed
+--   por construcao), sem editar este teste.
 -- ===========================================================================
 
 DO $$
@@ -443,13 +459,21 @@ DECLARE
     v_found   INT  := 0;
 BEGIN
     FOR v_rec IN
-        SELECT polname, polrelid::regclass::text AS relname, polwithcheck
-        FROM pg_policy
-        WHERE polname IN (
-            'accounts_tenant_isolation',
-            'journal_entries_tenant_isolation',
-            'postings_tenant_isolation'
-        )
+        SELECT pol.polname,
+               cls.relname AS relname,
+               pol.polwithcheck
+        FROM pg_policy    pol
+        JOIN pg_class     cls ON cls.oid = pol.polrelid
+        JOIN pg_namespace nsp ON nsp.oid = cls.relnamespace
+        WHERE nsp.nspname = 'ledger'
+          AND cls.relforcerowsecurity = true          -- FORCE ROW LEVEL SECURITY
+          AND EXISTS (                                  -- tabela tenant (tem tenant_id)
+                SELECT 1 FROM pg_attribute att
+                WHERE att.attrelid = cls.oid
+                  AND att.attname  = 'tenant_id'
+                  AND att.attnum   > 0
+                  AND NOT att.attisdropped
+              )
     LOOP
         v_found := v_found + 1;
         IF v_rec.polwithcheck IS NULL THEN
@@ -457,10 +481,18 @@ BEGIN
         END IF;
     END LOOP;
 
-    -- Guarda contra falso-positivo por vacuidade: se as policies fossem
+    -- Guarda contra falso-positivo por vacuidade: se as policies/tabelas fossem
     -- renomeadas/removidas, a query acima retornaria 0 linhas e o loop
-    -- "passaria" sem checar nada. Exige encontrar exatamente as 3 esperadas.
-    PERFORM pg_temp.assert_count('pg_policy: 3 policies do ledger encontradas', v_found::bigint, 3::bigint);
+    -- "passaria" sem checar nada. Exige encontrar AO MENOS as 4 policies tenant
+    -- conhecidas (accounts, journal_entries, postings, reconciliation_exceptions).
+    -- >= (nao ==) para que uma tabela tenant futura CORRETAMENTE configurada
+    -- (com WITH CHECK) nao quebre este teste — mas uma SEM WITH CHECK cai no
+    -- v_missing acima e aborta.
+    IF v_found < 4 THEN
+        RAISE EXCEPTION
+            'ASSERT FALHOU [introspeccao default-deny vacua]: esperava >= 4 policies tenant FORCE-RLS no schema ledger, encontrou %',
+            v_found;
+    END IF;
 
     IF v_missing <> '' THEN
         RAISE EXCEPTION
@@ -468,7 +500,7 @@ BEGIN
             v_missing;
     END IF;
 
-    RAISE NOTICE 'PASS [pg_policy.polwithcheck NOT NULL nas 3 policies do ledger — WITH CHECK explicito, independente de USING]';
+    RAISE NOTICE 'PASS [default-deny: todas as % policies tenant FORCE-RLS do ledger tem polwithcheck NOT NULL — WITH CHECK explicito, independente de USING]', v_found;
 END;
 $$;
 
@@ -820,6 +852,114 @@ BEGIN
     -- de eventuais blocos futuros nesta transacao (defensivo; o teste termina
     -- em ROLLBACK logo abaixo de qualquer forma).
     SET CONSTRAINTS ALL DEFERRED;
+END;
+$$;
+
+
+-- ===========================================================================
+-- BLOCO 9 — reconciliation_exceptions: isolamento RLS por tenant (FP #5, 29a).
+--
+-- POR QUE ESTE BLOCO E NECESSARIO
+--   ledger.reconciliation_exceptions (migration 0002) e uma tabela tenant
+--   (tenant_id NOT NULL, ENABLE + FORCE RLS) que armazena DIVERGENCIAS
+--   FINANCEIRAS por tenant. Ate a 29a onda NENHUM teste a tocava: os BLOCOS
+--   1-8 so cobrem accounts/journal_entries/postings, e o BLOCO 6.5 (antes)
+--   hardcodava exatamente 3 policies — a 4a policy escapava 100%. Um
+--   `USING (true)` (vazamento cross-tenant total das divergencias) passaria
+--   despercebido. Este bloco fecha a lacuna nos tres eixos: leitura isolada,
+--   fail-closed e WITH CHECK na escrita.
+--
+-- Fixtures inseridas como superuser (bypassa RLS). 1 excecao por tenant.
+-- divergence_minor_units e GENERATED ALWAYS (nao inserida). status default 'open'.
+-- ===========================================================================
+
+DO $$
+DECLARE
+    v_tenant_a UUID   := 'cccccccc-0000-0000-0000-000000000001';
+    v_tenant_b UUID   := 'dddddddd-0000-0000-0000-000000000001';
+    v_count    BIGINT;
+BEGIN
+    -- Fixtures como superuser (antes de SET ROLE): uma divergencia por tenant.
+    -- Valores em minor units NUMERIC (TX-2: sem float).
+    INSERT INTO ledger.reconciliation_exceptions
+        (tenant_id, asset_code, period_start, period_end,
+         expected_minor_units, ledger_minor_units)
+    VALUES
+        (v_tenant_a, 'USDC', '2026-06-15 00:00:00+00', '2026-06-15 01:00:00+00',
+         1000000, 900000),
+        (v_tenant_b, 'USDC', '2026-06-15 00:00:00+00', '2026-06-15 01:00:00+00',
+         5000000, 4000000);
+
+    SET LOCAL ROLE adserver_app;
+    SET LOCAL adserver.tenant_id = 'cccccccc-0000-0000-0000-000000000001';
+
+    -- 9a. isolamento de leitura: tenant A ve exatamente 1 (a sua excecao)
+    SELECT COUNT(*) INTO v_count FROM ledger.reconciliation_exceptions;
+    PERFORM pg_temp.assert_count('recon: tenant_a ve 1 excecao (a sua)', v_count, 1);
+
+    -- 9b. cross-tenant: A NAO ve a excecao de B, mesmo filtrando por tenant_id de B
+    SELECT COUNT(*) INTO v_count
+    FROM ledger.reconciliation_exceptions
+    WHERE tenant_id = v_tenant_b;
+    PERFORM pg_temp.assert_count('cross-tenant recon: A nao ve divergencia de B', v_count, 0);
+
+    -- 9c. fail-closed: sem adserver.tenant_id (vazio) -> NULLIF NULL -> 0 linhas.
+    --     Invariante TX-3/DA-11: falha fecha, nunca abre.
+    SET LOCAL adserver.tenant_id = '';
+    SELECT COUNT(*) INTO v_count FROM ledger.reconciliation_exceptions;
+    PERFORM pg_temp.assert_count('fail-closed recon (tenant_id vazio): 0', v_count, 0);
+
+    RESET ROLE;
+END;
+$$;
+
+
+-- ===========================================================================
+-- BLOCO 9.5 — reconciliation_exceptions: WITH CHECK rejeita INSERT cross-tenant.
+--
+-- Com adserver.tenant_id = A, um INSERT com tenant_id = B deve abortar com
+-- SQLSTATE 42501 (new row violates row-level security policy). Isso PROVA que
+-- a policy tem WITH CHECK (nao apenas USING) — sem WITH CHECK o banco reusaria
+-- USING como check de escrita, mas o teste do BLOCO 6.5 ja garante o
+-- polwithcheck NOT NULL no catalogo; aqui provamos o EFEITO em runtime.
+--
+-- Trap #28: para o INSERT ALCANCAR o WITH CHECK (e nao morrer antes num
+-- permission-check), adserver_app precisa de INSERT na tabela E USAGE na
+-- sequence do BIGSERIAL id (ambos concedidos em make/db.mk FASE 3:
+-- GRANT SELECT,INSERT ... e GRANT USAGE ON ALL SEQUENCES). Por isso o handler
+-- so aceita a rejeicao como PASS se a mensagem for de RLS (row-level security);
+-- uma "permission denied for sequence" (grant ausente) NAO satisfaz e re-lanca,
+-- evitando o falso-positivo do trap #28.
+-- ===========================================================================
+
+DO $$
+DECLARE
+    v_tenant_b UUID := 'dddddddd-0000-0000-0000-000000000001';
+BEGIN
+    SET LOCAL ROLE adserver_app;
+    SET LOCAL adserver.tenant_id = 'cccccccc-0000-0000-0000-000000000001';
+
+    BEGIN
+        INSERT INTO ledger.reconciliation_exceptions
+            (tenant_id, asset_code, period_start, period_end,
+             expected_minor_units, ledger_minor_units)
+        VALUES
+            (v_tenant_b, 'USDC', '2026-06-16 00:00:00+00', '2026-06-16 01:00:00+00',
+             1, 0);
+        -- Chegou aqui: nao foi rejeitado -> falha do teste (WITH CHECK ausente/ineficaz)
+        RAISE EXCEPTION 'ASSERT FALHOU [9.5 recon INSERT cross-tenant]: banco NAO rejeitou — WITH CHECK ausente ou ineficaz';
+    EXCEPTION
+        WHEN check_violation OR insufficient_privilege THEN
+            IF SQLERRM LIKE '%row-level security%' THEN
+                RAISE NOTICE 'PASS [9.5 recon: INSERT cross-tenant rejeitado pelo WITH CHECK (RLS 42501)]: %', SQLERRM;
+            ELSE
+                -- Rejeicao por OUTRO motivo (ex.: permission denied for sequence —
+                -- trap #28): NAO prova o WITH CHECK. Re-lanca para falhar alto.
+                RAISE;
+            END IF;
+    END;
+
+    RESET ROLE;
 END;
 $$;
 

@@ -2,9 +2,11 @@
 #
 # Sobe um Postgres 16 efêmero via service container do GitHub Actions,
 # aplica TODAS as migrations (_up) de todos os schemas em ordem obrigatória:
-#   asset_registry → config → ledger → vector → compliance
-# Roda os rls_isolation_test.sql de cada schema:
-#   config, ledger, vector, compliance
+#   asset_registry → config → ledger (0001..0004) → vector → compliance
+# Roda os testes de banco:
+#   - rls_isolation_test.sql de config, ledger, vector, compliance (TX-3)
+#   - postings_immutability_test.sql (ledger, migration 0004: append-only no
+#     banco via trigger — garantia da 28ª onda #6)
 # Aplica as migrations _down em ordem inversa e confirma reversão limpa.
 # Reporta PASS/FAIL por schema.
 #
@@ -99,9 +101,13 @@ jobs:
             psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "db/config/migrations/${f}_up.sql"
           done
 
-      - name: migrations up — ledger (0001, 0002, 0003)
+      - name: migrations up — ledger (0001, 0002, 0003, 0004)
         run: |
-          for f in 0001_ledger_schema 0002_reconciliation_exceptions 0003_ledger_rls; do
+          # 0004_ledger_postings_immutable: trigger BEFORE UPDATE/DELETE +
+          # append-only em ledger.postings (garantia da 28a onda #6). Sem ele
+          # aplicado na CI, o postings_immutability_test.sql abaixo nunca provaria
+          # a imutabilidade por-PR.
+          for f in 0001_ledger_schema 0002_reconciliation_exceptions 0003_ledger_rls 0004_ledger_postings_immutable; do
             echo "  up: ledger/${f}"
             psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "db/ledger/migrations/${f}_up.sql"
           done
@@ -129,6 +135,13 @@ jobs:
           GRANT SELECT ON ALL TABLES IN SCHEMA ledger TO adserver_loader;
           GRANT USAGE ON ALL SEQUENCES IN SCHEMA ledger TO adserver_app;
           GRANT EXECUTE ON FUNCTION ledger.current_tenant_id() TO adserver_app, adserver_loader;
+          -- least-privilege complementar (migration 0004, achado HIGH #6 / 28a
+          -- onda): adserver_app NAO precisa de UPDATE/DELETE em ledger.postings
+          -- (append-only; internal/ledger/posting.go so faz INSERT). O trigger
+          -- postings_immutable_trg e a garantia primaria; este REVOKE reduz a
+          -- superficie independentemente. O caso 7f de rls_isolation_test.sql
+          -- ja aceita insufficient_privilege como rejeicao valida.
+          REVOKE UPDATE, DELETE ON ledger.postings FROM adserver_app;
           -- vector_store
           GRANT USAGE ON SCHEMA vector_store TO adserver_loader, adserver_app;
           GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA vector_store TO adserver_app;
@@ -154,6 +167,17 @@ jobs:
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
                -f db/ledger/tests/rls_isolation_test.sql
 
+      # Prova de append-only no BANCO (migration 0004, achado HIGH #6 / 28a onda):
+      # INSERT de par balanceado ACEITO; UPDATE/DELETE de posting lancado e
+      # UPDATE direto na particao REJEITADOS pelo trigger postings_immutable_trg
+      # (mesmo como superusuario); journal_entries imutavel apos posted/void.
+      # Roda como o role do DSN de CI (superusuario) de proposito: prova que o
+      # BANCO bloqueia a mutacao independentemente de RLS/GRANT.
+      - name: "postings append-only immutability (migration 0004 / DA-11)"
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+               -f db/ledger/tests/postings_immutability_test.sql
+
       - name: "RLS isolation — vector (TX-3)"
         run: |
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
@@ -177,9 +201,10 @@ jobs:
             psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "db/vector/migrations/${f}_down.sql"
           done
 
-      - name: migrations down — ledger (0003, 0002, 0001)
+      - name: migrations down — ledger (0004, 0003, 0002, 0001)
         run: |
-          for f in 0003_ledger_rls 0002_reconciliation_exceptions 0001_ledger_schema; do
+          # ordem inversa do _up: 0004 (imutabilidade) reverte PRIMEIRO.
+          for f in 0004_ledger_postings_immutable 0003_ledger_rls 0002_reconciliation_exceptions 0001_ledger_schema; do
             echo "  down: ledger/${f}"
             psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "db/ledger/migrations/${f}_down.sql"
           done

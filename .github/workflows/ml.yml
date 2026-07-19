@@ -111,8 +111,46 @@ jobs:
             pytest-asyncio \
             pytest-cov
 
+      # Sentinela contra re-drift do pip install acima (espelha o backstop do
+      # job ml-deep-gate): o contrato ZipMap (zipmap=False — G0/E11) e provado
+      # por ml/training/test_onnx_export.py, que faz `pytest.importorskip` a
+      # nivel de modulo para lightgbm/onnxruntime/onnxmltools. Se qualquer um
+      # sair da lista de dependencias acima, o teste de contrato viraria SKIPPED
+      # em silencio e o ml-full ficaria verde SEM validar o backstop (este e o
+      # UNICO sinal de CI automatizado contra regressao silenciosa de ZipMap).
+      # Este passo falha duro e alto, antes de rodar pytest, se faltar qualquer um.
+      - name: sentinela lightgbm/onnxruntime/onnxmltools (evita skip silencioso do backstop ZipMap)
+        run: |
+          python -c "
+          import importlib, sys
+          faltando = [m for m in ('lightgbm', 'onnxruntime', 'onnxmltools', 'onnx') if importlib.util.find_spec(m) is None]
+          if faltando:
+              print(f'ERRO: pacote(s) ausente(s) no ambiente de CI: {faltando}.', file=sys.stderr)
+              print('ml/training/test_onnx_export.py usa pytest.importorskip para lightgbm/onnxruntime/onnxmltools,', file=sys.stderr)
+              print('entao sem eles o teste de contrato ZipMap (zipmap=False, G0/E11) SKIPPARIA em silencio e o', file=sys.stderr)
+              print('ml-full ficaria verde SEM validar o backstop. Corrija o pip install acima.', file=sys.stderr)
+              sys.exit(1)
+          print('sentinela ZipMap: OK — lightgbm/onnxruntime/onnxmltools/onnx presentes.')
+          "
+
       - name: ml-test (OPE + features + treino + calibracao + promote)
-        run: make ml-test
+        run: |
+          set -o pipefail
+          make ml-test 2>&1 | tee /tmp/ml-test.log
+          # Blindagem pos-hoc (defesa em profundidade, alem da sentinela de
+          # import acima — espelha o job ml-deep-gate): falha se QUALQUER teste
+          # tiver sido SKIPPED (o backstop ZipMap nunca deve escapar por skip) e
+          # confirma explicitamente que o teste de contrato zipmap=False rodou e
+          # passou — nunca skipou em silencio.
+          if grep -qiE '[0-9]+ skipped' /tmp/ml-test.log; then
+            echo "ERRO: make ml-test reportou teste(s) SKIPPED — backstop ZipMap (zipmap=False) mascarado em silencio." >&2
+            exit 1
+          fi
+          if ! grep -q 'test_export_onnx_probabilities_is_flat_tensor_not_zipmap.*PASSED' /tmp/ml-test.log; then
+            echo "ERRO: test_export_onnx_probabilities_is_flat_tensor_not_zipmap nao apareceu como PASSED — contrato ZipMap (zipmap=False) NAO foi validado." >&2
+            exit 1
+          fi
+          echo "ml-test: contrato ZipMap (zipmap=False) confirmado PASSED, 0 skipped."
 
   # -----------------------------------------------------------------------
   # ml-batch: testes de pacing + fraud supervisionado + fraude nao-supervisionada.

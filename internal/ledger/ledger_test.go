@@ -18,6 +18,7 @@ package ledger_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/big"
 	"testing"
@@ -256,6 +257,59 @@ func TestBalance_EmptyPostingsRejected(t *testing.T) {
 	_, err := s.recordEntry(loader, p)
 	if err != ledger.ErrEmptyPostings {
 		t.Fatalf("esperava ErrEmptyPostings, got: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 2b. Balanco — funcao de PRODUCAO (checkBalance em posting.go), nao o stub.
+//
+// Os TestBalance_* acima exercitam s.recordEntry (a reimplementacao local do
+// store stub), nao a checagem real. checkBalance([]PostingLine) e a fonte de
+// verdade em memoria, chamada por RecordEntry (posting.go). Estes testes
+// batem NELA diretamente via o wrapper fino ledger.CheckBalanceForTest, para
+// que uma mutacao em `if s.debit != s.credit` (posting.go) -> `if false`
+// (que desativa a checagem de producao) seja pega — os TestBalance_* baseados
+// no stub NAO pegariam. Prova nao-tautologica (FP #11, 29a onda).
+// ---------------------------------------------------------------------------
+
+func TestCheckBalance_BalancedReturnsNil(t *testing.T) {
+	t.Parallel()
+	// Par balanceado (500000 = 500000) por asset -> checkBalance de producao nil.
+	if err := ledger.CheckBalanceForTest(balancedPostings("USDC", 6, 500_000, 1, 2)); err != nil {
+		t.Fatalf("checkBalance de producao rejeitou par balanceado: %v", err)
+	}
+}
+
+func TestCheckBalance_UnbalancedReturnsError(t *testing.T) {
+	t.Parallel()
+	// Par desbalanceado (100 != 50): a funcao de PRODUCAO deve retornar
+	// ErrUnbalancedPostings. Sob a mutacao `if s.debit != s.credit` -> `if false`
+	// em posting.go, checkBalance retornaria nil e ESTE teste falha (RED),
+	// enquanto os TestBalance_* do stub continuariam verdes.
+	postings := []ledger.PostingLine{
+		{AccountID: 1, AssetCode: "USDC", Scale: 6, DebitMinorUnits: 100, CreditMinorUnits: 0},
+		{AccountID: 2, AssetCode: "USDC", Scale: 6, DebitMinorUnits: 0, CreditMinorUnits: 50},
+	}
+	err := ledger.CheckBalanceForTest(postings)
+	if !errors.Is(err, ledger.ErrUnbalancedPostings) {
+		t.Fatalf("esperava ErrUnbalancedPostings da funcao de producao, got: %v", err)
+	}
+}
+
+func TestCheckBalance_PerAssetImbalanceDetected(t *testing.T) {
+	t.Parallel()
+	// BRL balanceado, USDC desbalanceado (1_000_000 vs 999_999): o balanco e
+	// verificado POR asset_code, entao a divergencia de um centavo em USDC
+	// e detectada mesmo com BRL perfeito. Cobre o loop `for code, s := range
+	// byAsset` da funcao de producao.
+	postings := []ledger.PostingLine{
+		{AccountID: 1, AssetCode: "BRL", Scale: 2, DebitMinorUnits: 1000, CreditMinorUnits: 0},
+		{AccountID: 2, AssetCode: "BRL", Scale: 2, DebitMinorUnits: 0, CreditMinorUnits: 1000},
+		{AccountID: 3, AssetCode: "USDC", Scale: 6, DebitMinorUnits: 1_000_000, CreditMinorUnits: 0},
+		{AccountID: 4, AssetCode: "USDC", Scale: 6, DebitMinorUnits: 0, CreditMinorUnits: 999_999},
+	}
+	if !errors.Is(ledger.CheckBalanceForTest(postings), ledger.ErrUnbalancedPostings) {
+		t.Fatal("esperava ErrUnbalancedPostings: USDC desbalanceado por asset (funcao de producao)")
 	}
 }
 

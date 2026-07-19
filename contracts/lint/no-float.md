@@ -21,12 +21,17 @@ passava sem lint). Por isso o escopo real hoje é **abrangente com exceção exp
 Proto  → TODO proto/adserver/**/*.proto; default-deny de double/float + allowlist
          explícita por (arquivo, campo, tag) para os poucos double de ML (decision.proto).
 Go     → pacotes puro-dinheiro (internal/money, internal/ledger, internal/billing,
-         internal/ranker/score.go, services/payments, internal/chainconnector); barra
-         float32/64 E literais decimais (dinheiro é inteiro em minor units).
+         internal/ranker/score.go, services/payments, internal/chainconnector) MAIS
+         internal/configload/{loader,assemble}.go (montam o Money/ECPM autoritativo a
+         partir do Postgres — 29ª onda #1); barra float32/64 E literais decimais.
 TS     → ESLint por-nome de arquivo (bff/src/**/*{money,ledger,billing,payments}*.ts) +
-         backstop por CONTEÚDO (scripts/ci/no-float-ts.sh) sobre TODO bff/src, independente
-         do nome; console (web/console) via eslint.config.mjs em arquivos de dinheiro.
-Python → diretórios financeiros de ML (ml/pacing, ml/fraud) — floats de features ML livres.
+         backstop por CONTEÚDO (scripts/ci/no-float-ts.sh) sobre TODO bff/src E web/console/src,
+         independente do nome; console (web/console) via eslint.config.mjs em arquivos de
+         dinheiro E TODAS as páginas do App Router (src/app/**/*.tsx, default-deny com
+         MONEY_TSX_EXCLUDE vazio) — 29ª onda #2.
+Python → diretórios financeiros de ML (ml/pacing, ml/fraud) MAIS os jobs de faturamento
+         em data/iceberg/jobs (motor canônico CPM/CPC/CPA — 29ª onda #3, via
+         no-float-data-sql.sh string-aware) — floats de features ML seguem livres.
 SQL    → migrations/** · db/**/migrations/** — sem FLOAT/MONEY em coluna monetária.
 ```
 
@@ -47,7 +52,10 @@ grep + os testes rodavam.)
 **Escopo** (via `path-except` no `.golangci.yml`): os pacotes **puro-dinheiro**
 (`internal/money`, `internal/ledger`, `services/payments`, `internal/chainconnector` — onde float
 NUNCA é legítimo) **mais** o único arquivo do **money-point eCPM** (`internal/ranker/score.go`, cujo
-float intermediário de probabilidade carrega `//nolint:forbidigo // <motivo>`). Os arquivos ML
+float intermediário de probabilidade carrega `//nolint:forbidigo // <motivo>`) **mais**
+`internal/configload/{loader,assemble}.go` (29ª onda #1 — `decimalToMinor` NUMERIC→minor-units e a
+montagem do `moneyv1.Money.Amount` autoritativo; o nome do diretório não casava os globs financeiros,
+o ponto-cego da lição-mãe da 28ª onda). Os arquivos ML
 mistos (`ranker/bandit`, `ranker/featurize`, `cascade`) têm float legítimo pervasivo (pCTR,
 propensity, feature vector) e ficam **fora** do escopo — forbidigo proíbe o _tipo_ float por atacado
 e seria ruído lá; esses caminhos são cobertos por testes known-answer (ex.: `TestScoreCandidateECPM_*`).
@@ -69,7 +77,8 @@ Backstop grep complementar (falha o build), rodado no workflow `no-float.yml` �
 [`scripts/ci/no-float-go.sh`](../../scripts/ci/no-float-go.sh): tokenizer Go (remove
 comentários/strings antes de testar `\bfloat(32|64)\b`, evitando falso-positivo em comentários
 que documentam a regra) sobre o escopo `git ls-files '*money*/*.go' '*ledger*/*.go'
-'*billing*/*.go' '*payments*/*.go' '*chainconnector*/*.go'`. Complementa o forbidigo
+'*billing*/*.go' '*payments*/*.go' '*chainconnector*/*.go'` **mais** os arquivos nomeados
+`internal/configload/{loader,assemble}.go` (29ª onda #1). Complementa o forbidigo
 (lint _type-aware_) acima — o grep é um backstop de path independente do golangci-lint.
 
 ---
@@ -96,12 +105,13 @@ globals), aplicado por override de path:
         ],
         "no-restricted-syntax": [
           "error",
+          // O tipo `number` cru em dinheiro NAO e barrado por um seletor de lint: um
+          // `TSNumberKeyword` literal marcaria TODA anotacao `number` do arquivo
+          // (ex.: `formatCount(count: number)`), quebrando o build — impraticavel. Esse
+          // invariante e imposto em COMPILE-TIME pelo tipo branded `Money` (ver abaixo),
+          // nao pelo ESLint. O gate de lint impoe os 3 seletores abaixo.
           {
-            "selector": "TSNumberKeyword",
-            "message": "tipo 'number' proibido em dinheiro (TX-2): use Money (decimal.js string) ou bigint"
-          },
-          {
-            "selector": "CallExpression[callee.object.name='Number']",
+            "selector": "CallExpression[callee.name='Number']",
             "message": "Number(...) proibido em dinheiro (TX-2): use decimal.js/bigint"
           },
           {
@@ -115,8 +125,13 @@ globals), aplicado por override de path:
 }
 ```
 
-Reforço de revisão: o tipo `Money` é **branded** (ver `money-type.md` §7), o que impede
-passar um `number` cru onde o contrato espera `Money`.
+**Enforcement real (29ª onda #14 — honestidade doc↔código):** o gate de **lint** (`make web-ci`
+/ `bff-ci` + `scripts/ci/no-float-ts.sh`) impõe **3 seletores** em arquivos/páginas de dinheiro:
+(1) `parseFloat` (via `no-restricted-globals`), (2) `Number(...)`, (3) literal float. A proibição do
+**tipo `number` cru** em dinheiro é imposta em **compile-time** pelo tipo **branded** `Money` (ver
+`money-type.md` §7), que impede passar um `number` cru onde o contrato espera `Money` — **não** por um
+seletor de lint (um `TSNumberKeyword` literal seria ruído sobre toda anotação `number`). Portanto,
+descreva o console como **3 seletores de lint + tipo branded** — não como "4 regras de lint".
 
 ---
 

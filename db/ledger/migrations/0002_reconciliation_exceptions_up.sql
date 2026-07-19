@@ -130,9 +130,18 @@ ALTER TABLE ledger.reconciliation_exceptions FORCE ROW LEVEL SECURITY;
 -- Variavel de sessao canonica do repo: adserver.tenant_id (mesma do schema
 -- config/vector — SET LOCAL adserver.tenant_id = '<uuid>' pelo middleware da app).
 -- Fail-closed: sem adserver.tenant_id setado, NULLIF -> NULL -> 0 linhas.
+--
+-- WITH CHECK (mesma expressao do USING): o banco REJEITA INSERT/UPDATE cuja
+-- linha tenha tenant_id diferente do tenant corrente (SQLSTATE 42501 —
+-- new row violates row-level security policy). Sem o WITH CHECK explicito,
+-- o job de reconciliacao (ou um bug futuro) poderia GRAVAR uma excecao
+-- financeira sob o tenant errado, vazando divergencia cross-tenant na escrita.
+-- Nota: a forma inline NULLIF (nao ledger.current_tenant_id()) e usada porque
+-- esta migration 0002 roda ANTES de 0003, que so entao cria o helper.
 CREATE POLICY reconciliation_exceptions_tenant_policy
     ON ledger.reconciliation_exceptions
-    USING (tenant_id = NULLIF(current_setting('adserver.tenant_id', true), '')::uuid);
+    USING      (tenant_id = NULLIF(current_setting('adserver.tenant_id', true), '')::uuid)
+    WITH CHECK (tenant_id = NULLIF(current_setting('adserver.tenant_id', true), '')::uuid);
 
 -- Role de servico (adserver_loader/admin) bypassa RLS para reconciliacao batch.
 -- O BYPASSRLS e concedido ao role adserver_loader (mesmo padrao do config).

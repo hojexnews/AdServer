@@ -50,6 +50,19 @@ mapfile -t float_files < <(git ls-files \
     '*chainconnector*/*.go' \
     2>/dev/null | sort)
 
+# Arquivos money-building fora dos globs por-diretorio (29a onda #1):
+# internal/configload/{loader,assemble}.go convertem NUMERIC->minor-units
+# (decimalToMinor) e montam o moneyv1.Money.Amount AUTORITATIVO a partir do
+# Postgres. O nome do diretorio ("configload") nao casa os globs financeiros,
+# mas o INVARIANTE TX-2 (sem float no dinheiro Go) vale aqui — escopar por
+# NOME de diretorio era o ponto-cego da licao-mae da 28a onda. Full check
+# (token float32/float64 + literal decimal): o pacote nao tem float legitimo.
+for _mf in internal/configload/loader.go internal/configload/assemble.go; do
+    if git ls-files --error-unmatch "$_mf" >/dev/null 2>&1; then
+        float_files+=("$_mf")
+    fi
+done
+
 # Arquivos money-critical adicionais que NAO caem nos globs por-diretorio
 # acima, mas participam do check de LITERAL DECIMAL implicito (nao do check
 # de token float32/float64 — ver nota 27a onda #5 acima).

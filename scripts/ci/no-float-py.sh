@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 # no-float-py.sh — TX-2: proibe float MONETARIO em codigo financeiro Python.
-# Escopo financeiro: money/ledger/billing/payments (contabilidade), mais
+# Escopo financeiro: money/ledger/billing/payments (por DIRETORIO), mais
 # ml/fraud e ml/pacing que declaram TX-2 e processam dados financeiros
 # indiretamente. Dinheiro usa int64 minor-units. Ver contracts/lint/no-float.md.
+#
+# NOTA DE ESCOPO (29a onda #3): o glob '*billing*/*.py' casa "billing" num
+# COMPONENTE DE DIRETORIO — NAO cobre arquivos billing-NOMEADOS fora de um dir
+# "billing/" (ex.: data/iceberg/jobs/billing_batch_hourly.py, o motor canonico
+# de CPM/CPC/CPA). Esses jobs de faturamento em data/iceberg/jobs sao cobertos
+# pelo bloco Python string-aware de scripts/ci/no-float-data-sql.sh (que detecta
+# float() E literal float nu em nomes monetarios, incl. 'rate' — seguro ali, sem
+# os 'learning_rate' float de ML). Nao duplicar aqui p/ nao arriscar novo FP.
 #
 # DISTINCAO FLOAT MONETARIO vs FLOAT DE FEATURE (2026-06-08):
 #   ml/fraud/*.py e ml/pacing/*.py contem float/float32/np.float LEGITIMOS

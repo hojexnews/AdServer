@@ -1105,6 +1105,18 @@ Fecha o **G0** (Onda de Ativação de Go-Live). Dois itens em 3 commits + o focu
 > frontend E9 (22ª) · **copiloto E12 + frontend E10 (23ª)**. Não há mais item de código de G0. Mergeado na `main`
 > (`b4cb624`). **Próximo movimento real = G1 (cutover de infra)** — gated por cluster/OpenBao/FQDNs reais, não por código.
 
+> **Varreduras de integridade de gate pós-G0 (24ª–29ª) + seed E11 real.** Com G0 código-completo, o
+> trabalho pós-G0 é garantir que a **malha de gates realmente imponha** o que promete (a malha é o produto
+> tanto quanto o código). Resumo em [docs/plano-desenvolvimento-por-addon.md](docs/plano-desenvolvimento-por-addon.md)
+> (§ "Sweeps pós-G0"): 24ª (falso-RED do `platform-validate` por path-com-espaço), 25ª (13 gates tautológicos
+> por mutation-testing), 26ª (doc-lie do forbidigo), 27ª (31 falsos-positivos), 28ª (20), **29ª (15 —
+> scope-blindspot de dinheiro em `configload`/`billing_batch`/console, self-diff do `buf` no push, `db.yml`
+> órfão da migration 0004 de imutabilidade, RLS `reconciliation_exceptions` sem WITH CHECK, gate otel
+> case-sensitive, sentinela ZipMap ausente no `ml-full`, doc-lie "4 regras" do console; 5 guardiões PASS — a
+> barreira de dinheiro pegou um falso-positivo que o próprio sweep criou [exclusão `non_money` por-linha]).**
+> Antes da 29ª, o seed **E11 (lado-AdServer)** provisionou as zonas reais 1001–1004 do Hojex News (ver acima).
+> **G0 segue código-completo; próximo movimento real = G1 (cutover de infra, gated).**
+
 ### ⏭️ Pendente da Fase 3
 
 **K8** (promoção do deep ranking sob **uplift A/B + kill-switch**) segue **gated por

@@ -188,11 +188,45 @@ else:
     print("AVISO: billing_hourly.yaml nao encontrado em data/iceberg/specs/.")
 
 # ---------------------------------------------------------------------------
-# Verifica que live_stats / ao_vivo esta rotulado como NAO-FATURAVEL (ADR-0001)
+# Verifica que live_stats / ao_vivo esta rotulado como NAO-FATURAVEL (ADR-0001),
+# escopado ao statement 'COMMENT ON TABLE adserver.<view>' de CADA VIEW ao vivo
+# (achado #12, 29a onda).
+#
+# ANTES (tautologico): "NAO-FATURAVEL" not in ddl_text era substring no CORPUS
+# INTEIRO (concatenacao de todos os *.sql). A string aparece em 3 arquivos —
+# 005_live_view.sql (o rotulo REAL das views live_stats_exact/live_stats_fast)
+# e tambem em comentarios incidentais de 004_stats_hourly.sql e
+# 007_ivt_scoring.sql. Remover o rotulo INTEIRO de 005_live_view.sql nao
+# derrubava o gate, porque 004/007 sozinhos ja satisfaziam a substring global
+# — violando CA-6 (view ao-vivo perde o rotulo dual) em silencio.
+#
+# AGORA: cada VIEW ao-vivo da lista abaixo precisa do rotulo NAO-FATURAVEL
+# DENTRO do proprio statement 'COMMENT ON TABLE adserver.<view> IS ...'.
+# Carona em comentarios de outros arquivos nao satisfaz mais o check.
 # ---------------------------------------------------------------------------
-if "NAO-FATURAVEL" not in ddl_text:
-    print("ERRO: live_stats sem rotulo NAO-FATURAVEL detectado no DDL. ADR-0001 exige rotulacao.", file=sys.stderr)
-    fail = 1
+LIVE_VIEWS_REQUIRING_LABEL = ("live_stats_exact", "live_stats_fast")
+
+for _view in LIVE_VIEWS_REQUIRING_LABEL:
+    _comment_stmt = find_statement(
+        ddl_statements,
+        rf"COMMENT\s+ON\s+TABLE\s+adserver\.{re.escape(_view)}\b",
+    )
+    if _comment_stmt is None:
+        print(
+            f"ERRO: 'COMMENT ON TABLE adserver.{_view} IS ...' nao encontrado. "
+            f"A VIEW ao-vivo precisa de um COMMENT ON TABLE proprio com o "
+            f"rotulo NAO-FATURAVEL (ADR-0001/CA-6).",
+            file=sys.stderr,
+        )
+        fail = 1
+    elif "NAO-FATURAVEL" not in _comment_stmt:
+        print(
+            f"ERRO: adserver.{_view} sem rotulo NAO-FATURAVEL DENTRO do proprio "
+            f"COMMENT ON TABLE (ADR-0001 exige rotulacao dual ao-vivo != "
+            f"faturavel, CA-6).",
+            file=sys.stderr,
+        )
+        fail = 1
 
 if "live" not in ddl_text.lower():
     print("AVISO: nenhuma visao 'live' encontrada no DDL do ClickHouse.", file=sys.stderr)

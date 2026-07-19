@@ -42,6 +42,13 @@ results:
     result: fail
 
   - policy: pci/proibir-secret-estatico-pci
+    rule: proibir-env-secretkeyref
+    resources:
+      - pod-pci-secret-envkeyref-initcontainer
+    kind: Pod
+    result: fail
+
+  - policy: pci/proibir-secret-estatico-pci
     rule: proibir-envfrom-secretref
     resources:
       - pod-pci-vault-agent

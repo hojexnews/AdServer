@@ -134,20 +134,72 @@ for f in $YAML_FILES; do
 done
 
 # ---------------------------------------------------------------------------
-# Python (billing jobs): float() ou literais float em variaveis monetarias
-# Escopo restrito: nome de variavel contem _value, _amount, _rate
-# Exclui linhas de comentario (#) e strings de docstring.
+# Python (billing jobs em data/iceberg/jobs): float MONETARIO — float() OU
+# literal float NU — em variaveis financeiras.
+#
+# 29a onda #3/#13: o grep antigo tinha DOIS buracos que deixavam o motor
+# canonico de faturamento (billing_batch_hourly.py) escapar (provado por
+# mutacao: `make no-float` saia 0):
+#   (1) vocabulario estreito (value|amount|rate) — 'spend/cost/revenue/budget/
+#       cpm/cpc/cpa/...' escapavam. Ampliado para espelhar o bloco SQL/no-float-py.
+#   (2) so casava `\bfloat\s*\(` — `rate = Decimal(10.00)` (literal float NU
+#       alimentando Decimal, a armadilha classica TX-2) NAO tem 'float(' e
+#       passava verde. Agora tambem casa literal float nu.
+# STRING-AWARE (tokenizer stdlib): `rate = Decimal("10.00")` (string DECIMAL
+# LEGITIMA) tem o literal DENTRO de string -> ignorado; `rate = Decimal(10.00)`
+# (nu, em codigo) -> flagrado. Escopo contabil restrito a data/iceberg/jobs, onde
+# 'rate' e sempre dinheiro (CPM/CPC/CPA) — nao ha os 'learning_rate' float de ML.
 # ---------------------------------------------------------------------------
 PY_FILES=$(find "data/iceberg/jobs" -name "*.py" 2>/dev/null | sort || true)
+_PY_MONEY='(value|amount|rate|revenue|cost|budget|price|cpm|cpc|cpa|bid|spend|payout|charge|billing|money|minor_units|decimal)'
 for f in $PY_FILES; do
     [ -f "$f" ] || continue
-    # Detecta: nome_monetario = float(...) ou nome_monetario: float
-    hits=$(grep -inE '(value|amount|rate)\s*[:=].*\bfloat\s*\(' "$f" \
-           | grep -v '^\s*#' \
-           | grep -v '^\s*"""' \
-           || true)
+    hits=$(python3 - "$f" "$_PY_MONEY" <<'PYEOF' || true
+import sys, re, tokenize, io, token as tok_mod
+path, money = sys.argv[1], sys.argv[2]
+money_re = re.compile(money, re.IGNORECASE)
+float_call = re.compile(r'\bfloat\s*\(')
+float_lit = re.compile(r'(?<![A-Za-z0-9_.])([0-9]+\.[0-9]+|\.[0-9]+|[0-9]+[eE][+-]?[0-9]+)')
+# DEFAULT-DENY (29a onda #3/#13, ajuste pós-barreira money-ledger): NAO ha exclusao
+# por-linha de termos ML. Escopo = data/iceberg/jobs (billing puro); dinheiro aqui e
+# SEMPRE Decimal/int64, entao um nome monetario + float na MESMA linha e SEMPRE bug
+# (mesmo que um termo ML co-ocorra, ex.: `payout_rate = float(base_rate)*score_mult`).
+# Uma exclusao por-linha ("pula a linha se contem 'score'") mascarava esse float
+# monetario real — a mesma classe da tautologia "substring por-linha" das ondas 27/28.
+# Se algum dia surgir um float legitimo num nome monetario aqui, use allowlist explicita.
+src = open(path, encoding='utf-8', errors='replace').read()
+lines = src.splitlines()
+# Blinda comentarios e strings (incl. docstrings multi-linha) preservando o lineno.
+code = {i + 1: list(lines[i]) for i in range(len(lines))}
+try:
+    for t in tokenize.generate_tokens(io.StringIO(src).readline):
+        if t.type not in (tok_mod.COMMENT, tok_mod.STRING):
+            continue
+        (sr, sc), (er, ec) = t.start, t.end
+        if sr == er:
+            for c in range(sc, min(ec, len(code.get(sr, [])))):
+                code[sr][c] = ' '
+        else:
+            for c in range(sc, len(code.get(sr, []))):
+                code[sr][c] = ' '
+            for r in range(sr + 1, er):
+                code[r] = [' '] * len(code.get(r, []))
+            for c in range(0, min(ec, len(code.get(er, [])))):
+                code[er][c] = ' '
+except tokenize.TokenError:
+    pass  # fail-open no lexer; o backstop de token ainda roda linha a linha abaixo
+out = []
+for ln in sorted(code):
+    s = ''.join(code[ln])
+    if money_re.search(s) and (float_call.search(s) or float_lit.search(s)):
+        out.append(f"{path}:{ln}:{lines[ln - 1].rstrip()}")
+if out:
+    print("\n".join(out))
+    sys.exit(1)
+PYEOF
+)
     if [ -n "$hits" ]; then
-        echo "ERRO no-float-data-sql: float() em variavel monetaria em $f:"
+        echo "ERRO no-float-data-sql: float monetario (float() ou literal nu) em variavel financeira em $f:"
         echo "$hits"
         FAIL=1
     fi

@@ -39,6 +39,13 @@ results:
     result: fail
 
   - policy: aml-kyc/proibir-secret-estatico-aml-kyc
+    rule: proibir-env-secretkeyref
+    resources:
+      - pod-aml-secret-envkeyref-initcontainer
+    kind: Pod
+    result: fail
+
+  - policy: aml-kyc/proibir-secret-estatico-aml-kyc
     rule: proibir-envfrom-secretref
     resources:
       - pod-aml-vault-agent

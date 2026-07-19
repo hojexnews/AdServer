@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# no-float-ts.sh — TX-2: BACKSTOP textual para TypeScript de dinheiro no BFF,
-# independente do NOME do arquivo.
+# no-float-ts.sh — TX-2: BACKSTOP textual para TypeScript/TSX de dinheiro no
+# BFF e no console (web/console), independente do NOME do arquivo.
 #
 # PROBLEMA QUE ESTE SCRIPT FECHA (27ª/28ª onda, achado #2):
 #   O gate TS existente (eslint.config.mjs raiz + step do no-float.yml) so
@@ -10,14 +10,23 @@
 #   nem roda sobre ele — e parseFloat/Number(/literal-float nesse arquivo
 #   passa verde silenciosamente.
 #
-# FIX: backstop AMPLO, escaneia TODO bff/src/**/*.ts (exceto *.test.ts e
-# gen/**), independente do nome do arquivo, mas so falha uma LINHA se ela
-# contiver AO MESMO TEMPO:
+# ESCOPO ESTENDIDO (29ª onda, FP #2): o mesmo ponto-cego existia no console
+# (web/console) — o MONEY_GLOBS do web/console/eslint.config.mjs cobre hoje
+# toda pagina sob src/app/**/*.tsx (ver eslint.config.mjs), mas esse backstop
+# so escaneava bff/src/**/*.ts. Um .ts/.tsx de dinheiro do console fora de
+# src/app/ (ex.: um novo helper em src/lib/ sem "money"/"billing" no nome)
+# ainda escaparia do ESLint por nome E do backstop por escopo. Agora este
+# script escaneia TAMBEM web/console/src/**/*.ts e **/*.tsx.
+#
+# FIX: backstop AMPLO, escaneia TODO bff/src/**/*.ts e web/console/src/**/*.ts
+# e **/*.tsx (exceto *.test.ts(x) e gen/**), independente do nome do arquivo,
+# mas so falha uma LINHA se ela contiver AO MESMO TEMPO:
 #   (a) um identificador de dinheiro conhecido (amount, price, total, budget,
-#       revenue, cost, bid, cpm, cpc, cpa, balance, conversion_value,
+#       revenue, cost, bid, cpm, cpc, cpa, balance, rate, conversion_value,
 #       minor_units — em snake_case OU camelCase, como token de identificador
 #       inteiro, nao substring — "forbidden" nao casa "bid", "costume" nao
-#       casa "cost"); E
+#       casa "cost", "operate"/"separate"/"generate" nao casam "rate" pois
+#       sao uma unica corrida de minusculas, sem fronteira de camelCase); E
 #   (b) um padrao de float: parseFloat(, Number( (chamada direta, nao
 #       Number.isInteger(...) etc.) ou um literal decimal (12.34).
 #
@@ -33,6 +42,19 @@
 # violacao de verdade) e portanto NAO e stripado; so o texto literal do
 # template (fora de ${}) e tratado como string opaca, igual "..".
 #
+# TSX/JSX (29ª onda, FP #2): arquivos .tsx tem um terceiro tipo de texto
+# opaco que .ts nao tem — o CONTEUDO TEXTUAL de filhos JSX (ex.:
+# `<label>Rate (valor decimal, ex.: 5.00)</label>` — "5.00" ali e um hint
+# de UI, nao aritmetica). Um parser JSX completo esta fora do escopo de um
+# backstop textual; em vez disso, para arquivos .tsx, o padrao de LITERAL
+# decimal (12.34) so dispara se a MESMA linha tambem tiver um sinal
+# independente de codigo real (=, ;, {, +, -, *, ou a palavra `return`) —
+# texto de UI em portugues legitimamente nao carrega nenhum desses tokens.
+# parseFloat(/Number( continuam disparando sem essa guarda extra em .tsx:
+# uma chamada de funcao JS nunca aparece verbatim em prosa. Esta guarda so
+# se aplica a .tsx; o comportamento de .ts (bff/src e web/console/src) fica
+# INALTERADO (evita regressao no backstop ja validado nas ondas 27/28).
+#
 # LIMITACAO CONHECIDA (documentada, aceita para um backstop — nao um
 # parser completo): dentro de uma expressao ${...} o rastreamento de chaves
 # aninhadas e feito por contagem simples de '{'/'}' sem re-entrar na
@@ -41,11 +63,14 @@
 # contexto de dinheiro; aceitavel para um backstop.
 set -euo pipefail
 
-mapfile -t files < <(git ls-files 'bff/src/**/*.ts' \
-    2>/dev/null | grep -v '\.test\.ts$' | grep -v '/gen/' | grep -v '^gen/' | sort)
+mapfile -t files < <({
+    git ls-files 'bff/src/**/*.ts' 2>/dev/null
+    git ls-files 'web/console/src/**/*.ts' 2>/dev/null
+    git ls-files 'web/console/src/**/*.tsx' 2>/dev/null
+} | grep -v '\.test\.ts$' | grep -v '\.test\.tsx$' | grep -v '/gen/' | grep -v '^gen/' | sort -u)
 
 if [ "${#files[@]}" -eq 0 ]; then
-    echo "no-float-ts: nenhum arquivo TS em bff/src (ok)"
+    echo "no-float-ts: nenhum arquivo TS/TSX em bff/src ou web/console/src (ok)"
     exit 0
 fi
 
@@ -62,21 +87,32 @@ import sys, re
 FLOAT_CALL_PAT = re.compile(r'\bparseFloat\s*\(|(?<![.\w])Number\s*\(')
 FLOAT_LIT_PAT = re.compile(r'(?<![A-Za-z0-9_])(?:[0-9]+\.[0-9]+|\.[0-9]+)\b')
 
+# Guarda extra SO para .tsx (ver docstring do arquivo, secao "TSX/JSX"):
+# exige um sinal independente de codigo real na mesma linha antes de deixar
+# um literal decimal (sozinho, sem parseFloat/Number) disparar. Nunca inclui
+# '(' ')' ':' — esses SIM aparecem em prosa/hint de UI (ex.: "ex.: 5.00)")
+# e reintroduziriam o falso-positivo que esta guarda existe para evitar.
+TSX_CODE_SIGNAL_PAT = re.compile(r'[=;{]|[+\-*]|(?<![A-Za-z_$])return(?![A-Za-z0-9_$])')
+
 # Identificadores de dinheiro (token INTEIRO de identificador, nao
 # substring livre) — casam tanto snake_case (conversion_value, minor_units)
-# quanto camelCase (conversionValue, minorUnits, totalBudget).
+# quanto camelCase (conversionValue, minorUnits, totalBudget, rateAmount).
 MONEY_WORDS = {
     "amount", "price", "total", "budget", "revenue", "cost", "bid",
-    "cpm", "cpc", "cpa", "balance", "conversion", "value", "minor", "units",
+    "cpm", "cpc", "cpa", "balance", "rate", "conversion", "value",
+    "minor", "units",
 }
 # "conversion_value"/"minor_units" sao PARES de palavras — exigimos as duas
 # palavras adjacentes no MESMO identificador para casar (evita que um
 # "value" ou "units" soltos e genericos (ex.: "units" de paginacao) disparem
 # sozinhos). O restante (amount, price, total, budget, revenue, cost, bid,
-# cpm, cpc, cpa, balance) casa como palavra unica dentro do identificador.
+# cpm, cpc, cpa, balance, rate) casa como palavra unica dentro do
+# identificador — "rate" adicionada na 29ª onda (FP #2): "rateAmount" ja
+# casava via "amount", mas um campo nomeado so "rate"/"rateCurrency" sem
+# "amount" no identificador nao casaria sem este token.
 MONEY_SOLO = {
     "amount", "price", "total", "budget", "revenue", "cost", "bid",
-    "cpm", "cpc", "cpa", "balance",
+    "cpm", "cpc", "cpa", "balance", "rate",
 }
 MONEY_PAIRS = {("conversion", "value"), ("minor", "units")}
 
@@ -106,8 +142,18 @@ def line_has_money_identifier(line: str) -> bool:
                 return True
     return False
 
-def line_has_float_pattern(line: str) -> bool:
-    return bool(FLOAT_CALL_PAT.search(line)) or bool(FLOAT_LIT_PAT.search(line))
+def line_has_float_pattern(line: str, is_tsx: bool) -> bool:
+    if FLOAT_CALL_PAT.search(line):
+        return True
+    if FLOAT_LIT_PAT.search(line):
+        if not is_tsx:
+            return True
+        # .tsx: literal isolado so conta com um sinal de codigo real junto
+        # (ver TSX_CODE_SIGNAL_PAT) — evita disparar em texto de UI (JSX
+        # children), que nao carrega nenhum desses tokens.
+        if TSX_CODE_SIGNAL_PAT.search(line):
+            return True
+    return False
 
 
 def strip_ts_non_code(src: str):
@@ -240,13 +286,14 @@ def strip_ts_non_code(src: str):
 
 found = []
 for path in sys.argv[1:]:
+    is_tsx = path.endswith('.tsx')
     with open(path, encoding='utf-8', errors='replace') as f:
         src = f.read()
     src_lines = src.splitlines()
     lines_code = strip_ts_non_code(src)
     for lineno in sorted(lines_code):
         fragment = ''.join(lines_code[lineno])
-        if line_has_money_identifier(fragment) and line_has_float_pattern(fragment):
+        if line_has_money_identifier(fragment) and line_has_float_pattern(fragment, is_tsx):
             orig = src_lines[lineno - 1] if lineno <= len(src_lines) else fragment
             found.append(f"{path}:{lineno}:{orig}")
 
@@ -259,7 +306,7 @@ PYEOF
 hits=$(cat "$_tmpout")
 
 if [ "$py_status" -ne 0 ] || [ -n "$hits" ]; then
-    echo "float/Number/parseFloat proibido em codigo monetario TS (BFF/TX-2): use decimal.js ou bigint"
+    echo "float/Number/parseFloat proibido em codigo monetario TS/TSX (BFF/console, TX-2): use decimal.js ou bigint"
     echo "(backstop por CONTEUDO, independente do nome do arquivo — ver scripts/ci/no-float-ts.sh)"
     [ -n "$hits" ] && echo "$hits"
     exit 1
