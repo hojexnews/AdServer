@@ -29,50 +29,58 @@ results:
   # --- proibir-secret-estatico-pci ---
   - policy: pci/proibir-secret-estatico-pci
     rule: proibir-envfrom-secretref
-    resource: pod-pci-secret-envfrom
+    resources:
+      - pod-pci-secret-envfrom
     kind: Pod
     result: fail
 
   - policy: pci/proibir-secret-estatico-pci
     rule: proibir-env-secretkeyref
-    resource: pod-pci-secret-envkeyref
+    resources:
+      - pod-pci-secret-envkeyref
     kind: Pod
     result: fail
 
   - policy: pci/proibir-secret-estatico-pci
     rule: proibir-envfrom-secretref
-    resource: pod-pci-vault-agent
+    resources:
+      - pod-pci-vault-agent
     kind: Pod
     result: pass
 
   - policy: pci/proibir-secret-estatico-pci
     rule: proibir-env-secretkeyref
-    resource: pod-pci-vault-agent
+    resources:
+      - pod-pci-vault-agent
     kind: Pod
     result: pass
 
   # --- exigir-vault-agent-pci ---
   - policy: pci/exigir-vault-agent-pci
     rule: exigir-vault-agent-inject
-    resource: pod-pci-no-vault
+    resources:
+      - pod-pci-no-vault
     kind: Pod
     result: fail
 
   - policy: pci/exigir-vault-agent-pci
     rule: exigir-vault-agent-inject
-    resource: pod-pci-vault-agent
+    resources:
+      - pod-pci-vault-agent
     kind: Pod
     result: pass
 
   # --- proibir-label-delivery-em-pci ---
   - policy: pci/proibir-label-delivery-em-pci
     rule: proibir-cell-delivery
-    resource: pod-pci-label-delivery
+    resources:
+      - pod-pci-label-delivery
     kind: Pod
     result: fail
 
   - policy: pci/proibir-label-delivery-em-pci
     rule: proibir-cell-delivery
-    resource: pod-pci-vault-agent
+    resources:
+      - pod-pci-vault-agent
     kind: Pod
     result: pass

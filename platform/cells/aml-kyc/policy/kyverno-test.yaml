@@ -26,63 +26,73 @@ results:
   # --- proibir-secret-estatico-aml-kyc ---
   - policy: aml-kyc/proibir-secret-estatico-aml-kyc
     rule: proibir-envfrom-secretref
-    resource: pod-aml-secret-envfrom
+    resources:
+      - pod-aml-secret-envfrom
     kind: Pod
     result: fail
 
   - policy: aml-kyc/proibir-secret-estatico-aml-kyc
     rule: proibir-env-secretkeyref
-    resource: pod-aml-secret-envkeyref
+    resources:
+      - pod-aml-secret-envkeyref
     kind: Pod
     result: fail
 
   - policy: aml-kyc/proibir-secret-estatico-aml-kyc
     rule: proibir-envfrom-secretref
-    resource: pod-aml-vault-agent
+    resources:
+      - pod-aml-vault-agent
     kind: Pod
     result: pass
 
   - policy: aml-kyc/proibir-secret-estatico-aml-kyc
     rule: proibir-env-secretkeyref
-    resource: pod-aml-vault-agent
+    resources:
+      - pod-aml-vault-agent
     kind: Pod
     result: pass
 
   # --- exigir-vault-agent-aml-kyc ---
   - policy: aml-kyc/exigir-vault-agent-aml-kyc
     rule: exigir-vault-agent-inject
-    resource: pod-aml-no-vault
+    resources:
+      - pod-aml-no-vault
     kind: Pod
     result: fail
 
   - policy: aml-kyc/exigir-vault-agent-aml-kyc
     rule: exigir-vault-agent-inject
-    resource: pod-aml-vault-agent
+    resources:
+      - pod-aml-vault-agent
     kind: Pod
     result: pass
 
   # --- proibir-label-delivery-em-aml-kyc ---
   - policy: aml-kyc/proibir-label-delivery-em-aml-kyc
     rule: proibir-cell-delivery
-    resource: pod-aml-label-delivery
+    resources:
+      - pod-aml-label-delivery
     kind: Pod
     result: fail
 
   - policy: aml-kyc/proibir-label-delivery-em-aml-kyc
     rule: proibir-cell-delivery
-    resource: pod-aml-vault-agent
+    resources:
+      - pod-aml-vault-agent
     kind: Pod
     result: pass
 
   # --- proibir-label-pci-em-aml-kyc ---
   - policy: aml-kyc/proibir-label-pci-em-aml-kyc
     rule: proibir-cell-pci
-    resource: pod-aml-label-pci
+    resources:
+      - pod-aml-label-pci
     kind: Pod
     result: fail
 
   - policy: aml-kyc/proibir-label-pci-em-aml-kyc
     rule: proibir-cell-pci
-    resource: pod-aml-vault-agent
+    resources:
+      - pod-aml-vault-agent
     kind: Pod
     result: pass

@@ -9,6 +9,8 @@
 #   kubeconform  — valida YAML K8s/CRD contra schemas (baixado em .bin/ se ausente)
 #   kyverno      — kyverno test offline das policies (baixado em .bin/ se ausente)
 #   docker       — executa otelcol validate (imagem otel/opentelemetry-collector-contrib)
+#   python3      — valida estaticamente as policies OpenBao least-privilege
+#                  (platform/secrets/openbao/*.hcl); sem dependencia externa
 #
 # Convencao de ausencia de ferramenta:
 #   Local: avisa e pula (nao falha make, para nao bloquear dev sem as ferramentas).
@@ -32,13 +34,19 @@ KUBECONFORM   := $(shell command -v kubeconform 2>/dev/null || echo "$(BIN)/kube
 KYVERNO_CLI   := $(shell command -v kyverno 2>/dev/null || echo "$(BIN)/kyverno")
 
 KUBECONFORM_VER := 0.7.0
-KYVERNO_CLI_VER := 1.13.4
+# KYVERNO_CLI_VER: fixado em >=1.18.0 — versoes < 1.18.0 (ex.: 1.13.4) tem um bug
+# de reporte no "kyverno test" (fix upstream: kyverno/kyverno#15361) que MASCARA
+# mismatches "declared fail, actual pass": a REASON mostra "Want fail, got pass"
+# mas a coluna RESULT/Test-Summary/exit-code ficam verdes — achado #7 (auditoria
+# 27a onda). Confirmado empiricamente: 1.13.4 engole a mutacao; 1.18.2 reprova
+# (exit 1). NAO fazer downgrade sem reabrir esse achado.
+KYVERNO_CLI_VER := 1.18.2
 
 # SHA256 dos tarballs de instalacao local (sincronizado com .github/workflows/platform.yml).
 # Fonte autoritativa: .github/workflows/platform.yml (env: KUBECONFORM_SHA256 / KYVERNO_SHA256).
 # Atualizar aqui ao bumpar KUBECONFORM_VER / KYVERNO_CLI_VER acima.
 KUBECONFORM_SHA256 := c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3
-KYVERNO_SHA256     := abd318dbb971ab6de2bbe3b7226f4a03230d5c9c651df8a29b6b5e085a55aeeb
+KYVERNO_SHA256     := cb2feb8356149fd2fe774c894ccf0969f4a60a83867dd913af724f74ffbbc18b
 
 # Imagem do OTel Collector contrib para validacao semantica da config TX-5.
 # Espelha OTELCOL_IMAGE em .github/workflows/platform.yml — manter em sincronia.
@@ -49,6 +57,9 @@ OTEL_CONFIG := platform/observability/otel-collector.yaml
 
 # Diretorio raiz do modulo OpenTofu.
 TOFU_ROOT := platform/tofu
+
+# Diretorio das policies OpenBao least-privilege por celula (mandato item 5).
+OPENBAO_DIR := platform/secrets/openbao
 
 # Diretorios de manifests K8s a validar com kubeconform.
 # Inclui platform/k8s (baseline) e ambas as celulas compliance.
@@ -245,8 +256,18 @@ platform-otel-validate:
 	   validate --config /etc/otel/config.yaml; \
 	 echo "== platform-otel-validate: OK =="
 
-## platform-validate: tofu validate + kubeconform + kyverno test + otel-validate (tudo offline)
-platform-validate: platform-tofu-validate platform-kubeconform platform-kyverno-test platform-otel-validate
-	@echo "OK — platform validado offline (tofu + kubeconform + kyverno test + otel-validate TX-5)."
+## platform-openbao-policy-check: valida estaticamente least-privilege por celula
+##   das policies OpenBao (platform/secrets/openbao/*.hcl). Sem CLI externo
+##   ("bao"/"vault" indisponiveis no ambiente hermetico) -- validador proprio
+##   (platform/secrets/openbao/policy-check.py) rejeita: path "*" nu, capability
+##   "sudo"/"*", e qualquer path que vaze para o namespace de OUTRA celula
+##   (isolamento cross-cell, achado #8 da auditoria 27a onda).
+platform-openbao-policy-check:
+	@echo "== platform-openbao-policy-check: least-privilege por celula (HCL) =="
+	@python3 "$(CURDIR)/$(OPENBAO_DIR)/policy-check.py" "$(CURDIR)/$(OPENBAO_DIR)"
 
-.PHONY: platform-tools platform-tofu-validate platform-kubeconform platform-kyverno-test platform-otel-validate platform-validate
+## platform-validate: tofu validate + kubeconform + kyverno test + otel-validate + openbao-policy-check (tudo offline)
+platform-validate: platform-tofu-validate platform-kubeconform platform-kyverno-test platform-otel-validate platform-openbao-policy-check
+	@echo "OK — platform validado offline (tofu + kubeconform + kyverno test + otel-validate TX-5 + openbao-policy-check)."
+
+.PHONY: platform-tools platform-tofu-validate platform-kubeconform platform-kyverno-test platform-otel-validate platform-openbao-policy-check platform-validate

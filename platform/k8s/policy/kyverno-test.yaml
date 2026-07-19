@@ -31,25 +31,29 @@ results:
   # --- disallow-latest-tag ---
   - policy: disallow-latest-tag
     rule: require-image-tag
-    resource: pod-latest-tag
+    resources:
+      - pod-latest-tag
     kind: Pod
     result: fail
 
   - policy: disallow-latest-tag
     rule: require-image-tag
-    resource: pod-versioned-tag
+    resources:
+      - pod-versioned-tag
     kind: Pod
     result: pass
 
   # --- require-resource-limits ---
   - policy: require-resource-limits
     rule: require-limits
-    resource: pod-no-limits
+    resources:
+      - pod-no-limits
     kind: Pod
     result: fail
 
   - policy: require-resource-limits
     rule: require-limits
-    resource: pod-with-limits
+    resources:
+      - pod-with-limits
     kind: Pod
     result: pass

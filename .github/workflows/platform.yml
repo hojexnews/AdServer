@@ -8,6 +8,9 @@
 #      platform/cells/aml-kyc/policy/  (asserts de accept/reject offline)
 #   4. otelcol validate --config platform/observability/otel-collector.yaml
 #      + verificacao estrutural dos processadores de redacao de PII (TX-5)
+#   5. policy-check.py sobre platform/secrets/openbao/*.hcl (least-privilege
+#      por celula: rejeita path "*" nu, capability "sudo"/"*" e qualquer path
+#      cross-cell -- python3, sem CLI bao/vault externo)
 #
 # Aciona em PR/push apenas quando platform/ ou make/platform.mk forem alterados.
 # Nao exige aprovacao cloud — tudo estatico.
@@ -32,7 +35,10 @@ permissions:
 env:
   # Versoes espelhadas em make/platform.mk — manter em sincronia.
   KUBECONFORM_VER: "0.7.0"
-  KYVERNO_CLI_VER: "1.13.4"
+  # >=1.18.0 exigido — fix upstream kyverno/kyverno#15361 (achado #7, 27a onda):
+  # < 1.18.0 mascara "declared fail, actual pass" no kyverno test (RESULT/exit
+  # ficam verdes mesmo com REASON="Want fail, got pass"). Ver make/platform.mk.
+  KYVERNO_CLI_VER: "1.18.2"
   TOFU_VER: "1.9.1"
   # Imagem do OTel Collector contrib para validacao semantica (TX-5).
   # Espelha OTELCOL_IMAGE em make/platform.mk — manter em sincronia.
@@ -41,10 +47,10 @@ env:
   # Atualizar ao bumpar versoes acima. Verificado antes de extrair (M-1).
   # Digests obtidos de:
   #   kubeconform: https://github.com/yannh/kubeconform/releases/download/v0.7.0/CHECKSUMS
-  #   kyverno:     https://github.com/kyverno/kyverno/releases/download/v1.13.4/checksums.txt
+  #   kyverno:     https://github.com/kyverno/kyverno/releases/download/v1.18.2/checksums.txt
   #   tofu:        https://github.com/opentofu/opentofu/releases/download/v1.9.1/tofu_1.9.1_SHA256SUMS
   KUBECONFORM_SHA256: "c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3"
-  KYVERNO_SHA256: "abd318dbb971ab6de2bbe3b7226f4a03230d5c9c651df8a29b6b5e085a55aeeb"
+  KYVERNO_SHA256: "cb2feb8356149fd2fe774c894ccf0969f4a60a83867dd913af724f74ffbbc18b"
   TOFU_SHA256: "ebb3eb2d12833422543c3f04a7ec21d9fd260e893ad221c63dbcf0a319ff563a"
 
 jobs:
@@ -81,8 +87,9 @@ jobs:
 
       # ------------------------------------------------------------------
       # kyverno CLI — download com verificacao de integridade SHA256 (M-1).
-      # Nota: o asset real para v1.13.4 e kyverno-cli_v<ver>_linux_x86_64.tar.gz
-      # (nao kyverno_linux_amd64.tar.gz). O binario dentro do tarball e "kyverno".
+      # Nota: o asset real e kyverno-cli_v<ver>_linux_x86_64.tar.gz
+      # (nao kyverno_linux_amd64.tar.gz; confirmado tambem em v1.18.2). O binario
+      # dentro do tarball e "kyverno".
       # ------------------------------------------------------------------
       - name: instalar kyverno CLI
         run: |
@@ -120,3 +127,11 @@ jobs:
       # ------------------------------------------------------------------
       - name: otel-validate (config TX-5 — redacao PII + otelcol validate)
         run: PLATFORM_STRICT=1 make platform-otel-validate
+
+      # ------------------------------------------------------------------
+      # OpenBao — validacao estatica das policies least-privilege por celula
+      # (mandato item 5). Sem CLI externo (bao/vault); python3 (ja presente no
+      # runner ubuntu-latest) roda platform/secrets/openbao/policy-check.py.
+      # ------------------------------------------------------------------
+      - name: openbao policy-check (least-privilege por celula, HCL)
+        run: make platform-openbao-policy-check
