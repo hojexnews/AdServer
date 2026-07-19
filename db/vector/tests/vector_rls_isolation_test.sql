@@ -313,6 +313,17 @@ $$;
 --   que todos leem — envenenamento do corpus RAG. Cada tentativa deve abortar
 --   com 42501; cada probe roda num sub-bloco (savepoint), então a rejeição
 --   esperada não derruba a transação de teste.
+--
+--   PK EXPLÍCITA (anti-tautologia): as duas tabelas usam `id BIGSERIAL`, mas o
+--   role adserver_app NÃO recebe `USAGE` na sequence (make/db.mk concede só
+--   USAGE no schema + DML nas tabelas, sem `ALL SEQUENCES`; o grant de sequence
+--   de vector_store está comentado em 0002_vector_rls_up.sql). Um INSERT que
+--   OMITE `id` avalia nextval() e morre com "permission denied for sequence"
+--   (SQLSTATE 42501) ANTES de a policy WITH CHECK ser avaliada — o mesmo 42501
+--   que uma violação de RLS produz. Isso tornava o bloco TAUTOLÓGICO: passava
+--   mesmo com WITH CHECK (true). Fornecemos `id` explícito (fora do range do
+--   BIGSERIAL semeado) para que nextval() NÃO seja chamado, o INSERT ALCANCE a
+--   policy, e o 42501 observado seja de fato a violação do WITH CHECK.
 -- ===========================================================================
 DO $$
 DECLARE
@@ -323,33 +334,34 @@ BEGIN
     SET LOCAL adserver.tenant_id = 'cccccccc-0000-0000-0000-000000000001';
 
     -- 7a. help_doc "público" forjado (tenant_id NULL) por um tenant → rejeitado
+    --     id explícito (900001) → sem nextval → o INSERT alcança o WITH CHECK.
     BEGIN
         INSERT INTO vector_store.help_doc_embeddings
-            (tenant_id, doc_id, title, content, chunk_index, embedding, embedding_model)
-        VALUES (NULL, 'help-forjado', 'Forjado', 'x', 0, v_zero_vec::vector, 'test-model');
+            (id, tenant_id, doc_id, title, content, chunk_index, embedding, embedding_model)
+        VALUES (900001, NULL, 'help-forjado', 'Forjado', 'x', 0, v_zero_vec::vector, 'test-model');
         RAISE EXCEPTION
             'ASSERT FALHOU [WITH CHECK help_doc NULL]: doc público por tenant ACEITO (esperado 42501)';
     EXCEPTION WHEN insufficient_privilege THEN
         RAISE NOTICE 'PASS [WITH CHECK: help_doc público (tenant_id NULL) forjado rejeitado]: %', SQLSTATE;
     END;
 
-    -- 7b. help_doc com tenant_id de B → rejeitado
+    -- 7b. help_doc com tenant_id de B → rejeitado (id explícito 900002)
     BEGIN
         INSERT INTO vector_store.help_doc_embeddings
-            (tenant_id, doc_id, title, content, chunk_index, embedding, embedding_model)
-        VALUES (v_tenant_b, 'help-b-forjado', 'Forjado B', 'x', 0, v_zero_vec::vector, 'test-model');
+            (id, tenant_id, doc_id, title, content, chunk_index, embedding, embedding_model)
+        VALUES (900002, v_tenant_b, 'help-b-forjado', 'Forjado B', 'x', 0, v_zero_vec::vector, 'test-model');
         RAISE EXCEPTION
             'ASSERT FALHOU [WITH CHECK help_doc B]: INSERT cross-tenant ACEITO (esperado 42501)';
     EXCEPTION WHEN insufficient_privilege THEN
         RAISE NOTICE 'PASS [WITH CHECK: help_doc do tenant B rejeitado]: %', SQLSTATE;
     END;
 
-    -- 7c. creative com tenant_id de B → rejeitado
+    -- 7c. creative com tenant_id de B → rejeitado (id explícito 900003)
     BEGIN
         INSERT INTO vector_store.creative_embeddings
-            (tenant_id, banner_id, campaign_id, creative_type, ctr,
+            (id, tenant_id, banner_id, campaign_id, creative_type, ctr,
              impression_count, description_snippet, embedding, embedding_model)
-        VALUES (v_tenant_b, 999, 9999, 'image', 0.01, 1, 'forjado',
+        VALUES (900003, v_tenant_b, 999, 9999, 'image', 0.01, 1, 'forjado',
                 v_zero_vec::vector, 'test-model');
         RAISE EXCEPTION
             'ASSERT FALHOU [WITH CHECK creative B]: INSERT cross-tenant ACEITO (esperado 42501)';

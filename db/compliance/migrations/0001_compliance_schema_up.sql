@@ -141,8 +141,13 @@ CREATE INDEX kyc_subjects_sumsub_applicant_id_idx ON compliance.kyc_subjects (su
 ALTER TABLE compliance.kyc_subjects ENABLE ROW LEVEL SECURITY;
 ALTER TABLE compliance.kyc_subjects FORCE  ROW LEVEL SECURITY;
 
+-- WITH CHECK explicito (padrao canonico do repo — identico a config/ledger/vector):
+-- rejeita INSERT/UPDATE cujo tenant_id divirja do tenant corrente. Sem a clausula,
+-- o Postgres reusa o USING como verificacao de escrita (comportamento identico),
+-- mas o WITH CHECK torna a intencao inequivoca e robusta a mudanca do USING.
 CREATE POLICY kyc_subjects_tenant_isolation ON compliance.kyc_subjects
-    USING (tenant_id = compliance.current_tenant_id());
+    USING      (tenant_id = compliance.current_tenant_id())
+    WITH CHECK (tenant_id = compliance.current_tenant_id());
 
 -- ---------------------------------------------------------------------------
 -- Tabela: compliance.screening_results
@@ -209,8 +214,10 @@ CREATE INDEX screening_results_address_direction_idx
 ALTER TABLE compliance.screening_results ENABLE ROW LEVEL SECURITY;
 ALTER TABLE compliance.screening_results FORCE  ROW LEVEL SECURITY;
 
+-- WITH CHECK explicito (ver nota em kyc_subjects_tenant_isolation).
 CREATE POLICY screening_results_tenant_isolation ON compliance.screening_results
-    USING (tenant_id = compliance.current_tenant_id());
+    USING      (tenant_id = compliance.current_tenant_id())
+    WITH CHECK (tenant_id = compliance.current_tenant_id());
 
 -- ---------------------------------------------------------------------------
 -- Tabela: compliance.travel_rule_records
@@ -291,8 +298,10 @@ CREATE INDEX travel_rule_records_tx_ref_idx ON compliance.travel_rule_records (t
 ALTER TABLE compliance.travel_rule_records ENABLE ROW LEVEL SECURITY;
 ALTER TABLE compliance.travel_rule_records FORCE  ROW LEVEL SECURITY;
 
+-- WITH CHECK explicito (ver nota em kyc_subjects_tenant_isolation).
 CREATE POLICY travel_rule_records_tenant_isolation ON compliance.travel_rule_records
-    USING (tenant_id = compliance.current_tenant_id());
+    USING      (tenant_id = compliance.current_tenant_id())
+    WITH CHECK (tenant_id = compliance.current_tenant_id());
 
 -- ---------------------------------------------------------------------------
 -- Funcao auxiliar: atualiza updated_at automaticamente

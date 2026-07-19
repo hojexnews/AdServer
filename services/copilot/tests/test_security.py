@@ -42,6 +42,14 @@ from tools.schemas import (
 # Fixtures / helpers
 # ---------------------------------------------------------------------------
 
+# app/server.py constroi settings/gateway/graph a NIVEL DE MODULO — precisa
+# destas 3 env vars presentes ANTES do primeiro `import app.server` (usado
+# pelos testes de execucao real C1 — Achado #13/#24). setdefault() nunca
+# sobrescreve valores reais se o processo ja os tiver (CI/prod).
+os.environ.setdefault("ANTHROPIC_API_KEY", "sk-test-fake-for-import")
+os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://test:test@localhost/test")
+os.environ.setdefault("COPILOT_INTERNAL_SECRET", "test-secret-hmac-32-chars-long!!")
+
 TENANT_A = "aaaaaaaa-0000-0000-0000-000000000001"
 TENANT_B = "bbbbbbbb-0000-0000-0000-000000000002"
 
@@ -1214,3 +1222,366 @@ class TestHitlResumeContract:
         assert "frontend-bff" in source.lower() or "frontend-bff-engineer" in source.lower(), (
             "O contrato de reconexao deve mencionar o frontend-bff-engineer"
         )
+
+
+# =============================================================================
+# Achado #10/#11 — HMAC real (_verify_hmac) + anti-replay: testes BEHAVIORAIS
+# contra o CODIGO REAL (nao a copia _verify_hmac_pure usada acima em
+# TestH1HmacFailClosed). Uma mutacao accept-all em auth.py:144 ou que desliga
+# a janela de anti-replay em auth.py:134 deve fazer estes testes falharem.
+# =============================================================================
+
+class TestHmacRealFunctionRejectsForgedAndReplayed:
+    """
+    Achado #10: nenhum teste anterior chamava a FUNCAO REAL _verify_hmac (ou
+    get_authorized_session) com uma assinatura presente-porem-ERRADA — so a
+    copia _verify_hmac_pure era exercitada com sig invalida. Aqui chamamos a
+    funcao real.
+
+    Achado #11: nenhum teste anterior chamava a funcao real com timestamp fora
+    da janela de +-60s — so a copia. Aqui testamos o anti-replay real.
+    """
+
+    def test_real_verify_hmac_rejects_wrong_signature(self) -> None:
+        """_verify_hmac REAL (auth.py:108) rejeita assinatura forjada."""
+        from app.auth import _verify_hmac
+
+        secret = "correct-secret-32-chars-long!!!"
+        ts = str(int(time.time()))
+        forged_sig = _make_hmac_sig(TENANT_A, ts, "attacker-controlled-secret")
+        assert _verify_hmac(TENANT_A, ts, forged_sig, secret) is False, (
+            "_verify_hmac REAL deve rejeitar assinatura forjada com secret errado"
+        )
+
+    def test_real_verify_hmac_accepts_valid_signature(self) -> None:
+        """_verify_hmac REAL aceita assinatura corretamente calculada (contraste)."""
+        from app.auth import _verify_hmac
+
+        secret = "correct-secret-32-chars-long!!!"
+        ts = str(int(time.time()))
+        sig = _make_hmac_sig(TENANT_A, ts, secret)
+        assert _verify_hmac(TENANT_A, ts, sig, secret) is True
+
+    def test_real_verify_hmac_rejects_replayed_old_timestamp(self) -> None:
+        """
+        _verify_hmac REAL (auth.py:134) rejeita timestamp fora da janela de
+        +-60s, mesmo com assinatura corretamente calculada para esse timestamp
+        antigo (anti-replay).
+        """
+        from app.auth import _verify_hmac
+
+        secret = "correct-secret-32-chars-long!!!"
+        old_ts = str(int(time.time()) - 120)  # 2 minutos atras — fora da janela
+        sig = _make_hmac_sig(TENANT_A, old_ts, secret)  # assinatura correta, porem velha
+        assert _verify_hmac(TENANT_A, old_ts, sig, secret) is False, (
+            "_verify_hmac REAL deve rejeitar timestamp replayed (fora de +-60s)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_authorized_session_real_rejects_forged_signature_in_production(self) -> None:
+        """
+        Fim-a-fim: get_authorized_session REAL com assinatura forjada (secret
+        errado) retorna 401 em producao. Uma mutacao accept-all em
+        auth.py:144 faria este teste passar de RED para GREEN indevidamente
+        (a request seria aceita).
+        """
+        from fastapi import HTTPException
+        from app.auth import get_authorized_session
+
+        secret = "prod-secret-hmac-32-chars-long!"
+        settings = make_settings(copilot_internal_secret=secret)
+        ts = str(int(time.time()))
+        forged_sig = _make_hmac_sig(TENANT_A, ts, "wrong-secret-forjado-pelo-atacante")
+        mock_request = MagicMock()
+
+        with patch.dict(os.environ, {"APP_ENV": "production", "SKIP_AUTH_DEV": "false"}):
+            with pytest.raises(HTTPException) as exc_info:
+                await get_authorized_session(
+                    request=mock_request,
+                    settings=settings,
+                    x_tenant_id=TENANT_A,
+                    x_session_id=None,
+                    x_internal_timestamp=ts,
+                    x_internal_signature=forged_sig,
+                )
+            assert exc_info.value.status_code == 401, (
+                "get_authorized_session REAL deve rejeitar assinatura forjada com 401"
+            )
+
+    @pytest.mark.asyncio
+    async def test_get_authorized_session_real_rejects_replayed_timestamp_in_production(self) -> None:
+        """
+        Fim-a-fim: get_authorized_session REAL com timestamp fora da janela
+        (1h atras), porem com assinatura CORRETA para aquele timestamp, ainda
+        retorna 401 (anti-replay). Uma mutacao que desliga a janela em
+        auth.py:134 faria este teste passar indevidamente.
+        """
+        from fastapi import HTTPException
+        from app.auth import get_authorized_session
+
+        secret = "prod-secret-hmac-32-chars-long!"
+        settings = make_settings(copilot_internal_secret=secret)
+        old_ts = str(int(time.time()) - 3600)  # 1 hora atras
+        sig = _make_hmac_sig(TENANT_A, old_ts, secret)  # correta, porem velha (replay)
+        mock_request = MagicMock()
+
+        with patch.dict(os.environ, {"APP_ENV": "production", "SKIP_AUTH_DEV": "false"}):
+            with pytest.raises(HTTPException) as exc_info:
+                await get_authorized_session(
+                    request=mock_request,
+                    settings=settings,
+                    x_tenant_id=TENANT_A,
+                    x_session_id=None,
+                    x_internal_timestamp=old_ts,
+                    x_internal_signature=sig,
+                )
+            assert exc_info.value.status_code == 401, (
+                "get_authorized_session REAL deve rejeitar timestamp replayed com 401"
+            )
+
+
+# =============================================================================
+# Achado #12 — HITL obrigatorio: testes BEHAVIORAIS sobre o grafo REAL
+# (graph.builder.build_graph) e o guard REAL de graph.nodes.apply_write_node.
+# Nenhum teste anterior importava/invocava estes modulos behaviorally — so
+# grep de source. Uma mutacao que pula HITL na topologia (builder.py:160) ou
+# remove o guard hitl_approved (nodes.py:480) deve fazer estes testes falharem.
+# =============================================================================
+
+class TestHitlMandatoryRealGraphAndNode:
+    """
+    Achado #12: HITL obrigatorio nao tinha gate algum sobre o codigo real do
+    grafo. Aqui: (a) compilamos o grafo REAL e inspecionamos a topologia
+    (write_draft deve ir para hitl_approval, nunca direto para apply_write);
+    (b) chamamos apply_write_node REAL e provamos que NAO persiste sem
+    state['hitl_approved'] == True.
+    """
+
+    def test_write_draft_edge_goes_to_hitl_approval_not_apply_write(self) -> None:
+        """
+        graph.builder.build_graph REAL: a aresta write_draft->hitl_approval
+        deve existir; write_draft->apply_write (bypass de HITL) NAO deve
+        existir na topologia compilada.
+        """
+        from graph.builder import build_graph
+        from app.model_router import ModelRouter, InMemoryBudgetTracker
+
+        settings = make_settings()
+        gw = make_gateway(settings)
+        model_router = ModelRouter(settings, InMemoryBudgetTracker())
+        graph = build_graph(settings, gw, model_router)
+
+        edges = {(e.source, e.target) for e in graph.get_graph().edges}
+        assert ("write_draft", "hitl_approval") in edges, (
+            "write_draft deve seguir para hitl_approval — HITL e obrigatorio"
+        )
+        assert ("write_draft", "apply_write") not in edges, (
+            "write_draft NUNCA pode ir direto para apply_write (bypass de HITL)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_apply_write_node_real_refuses_without_hitl_approval(self) -> None:
+        """
+        make_apply_write_node (REAL, graph/nodes.py) NAO chama
+        gateway.apply_write quando state['hitl_approved'] nao e True —
+        nenhuma escrita persiste sem aprovacao humana explicita.
+        """
+        from graph.nodes import make_apply_write_node
+
+        gw = make_gateway()
+        gw.apply_write = AsyncMock(return_value={"status": "applied", "tenant_id": TENANT_A})
+        node = make_apply_write_node(gw)
+
+        diff = WriteDiff(
+            operation="create_campaign",
+            entity_type="campaign",
+            after={"tenant_id": TENANT_A, "name": "Campanha X"},
+        )
+
+        base_state: dict[str, Any] = {
+            "tenant_id": TENANT_A,
+            "session_id": "s1",
+            "requested_model_tier": None,
+            "messages": [],
+            "pending_diff": diff,
+            "hitl_rejection_reason": None,
+            "last_tool_result": None,
+            "judge_result": None,
+            "langfuse_trace_id": None,
+            "input_tokens_used": 0,
+            "output_tokens_used": 0,
+            "next_action": None,
+            "error_message": None,
+        }
+
+        for bad_hitl_value in (None, False):
+            state = {**base_state, "hitl_approved": bad_hitl_value}
+            result = await node(state)
+            assert result["next_action"] == "error", (
+                f"apply_write_node deve recusar com hitl_approved={bad_hitl_value!r}"
+            )
+
+        gw.apply_write.assert_not_called()  # em NENHUMA das chamadas acima
+
+    @pytest.mark.asyncio
+    async def test_apply_write_node_real_persists_only_after_hitl_approval(self) -> None:
+        """
+        Contraste: com state['hitl_approved'] == True, apply_write_node REAL
+        chama gateway.apply_write (unico caminho legitimo de persistencia).
+        """
+        from graph.nodes import make_apply_write_node
+
+        gw = make_gateway()
+        gw.apply_write = AsyncMock(return_value={"status": "applied", "tenant_id": TENANT_A})
+        node = make_apply_write_node(gw)
+
+        diff = WriteDiff(
+            operation="create_campaign",
+            entity_type="campaign",
+            after={"tenant_id": TENANT_A, "name": "Campanha X"},
+        )
+        state: dict[str, Any] = {
+            "tenant_id": TENANT_A,
+            "session_id": "s1",
+            "requested_model_tier": None,
+            "messages": [],
+            "pending_diff": diff,
+            "hitl_approved": True,
+            "hitl_rejection_reason": None,
+            "last_tool_result": None,
+            "judge_result": None,
+            "langfuse_trace_id": None,
+            "input_tokens_used": 0,
+            "output_tokens_used": 0,
+            "next_action": None,
+            "error_message": None,
+        }
+        result = await node(state)
+        gw.apply_write.assert_called_once()
+        assert result["next_action"] == "respond"
+
+
+# =============================================================================
+# Achado #13/#24 — C1 IDOR cross-tenant: EXECUCAO real de hitl_approve() e
+# get_session_state() (nao apenas grep de source como em
+# TestC1HitlCrossTenantIDOR acima). app.server E importavel neste venv com
+# apenas as 3 env vars usadas em make_settings(); patch.object no `graph`
+# modulo-level permite exercitar o endpoint sem infra real. Uma mutacao que
+# neutraliza o `raise HTTPException(403)` (preservando as strings grepadas)
+# faz estes testes falharem.
+# =============================================================================
+
+class TestC1IdorRealExecution:
+    """
+    Achado #13/#24: aprovacao/leitura cross-tenant devem ser rejeitadas (403)
+    quando EXECUTADAS de verdade — nao apenas quando o texto-fonte contem as
+    substrings certas.
+    """
+
+    @pytest.mark.asyncio
+    async def test_hitl_approve_real_rejects_cross_tenant(self) -> None:
+        """
+        hitl_approve() REAL: tenant A tentando aprovar um thread cujo estado
+        pertence a tenant B recebe 403 — e o grafo NUNCA e retomado
+        (graph.ainvoke nao e chamado).
+        """
+        from fastapi import HTTPException
+        import app.server as server_module
+        from app.auth import AuthorizedSession
+
+        fake_state = MagicMock()
+        fake_state.values = {"tenant_id": TENANT_B, "pending_diff": None}
+
+        mock_graph = AsyncMock()
+        mock_graph.aget_state = AsyncMock(return_value=fake_state)
+        mock_graph.ainvoke = AsyncMock()
+
+        session = AuthorizedSession(tenant_id=TENANT_A, session_id="thread-b-1")
+        body = server_module.HitlApproveRequest(approved=True, reason="tentativa cross-tenant")
+
+        with patch.object(server_module, "graph", mock_graph):
+            with pytest.raises(HTTPException) as exc_info:
+                await server_module.hitl_approve("thread-b-1", body, session)
+
+        assert exc_info.value.status_code == 403, (
+            "hitl_approve REAL deve retornar 403 para aprovacao cross-tenant"
+        )
+        mock_graph.ainvoke.assert_not_called()  # NUNCA retoma o grafo sem posse confirmada
+
+    @pytest.mark.asyncio
+    async def test_hitl_approve_real_allows_same_tenant(self) -> None:
+        """Contraste: mesmo tenant -> aprovacao segue e o grafo E retomado."""
+        import app.server as server_module
+        from app.auth import AuthorizedSession
+
+        fake_state = MagicMock()
+        fake_state.values = {"tenant_id": TENANT_A, "pending_diff": None}
+
+        mock_graph = AsyncMock()
+        mock_graph.aget_state = AsyncMock(return_value=fake_state)
+        mock_graph.ainvoke = AsyncMock(return_value=None)
+
+        session = AuthorizedSession(tenant_id=TENANT_A, session_id="thread-a-1")
+        body = server_module.HitlApproveRequest(approved=True, reason="ok")
+
+        with patch.object(server_module, "graph", mock_graph):
+            result = await server_module.hitl_approve("thread-a-1", body, session)
+
+        assert result["status"] == "resumed"
+        mock_graph.ainvoke.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_get_session_state_real_rejects_cross_tenant(self) -> None:
+        """
+        get_session_state() REAL: tenant A tentando ler o estado de um thread
+        de tenant B recebe 403 (sem vazar pending_diff/hitl_approved etc).
+        """
+        from fastapi import HTTPException
+        import app.server as server_module
+        from app.auth import AuthorizedSession
+
+        fake_state = MagicMock()
+        fake_state.values = {
+            "tenant_id": TENANT_B,
+            "pending_diff": None,
+            "hitl_approved": None,
+        }
+
+        mock_graph = AsyncMock()
+        mock_graph.aget_state = AsyncMock(return_value=fake_state)
+
+        session = AuthorizedSession(tenant_id=TENANT_A, session_id="thread-b-1")
+
+        with patch.object(server_module, "graph", mock_graph):
+            with pytest.raises(HTTPException) as exc_info:
+                await server_module.get_session_state("thread-b-1", session)
+
+        assert exc_info.value.status_code == 403, (
+            "get_session_state REAL deve retornar 403 para leitura cross-tenant"
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_session_state_real_allows_same_tenant(self) -> None:
+        """Contraste: mesmo tenant -> leitura de estado funciona normalmente."""
+        import app.server as server_module
+        from app.auth import AuthorizedSession
+
+        fake_state = MagicMock()
+        fake_state.values = {
+            "tenant_id": TENANT_A,
+            "pending_diff": None,
+            "hitl_approved": None,
+            "next_action": None,
+            "input_tokens_used": 3,
+            "output_tokens_used": 5,
+        }
+
+        mock_graph = AsyncMock()
+        mock_graph.aget_state = AsyncMock(return_value=fake_state)
+
+        session = AuthorizedSession(tenant_id=TENANT_A, session_id="thread-a-1")
+
+        with patch.object(server_module, "graph", mock_graph):
+            result = await server_module.get_session_state("thread-a-1", session)
+
+        assert result["tenant_id"] == TENANT_A

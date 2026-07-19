@@ -567,6 +567,155 @@ $$;
 
 
 -- ===========================================================================
+-- BLOCO 8 — Double-entry: o banco rejeita postings DESBALANCEADOS (caminho
+--   NEGATIVO da constraint trigger postings_balance_chk_trg).
+--
+-- Invariante 1 do schema (0001_ledger_schema_up.sql:10-11 / checklist item 5):
+--   sum(debit_amount) = sum(credit_amount) por journal_entry+asset_code.
+-- Os BLOCOS 1-7 so exercitam RLS; as fixtures do SETUP sao PROPOSITALMENTE
+-- balanceadas (linhas 97-117), entao a trigger de balanco NUNCA e exercitada no
+-- caminho negativo. Este bloco fecha a lacuna: prova que um posting unilateral
+-- (debito sem credito, ou credito sem debito) e REJEITADO pelo banco.
+--
+-- DEFERRABLE INITIALLY DEFERRED: a trigger dispara no COMMIT, nao na linha. Como
+-- o teste roda dentro de BEGIN...ROLLBACK (nunca faz COMMIT), forcamos a
+-- verificacao com `SET CONSTRAINTS ALL IMMEDIATE` dentro de um sub-bloco (que
+-- estabelece um savepoint): a trigger dispara ali, a rejeicao esperada e
+-- capturada pelo EXCEPTION handler e o savepoint reverte o INSERT invalido sem
+-- derrubar a transacao de teste. Rodamos como superuser (sem SET ROLE) para que
+-- o RLS nao mascare a verificacao — aqui provamos a TRIGGER DE BALANCO, nao o RLS.
+-- ===========================================================================
+
+DO $$
+DECLARE
+    v_tenant_a UUID := 'cccccccc-0000-0000-0000-000000000001';
+    v_acct_a   BIGINT;
+    v_entry    BIGINT;
+BEGIN
+    -- Conta auxiliar reutilizavel (accounts nao tem a trigger de balanco).
+    INSERT INTO ledger.accounts (tenant_id, code, name, kind, asset_code)
+    VALUES (v_tenant_a, 'bal-test:revenue:brl', 'Conta Balanco A', 'revenue', 'BRL')
+    RETURNING id INTO v_acct_a;
+
+    -- ISOLAMENTO DAS SONDAS: `SET CONSTRAINTS ALL IMMEDIATE` dispara TODOS os
+    -- eventos de trigger DEFERRED pendentes — inclusive as 4 fixtures BALANCEADAS
+    -- do SETUP. Se elas ficassem pendentes, cada sonda negativa abaixo veria a
+    -- excecao das fixtures misturada com a sua. Validamos+esvaziamos a fila de
+    -- eventos das fixtures AGORA (sob a trigger correta elas passam) e voltamos
+    -- ao modo DEFERRED — assim cada sub-bloco 8a-8d so tem a SUA propria entry
+    -- pendente quando chama SET CONSTRAINTS IMMEDIATE. (Sob a trigger MUTADA/
+    -- invertida, este flush ja falha aqui nas fixtures balanceadas -> teste
+    -- VERMELHO; sob a trigger CORRETA passa e cada sonda fica limpa.)
+    SET CONSTRAINTS ALL IMMEDIATE;
+    SET CONSTRAINTS ALL DEFERRED;
+
+    -- -----------------------------------------------------------------------
+    -- 8a. Posting unilateral (SO debito) -> entry desbalanceada -> rejeitada
+    -- -----------------------------------------------------------------------
+    BEGIN
+        INSERT INTO ledger.journal_entries (tenant_id, idempotency_key, description)
+        VALUES (v_tenant_a, 'bal-test-idem-debit-only', 'debito sem credito')
+        RETURNING id INTO v_entry;
+
+        INSERT INTO ledger.postings
+            (journal_entry_id, tenant_id, account_id, asset_code, scale,
+             debit_amount, credit_amount, posted_at)
+        VALUES (v_entry, v_tenant_a, v_acct_a, 'BRL', 2,
+                100000, 0, '2026-06-15 09:00:00+00');   -- debito=1000,00 sem credito
+
+        SET CONSTRAINTS ALL IMMEDIATE;   -- forca a trigger DEFERRED a disparar agora
+        RAISE EXCEPTION
+            'ASSERT FALHOU [8a debito-so]: banco ACEITOU entry desbalanceada — trigger de balanco ausente ou ineficaz';
+    EXCEPTION WHEN raise_exception THEN
+        IF SQLERRM LIKE '%desbalanceado%' THEN
+            RAISE NOTICE 'PASS [8a: posting debito-so rejeitado pela trigger de balanco]: %', SQLERRM;
+        ELSE
+            RAISE;   -- re-lanca o ASSERT FALHOU (a trigger NAO rejeitou)
+        END IF;
+    END;
+
+    -- -----------------------------------------------------------------------
+    -- 8b. Posting unilateral (SO credito) -> entry desbalanceada -> rejeitada
+    --     (simetria: prova que nao e so o lado do debito que e verificado)
+    -- -----------------------------------------------------------------------
+    BEGIN
+        INSERT INTO ledger.journal_entries (tenant_id, idempotency_key, description)
+        VALUES (v_tenant_a, 'bal-test-idem-credit-only', 'credito sem debito')
+        RETURNING id INTO v_entry;
+
+        INSERT INTO ledger.postings
+            (journal_entry_id, tenant_id, account_id, asset_code, scale,
+             debit_amount, credit_amount, posted_at)
+        VALUES (v_entry, v_tenant_a, v_acct_a, 'BRL', 2,
+                0, 250000, '2026-06-15 09:30:00+00');   -- credito=2500,00 sem debito
+
+        SET CONSTRAINTS ALL IMMEDIATE;
+        RAISE EXCEPTION
+            'ASSERT FALHOU [8b credito-so]: banco ACEITOU entry desbalanceada — trigger de balanco ausente ou ineficaz';
+    EXCEPTION WHEN raise_exception THEN
+        IF SQLERRM LIKE '%desbalanceado%' THEN
+            RAISE NOTICE 'PASS [8b: posting credito-so rejeitado pela trigger de balanco]: %', SQLERRM;
+        ELSE
+            RAISE;
+        END IF;
+    END;
+
+    -- -----------------------------------------------------------------------
+    -- 8c. Par desbalanceado (debito 100000 vs credito 99999) -> rejeitado
+    --     Prova que a verificacao e por VALOR (soma), nao so por presenca de
+    --     ambos os lados. Um centavo de diferenca ja quebra o double-entry.
+    -- -----------------------------------------------------------------------
+    BEGIN
+        INSERT INTO ledger.journal_entries (tenant_id, idempotency_key, description)
+        VALUES (v_tenant_a, 'bal-test-idem-off-by-one', 'par off-by-one')
+        RETURNING id INTO v_entry;
+
+        INSERT INTO ledger.postings
+            (journal_entry_id, tenant_id, account_id, asset_code, scale,
+             debit_amount, credit_amount, posted_at)
+        VALUES
+            (v_entry, v_tenant_a, v_acct_a, 'BRL', 2, 100000, 0, '2026-06-15 09:45:00+00'),
+            (v_entry, v_tenant_a, v_acct_a, 'BRL', 2, 0, 99999, '2026-06-15 09:45:00+00');
+
+        SET CONSTRAINTS ALL IMMEDIATE;
+        RAISE EXCEPTION
+            'ASSERT FALHOU [8c off-by-one]: banco ACEITOU par desbalanceado (100000 vs 99999)';
+    EXCEPTION WHEN raise_exception THEN
+        IF SQLERRM LIKE '%desbalanceado%' THEN
+            RAISE NOTICE 'PASS [8c: par off-by-one rejeitado pela trigger de balanco]: %', SQLERRM;
+        ELSE
+            RAISE;
+        END IF;
+    END;
+
+    -- -----------------------------------------------------------------------
+    -- 8d. CONTROLE POSITIVO: par BALANCEADO (100000 = 100000) -> ACEITO.
+    --     Garante que a trigger nao rejeita indiscriminadamente (senao 8a-8c
+    --     seriam tautologicos: um bloqueio universal tambem os faria "passar").
+    -- -----------------------------------------------------------------------
+    INSERT INTO ledger.journal_entries (tenant_id, idempotency_key, description)
+    VALUES (v_tenant_a, 'bal-test-idem-balanced', 'par balanceado')
+    RETURNING id INTO v_entry;
+
+    INSERT INTO ledger.postings
+        (journal_entry_id, tenant_id, account_id, asset_code, scale,
+         debit_amount, credit_amount, posted_at)
+    VALUES
+        (v_entry, v_tenant_a, v_acct_a, 'BRL', 2, 100000, 0, '2026-06-15 10:15:00+00'),
+        (v_entry, v_tenant_a, v_acct_a, 'BRL', 2, 0, 100000, '2026-06-15 10:15:00+00');
+
+    SET CONSTRAINTS ALL IMMEDIATE;   -- entry balanceada: NAO deve disparar excecao
+    RAISE NOTICE 'PASS [8d: par balanceado (100000=100000) ACEITO pela trigger de balanco]';
+
+    -- Volta as constraints ao modo diferido para nao alterar o comportamento
+    -- de eventuais blocos futuros nesta transacao (defensivo; o teste termina
+    -- em ROLLBACK logo abaixo de qualquer forma).
+    SET CONSTRAINTS ALL DEFERRED;
+END;
+$$;
+
+
+-- ===========================================================================
 -- ROLLBACK: nao persiste nenhum dado de teste
 -- ===========================================================================
 

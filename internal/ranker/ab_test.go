@@ -44,17 +44,35 @@ func TestHashBucket_InRange(t *testing.T) {
 	}
 }
 
-// TestHashBucket_Separator verifies that swapping between zone/tenant suffix
-// produces different buckets most of the time (separator byte prevents collision).
+// TestHashBucket_Separator is a known-answer test: it pins the exact bucket
+// values produced by hashBucket for the adversarial pair "ab"+"c" vs "a"+"bc"
+// (both concatenate to the byte-stream "abc" without a separator). This MUST
+// fail — not just log — if the 0x00 separator step is ever removed, because
+// without it both inputs collide EXACTLY (not just with 1/NumBuckets odds):
+// verified empirically that removing the separator makes both hash to the
+// same bucket (31), while with the separator they hash to 35 and 99
+// respectively (see ab.go:225-226 for the separator step).
 func TestHashBucket_Separator(t *testing.T) {
-	// "ab"+"c" vs "a"+"bc" — with separator these MUST produce different hashes.
+	const (
+		wantAB_C = 35 // hashBucket("ab", "c")
+		wantA_BC = 99 // hashBucket("a", "bc")
+	)
 	b1 := hashBucket("ab", "c")
 	b2 := hashBucket("a", "bc")
+
+	if b1 != wantAB_C {
+		t.Errorf(`hashBucket("ab","c") = %d, want %d (known-answer; separator step changed?)`, b1, wantAB_C)
+	}
+	if b2 != wantA_BC {
+		t.Errorf(`hashBucket("a","bc") = %d, want %d (known-answer; separator step changed?)`, b2, wantA_BC)
+	}
+	// The separator's entire purpose is to prevent these two adversarial
+	// inputs — which concatenate to the identical byte-stream "abc" — from
+	// colliding. Without it they collide EXACTLY (both = 31), not merely
+	// with a 1/NumBuckets chance. This assertion is what actually protects
+	// the invariant documented at ab.go:212-213.
 	if b1 == b2 {
-		// A hash collision is possible (1/NumBuckets chance) but the test documents
-		// the invariant intent. For these specific values, the FNV-1a separator
-		// guarantees different internal hashes; collision only if NumBuckets=1.
-		t.Logf("hashBucket collision for (ab,c) vs (a,bc): bucket=%d (acceptable if NumBuckets=1)", b1)
+		t.Errorf(`hashBucket("ab","c")=%d == hashBucket("a","bc")=%d: separator failed to disambiguate concatenation boundary`, b1, b2)
 	}
 }
 

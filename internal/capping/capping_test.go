@@ -2,8 +2,11 @@ package capping_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -394,6 +397,53 @@ func TestCapper_CampaignTotal_TTLIsPositive(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestCapper_KeyIsHashed_NotRawUserID locks down the privacy invariant
+// documented at capping.go:22-26 and capping.go:246-254: the Redis capping
+// key is a salted SHA-256 hash of the user id, and the RAW user id (a
+// pseudonymous cookie/session identifier) NEVER appears in the key. Prior to
+// this test, no test in this file inspected the key STRING at all — a
+// regression that used the raw user id verbatim as key material (e.g.
+// `hx := userID + ":" + salt` instead of the SHA-256 hash) would still pass
+// every other test in this file (UserIsolation, SaltRotation, TTL tests are
+// all agnostic to key format).
+func TestCapper_KeyIsHashed_NotRawUserID(t *testing.T) {
+	r := newFakeRedis()
+	const salt = "test-salt"
+	c := capping.New(r, salt)
+	camp := makeCamp(5, 0, 0, 0) // only campaign_total active → exactly one key
+	ban := makeBan(0, 0, 0, 0)
+
+	const userID = "distinctive-raw-user-id-99999a"
+
+	ok, err := c.Allowed(userID, camp, ban)
+	if err != nil || !ok {
+		t.Fatalf("expected allowed, got ok=%v err=%v", ok, err)
+	}
+
+	if len(r.counters) != 1 {
+		t.Fatalf("expected exactly 1 counter key for a single active scope, got %d", len(r.counters))
+	}
+	var gotKey string
+	for k := range r.counters {
+		gotKey = k
+	}
+
+	// The raw user id must NEVER appear in the Redis key (capping.go:22-26).
+	if strings.Contains(gotKey, userID) {
+		t.Fatalf("capping key contains the RAW user id (PII/pseudonymous-id leak): key=%q", gotKey)
+	}
+
+	// The key must be EXACTLY the documented salted SHA-256 hash construction
+	// (capping.go:246-259), not merely "different from the raw id":
+	//   "cap:" + SHA-256(userID + ":" + salt)[:32 hex] + ":" + scope + ":" + campaignID + ":" + bannerID
+	sum := sha256.Sum256([]byte(userID + ":" + salt))
+	wantHashPrefix := hex.EncodeToString(sum[:])[:32]
+	wantKey := fmt.Sprintf("cap:%s:total:%s:%s", wantHashPrefix, camp.ID, ban.ID)
+	if gotKey != wantKey {
+		t.Fatalf("capping key not derived by salted SHA-256 hash: got %q, want %q", gotKey, wantKey)
 	}
 }
 

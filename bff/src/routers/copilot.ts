@@ -59,8 +59,11 @@ const COPILOT_INTERNAL_SECRET = process.env["COPILOT_INTERNAL_SECRET"];
 
 // ---------------------------------------------------------------------------
 // Helper: gera headers HMAC para autenticação interna BFF→copilot (TX-3)
+//
+// Exportado (só) para ser testável diretamente por copilot.test.ts — sem
+// isto, a assinatura HMAC BFF→copilot ficava sem NENHUM teste (achado #15).
 // ---------------------------------------------------------------------------
-function makeInternalHeaders(tenantId: string): Record<string, string> {
+export function makeInternalHeaders(tenantId: string): Record<string, string> {
   const timestamp = Math.floor(Date.now() / 1000).toString();
 
   if (!COPILOT_INTERNAL_SECRET) {
