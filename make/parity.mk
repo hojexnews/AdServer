@@ -10,8 +10,8 @@
 # ALVOS EXECUTÁVEIS SEM INFRA (gate mínimo de CI)
 # ---------------------------------------------------------------------------
 #
-#   parity-golden        → suite golden executável (CA-2, CA-4, CA-5, CA-6,
-#                          shadow harness, dual-run spec).
+#   parity-golden        → suite golden executável (CA-2, CA-3 parcial, CA-4,
+#                          CA-5, CA-6, shadow harness, dual-run spec).
 #                          NÃO requer Redis, Redpanda, Postgres, MaxMind.
 #
 # ---------------------------------------------------------------------------
@@ -34,8 +34,8 @@
 GO      := go
 GOFLAGS :=
 
-## parity-golden: executa a suite golden completa (CA-2, CA-4, CA-5, CA-6,
-##                shadow harness, dual-run spec) — sem infra externa.
+## parity-golden: executa a suite golden completa (CA-2, CA-3 parcial, CA-4,
+##                CA-5, CA-6, shadow harness, dual-run spec) — sem infra externa.
 ##                É o gate mínimo de CI antes do cutover.
 parity-golden:
 	@set -o pipefail; $(GO) test $(GOFLAGS) -count=1 -race -v \
@@ -106,7 +106,8 @@ parity-status:
 	@echo "MATRIZ CA-1..CA-9 → status:"
 	@echo "  CA-1  (multi-tenancy/ACL)  : parcial — unit tests (cascade TenantIsolation)"
 	@echo "  CA-2  (cascata DA-3)       : VERDE — golden executavel (11 casos)"
-	@echo "  CA-3  (criativos)          : pendente console/BFF (upload, HTML5, video)"
+	@echo "  CA-3  (criativos)          : PARCIAL — golden executavel (7 casos: mapping/selecao/HMAC);"
+	@echo "                                render/VAST/SSRF/upload pendentes (collector package main + CHECK Postgres)"
 	@echo "  CA-4  (regras §4.6)        : VERDE — golden executavel (23+ casos)"
 	@echo "  CA-5  (capping §4.8)       : VERDE — golden executavel (10+ casos)"
 	@echo "  CA-6  (telemetria)         : PARCIAL — unit (dedupe, WAL, token, geo)"
