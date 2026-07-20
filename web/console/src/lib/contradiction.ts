@@ -20,6 +20,29 @@
  * Esta validação roda:
  *   1. No builder de segmentação antes de salvar (CA-4)
  *   2. Sobre sugestões da IA (Fase 2 — o mesmo código é reutilizado)
+ *
+ * A UI SOZINHA não é fronteira de confiança (CA-4 exige aplicação real, não
+ * cosmética): bff/src/lib/contradiction.ts é um port desta MESMA lógica que
+ * roda como backstop server-side em deliveryRule.create/update.
+ *
+ * "Mantenha os dois arquivos sincronizados" NÃO é uma promessa de comentário
+ * — é um GATE EXECUTÁVEL. A lista de vetores (SELECTABLE_VECTORS) não pode
+ * dessincronizar silenciosamente entre os dois pacotes:
+ *   - No lado BFF, SELECTABLE_VECTORS é DERIVADA de DeliveryRuleVectorSchema
+ *     (bff/src/schemas/config.ts, o enum Zod que valida o input real do
+ *     router) via `.options` — não é uma cópia manual, é o próprio enum.
+ *     DISCRETE_EXCLUSIVE_VECTORS lá usa `satisfies Record<SelectableVector,
+ *     boolean>`, então esquecer de classificar um vetor novo é erro de
+ *     `tsc`, não um buraco silencioso.
+ *   - Neste lado (console), SELECTABLE_VECTORS abaixo continua sendo uma
+ *     lista própria (bff/ e web/console/ são pacotes npm separados sem
+ *     workspace comum — o console não pode importar código server-only do
+ *     BFF para o bundle do cliente). O que fecha o risco de divergência é
+ *     contradiction.test.ts: o teste "SELECTABLE_VECTORS não diverge de
+ *     DeliveryRuleVectorSchema" lê o TEXTO-FONTE de
+ *     bff/src/schemas/config.ts em tempo de teste, extrai o array literal
+ *     do enum e compara contra SELECTABLE_VECTORS aqui — se alguém editar
+ *     um lado sem editar o outro, web-ci fica VERMELHO.
  */
 
 export type LogicalOp = "AND" | "OR";
@@ -42,16 +65,49 @@ export interface ContradictionResult {
 }
 
 /**
- * Vetores com valores discretos mutuamente exclusivos (enum-like).
- * Se duas regras AND usam o mesmo vetor com operador "is" e valores
- * diferentes, são mutuamente exclusivas.
+ * Vetores selecionáveis no builder de segmentação (app/rules/page.tsx).
+ *
+ * FONTE ÚNICA DE VERDADE (wave 30, achado contradiction-vector-allowlist-gap):
+ * antes desta correção, app/rules/page.tsx mantinha seu PRÓPRIO array
+ * `VECTORS` (6 opções) duplicado deste módulo, e DISCRETE_EXCLUSIVE_VECTORS
+ * abaixo só cobria 4/6 — "Site - URL" e "Site - Variable" ficavam de fora.
+ * Duas regras AND "Site - URL is /a" + "Site - URL is /b" (zero delivery
+ * possível sob operador de igualdade) passavam sem alerta algum, e o teste
+ * antigo CODIFICAVA esse buraco como comportamento "válido"
+ * (contradiction.test.ts, caso "vetor não-discreto, ex. Site - URL").
+ *
+ * Agora app/rules/page.tsx IMPORTA SELECTABLE_VECTORS (schema Zod do form e
+ * <select> de vetor) em vez de manter sua própria lista — um vetor novo
+ * adicionado aqui aparece automaticamente no builder E na checagem de
+ * exclusividade abaixo. Não há mais duas listas para dessincronizar.
  */
-const DISCRETE_EXCLUSIVE_VECTORS = new Set([
+export const SELECTABLE_VECTORS = [
   "Time - Day of Week",
+  "Site - URL",
   "Geo - Country",
   "Geo - City",
   "Client - Useragent",
-]);
+  "Site - Variable",
+] as const;
+
+export type SelectableVector = (typeof SELECTABLE_VECTORS)[number];
+
+/**
+ * Vetores com valores discretos mutuamente exclusivos (enum-like).
+ * Se duas regras AND usam o mesmo vetor com operador "is" e valores
+ * diferentes, são mutuamente exclusivas.
+ *
+ * DEFAULT-DENY: hoje TODOS os vetores selecionáveis no builder são
+ * enum-like sob o operador de igualdade "is" (mesmo "Site - Variable",
+ * que representa uma comparação exata chave=valor) — por isso o conjunto
+ * abaixo é SELECTABLE_VECTORS por inteiro. Se um vetor genuinamente
+ * NÃO-discreto for adicionado no futuro (ex.: um contador contínuo onde
+ * "is" nunca é exato), remova-o daqui EXPLICITAMENTE com uma justificativa
+ * no comentário — nunca por omissão silenciosa. O padrão é incluir
+ * (fail-safe: um falso-positivo gera um alerta dispensável; um
+ * falso-negativo salva uma regra AND que nunca entrega, violando CA-4).
+ */
+const DISCRETE_EXCLUSIVE_VECTORS = new Set<string>(SELECTABLE_VECTORS);
 
 /**
  * Detecta contradições em um conjunto de regras de segmentação.

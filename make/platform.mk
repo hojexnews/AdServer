@@ -192,29 +192,43 @@ platform-kyverno-test:
 # Usa "docker run --rm" com a imagem oficial otel/opentelemetry-collector-contrib
 # pinada em OTELCOL_IMAGE para rodar "otelcol validate --config".
 # Isso garante que os processadores de redacao de PII (transform/redact-pii,
-# redaction/allowlist-traces, redaction/allowlist-logs) sejam validados
-# pela mesma distro que os executa em producao — prevenindo falsa cobertura
-# de um kubeconform que ignora a config nativa (sem apiVersion/kind).
+# redaction/allowlist-traces, redaction/allowlist-logs, redaction/allowlist-
+# metrics) sejam validados pela mesma distro que os executa em producao —
+# prevenindo falsa cobertura de um kubeconform que ignora a config nativa
+# (sem apiVersion/kind).
 #
-# Alem da validacao semantica, verifica estruturalmente (MEMBRESIA no pipeline,
-# nao mera presenca no arquivo — um processador definido mas nao cabeado na lista
-# service.pipelines.<p>.processors seria fail-open silencioso):
-#   1. traces.processors e logs.processors contem transform/redact-pii (redacao por chave).
-#   2. traces.processors contem redaction/allowlist-traces; logs.processors, allowlist-logs (fail-closed).
-#   3. Nenhum allow_all_keys resolve para "true" (checagem default-deny,
-#      case-insensitive): toda ocorrencia de "allow_all_keys:" no arquivo deve
-#      resolver textualmente para false/off/no/n; qualquer outra grafia truthy
-#      do resolver YAML 1.1 usado pelo yaml.v3 do otelcol (True/TRUE/yes/YES/on/ON/
-#      1/y/t) ou valor ausente/nao-reconhecido reprova o gate (achado #7, 29a onda:
-#      grep antigo era case-sensitive e so pegava "true" minusculo literal).
+# Alem da validacao semantica, verifica estruturalmente via
+# platform/observability/otel-pipeline-redaction-check.py — MEMBRESIA no
+# pipeline (nao mera presenca no arquivo — um processador definido mas nao
+# cabeado na lista service.pipelines.<p>.processors seria fail-open
+# silencioso) E DEFAULT-DENY sobre TODOS os pipelines de service.pipelines,
+# nao uma lista hardcoded de nomes (achados `otel-gate-hardcoded-pipeline-
+# names` e `otel-metrics-pipeline-sem-redacao-e-sem-gate`, 30a onda: o gate
+# antigo so iterava dois nomes literais "traces"/"logs" — um pipeline
+# `traces/raw` ou o pipeline `metrics` inteiro escapavam sem verificacao
+# alguma). O script:
+#   1. Enumera TODOS os pipelines definidos em service.pipelines (qualquer
+#      nome, incluindo `<tipo>/<id>` como `traces/raw`).
+#   2. Deriva o tipo de sinal do prefixo antes de "/"; tipo desconhecido
+#      (fora de traces/metrics/logs) reprova por construcao.
+#   3. Exige transform/redact-pii + redaction/allowlist-<tipo>* cabeados em
+#      .processors de CADA pipeline — sem excecao de nome.
+# Depois, verifica que nenhum allow_all_keys resolve para "true" (checagem
+# default-deny, case-insensitive, sobre o ARQUIVO INTEIRO — ja e default-
+# deny por natureza, pois conta toda ocorrencia de "allow_all_keys:", nao
+# uma lista de nomes de processor): toda ocorrencia deve resolver
+# textualmente para false/off/no/n; qualquer outra grafia truthy do
+# resolver YAML 1.1 usado pelo yaml.v3 do otelcol (True/TRUE/yes/YES/on/ON/
+# 1/y/t) ou valor ausente/nao-reconhecido reprova o gate (achado #7, 29a
+# onda: grep antigo era case-sensitive e so pegava "true" minusculo literal).
 #
 # FIX (11a onda): o "docker run" injeta as tres env-vars de endpoint com valores
 # placeholder/dummy SOMENTE para a etapa de validacao estrutural do otelcol.
 # Os exporters usam ${env:VAR} — o validate exige que as vars estejam definidas
 # e que resultem em string nao-vazia; o valor dummy satisfaz essa exigencia sem
 # alterar a semantica de producao nem relaxar nenhuma das verificacoes de PII.
-# INVARIANTE: a verificacao estrutural de redacao TX-5 (grep) permanece intacta
-# e fail-closed — os endpoints dummy nao interferem nela.
+# INVARIANTE: a verificacao estrutural de redacao TX-5 (script Python + grep)
+# permanece intacta e fail-closed — os endpoints dummy nao interferem nela.
 #
 # Convencao de ausencia de ferramenta:
 #   Local sem Docker: avisa e pula.
@@ -224,14 +238,8 @@ platform-otel-validate:
 	@set -e; \
 	 CONFIG="$(OTEL_CONFIG)"; \
 	 FAIL=0; \
-	 echo "-- otel: verificando MEMBRESIA dos processadores de redacao nos pipelines traces+logs (TX-5)..."; \
-	 for pl in "traces:redaction/allowlist-traces" "logs:redaction/allowlist-logs"; do \
-	   p="$${pl%%:*}"; al="$${pl##*:}"; \
-	   line=$$(awk -v pipe="$$p" '/^  pipelines:/{inpipe=1;next} inpipe&&/^  [a-zA-Z]/&&!/^    /{inpipe=0} inpipe&&/^    [a-zA-Z0-9_\/-]+:/{cur=$$1;sub(/:.*/,"",cur)} inpipe&&cur==pipe&&/^      processors:/{print;exit}' "$$CONFIG"); \
-	   [ -n "$$line" ] || { echo "ERRO TX-5: pipeline $$p sem linha .processors em $$CONFIG"; FAIL=1; }; \
-	   case "$$line" in *transform/redact-pii*) :;; *) echo "ERRO TX-5: pipeline $$p sem transform/redact-pii na lista .processors (nao apenas definido no arquivo)"; FAIL=1;; esac; \
-	   case "$$line" in *"$$al"*) :;; *) echo "ERRO TX-5: pipeline $$p sem $$al na lista .processors"; FAIL=1;; esac; \
-	 done; \
+	 echo "-- otel: verificando MEMBRESIA dos processadores de redacao em TODOS os pipelines de service.pipelines (TX-5, default-deny)..."; \
+	 python3 "$(CURDIR)/platform/observability/otel-pipeline-redaction-check.py" "$$CONFIG" || FAIL=1; \
 	 ALLOW_ALL_TOTAL=$$(grep -icE "allow_all_keys:" "$$CONFIG"); \
 	 ALLOW_ALL_FALSE=$$(grep -icE "allow_all_keys:[[:space:]]*(false|off|no|n)([[:space:]]|#|$$)" "$$CONFIG"); \
 	 if [ "$$ALLOW_ALL_TOTAL" != "$$ALLOW_ALL_FALSE" ]; then \
@@ -249,7 +257,7 @@ platform-otel-validate:
 	   else \
 	     echo "AVISO: docker nao encontrado — pulando validacao semantica do OTel Collector."; \
 	     echo "       (PLATFORM_STRICT=1 para falhar; instale Docker para validacao completa)"; \
-	     echo "       A verificacao estrutural (grep) acima ja foi executada."; \
+	     echo "       A verificacao estrutural (script + grep) acima ja foi executada."; \
 	     exit 0; \
 	   fi; \
 	 fi; \

@@ -68,6 +68,7 @@ import (
 	"github.com/hojex/adserver/internal/clicktoken"
 	"github.com/hojex/adserver/internal/geo"
 	"github.com/hojex/adserver/internal/telemetry"
+	"github.com/hojex/adserver/internal/telemetry/blank"
 	"github.com/hojex/adserver/internal/useragent"
 )
 
@@ -410,8 +411,11 @@ func (h *collectorHandler) handleImpression(w http.ResponseWriter, r *http.Reque
 		servedTier = commonv1.ServedTier(v)
 	}
 
-	blank := servedTier == commonv1.ServedTier_SERVED_TIER_BLANK || bannerID == ""
-	billable := !blank && servedTier != commonv1.ServedTier_SERVED_TIER_UNSPECIFIED
+	// CA-6/CA-2 billing invariant: blank must never be billable. This decision
+	// is made by the single production function blank.ComputeBlankBillable —
+	// the CA-6 parity golden test (tests/parity/ca6_telemetry_golden_test.go)
+	// calls the exact same function, so a regression here fails that gate too.
+	isBlank, billable := blank.ComputeBlankBillable(servedTier, bannerID)
 
 	// model_version is forwarded from the JS tag (passed as "mv" query param).
 	// In J0 (cascade-only) this is always "" (modelVersionDeterministic).
@@ -422,7 +426,7 @@ func (h *collectorHandler) handleImpression(w http.ResponseWriter, r *http.Reque
 
 	h.sink.EmitImpression(
 		tenantID, campaignID, bannerID, zoneID,
-		servedTier, billable, blank,
+		servedTier, billable, isBlank,
 		decisionID, modelVersion,
 	)
 

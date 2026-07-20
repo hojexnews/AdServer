@@ -12,8 +12,17 @@ ONDE A CALIBRACAO VIVE (decisao de arquitetura):
        deriva de distribuicao) sem re-treinar o modelo.
     3. O sidecar (services/ranker-sidecar) aplica a calibracao em duas etapas:
          (a) infere pCTR_raw com o .onnx do LightGBM
+             (services/ranker-sidecar/internal/onnx/onnx.go)
          (b) aplica isotonic_map (tabela de lookup interpolada) -> pCTR_cal
+             (services/ranker-sidecar/internal/calibration/calibration.go,
+             LoadMap + Map.Apply — a mesma interpolacao linear de
+             apply_calibration abaixo, provada bit-a-bit em
+             services/ranker-sidecar/internal/wiring/calibration_parity_test.go)
        A calibracao como mapa separado permite hot-reload independente.
+       services/ranker-sidecar/internal/wiring/wiring.go (BuildInferencer)
+       carrega o mapa e decide o wrap; se o mapa faltar ou for invalido,
+       o sidecar serve pCTR_raw (fail-open, DA-3) e loga um aviso — nunca
+       recusa iniciar nem derruba o hot path.
 
 CONTRATO COM O SIDECAR (J1 / services/ranker-sidecar):
   Artefato: calibration_map.json (versionado no MLflow junto com o .onnx)

@@ -24,7 +24,11 @@ import { useForm, useFieldArray } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import { trpc } from "@/lib/trpc";
-import { detectContradictions, type RuleCandidate } from "@/lib/contradiction";
+import {
+  detectContradictions,
+  SELECTABLE_VECTORS,
+  type RuleCandidate,
+} from "@/lib/contradiction";
 import { LoadingState, ErrorState } from "@/components/ui/empty-state";
 
 // ---------------------------------------------------------------------------
@@ -37,14 +41,11 @@ const RuleFormSchema = z.object({
   rules: z
     .array(
       z.object({
-        vector: z.enum([
-          "Time - Day of Week",
-          "Site - URL",
-          "Geo - Country",
-          "Geo - City",
-          "Client - Useragent",
-          "Site - Variable",
-        ]),
+        // Fonte única: SELECTABLE_VECTORS (lib/contradiction.ts) — um vetor
+        // novo aparece aqui E na checagem de exclusividade discreta ao mesmo
+        // tempo, sem lista duplicada para dessincronizar (wave 30, achado
+        // contradiction-vector-allowlist-gap).
+        vector: z.enum(SELECTABLE_VECTORS),
         operator: z.enum([
           "is",
           "is not",
@@ -63,14 +64,7 @@ const RuleFormSchema = z.object({
 
 type RuleFormValues = z.infer<typeof RuleFormSchema>;
 
-const VECTORS = [
-  "Time - Day of Week",
-  "Site - URL",
-  "Geo - Country",
-  "Geo - City",
-  "Client - Useragent",
-  "Site - Variable",
-] as const;
+const VECTORS = SELECTABLE_VECTORS;
 
 const OPERATORS = [
   "is",

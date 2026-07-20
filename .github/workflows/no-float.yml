@@ -1,6 +1,17 @@
-# no-float (TX-2) — float PROIBIDO em codigo monetario nas 4 linguagens.
-# Escopo restrito a money/ledger/billing/payments/migrations (nao pune
-# floats legitimos de ML/telemetria). Fonte: contracts/lint/no-float.md.
+# no-float (TX-2) — float PROIBIDO em codigo monetario: proto + 4 linguagens.
+#
+# O escopo NAO e uniforme e NAO e mais "so money/ledger/billing/payments/
+# migrations" — a 28a onda provou que escopar por diretorio/nome "financeiro" e
+# ponto-cego ativo. Hoje ele e MISTO: default-deny sobre toda a superficie em
+# proto (`proto/adserver/**`), SQL (todo `.sql` rastreado, menos data/clickhouse/
+# e data/iceberg/, que vao no guard irmao) e TS/TSX por CONTEUDO; escopo positivo
+# por caminho em Go e Python, onde float nunca e legitimo. O que se mantem em
+# todos: nao punir float legitimo de ML/telemetria — isso sai por allowlist/
+# excecao explicita, nao por estreitar o escopo.
+#
+# NAO replique a regra de selecao aqui: a fonte unica e contracts/lint/no-float.md
+# (secao "Escopo"), e sobre ela os scripts em scripts/ci/ vencem em caso de
+# divergencia. Este cabecalho descreve a FORMA do escopo, nao o censo de arquivos.
 name: no-float (TX-2)
 
 on:

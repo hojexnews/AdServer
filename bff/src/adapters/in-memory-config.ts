@@ -472,6 +472,13 @@ export class InMemoryConfigAdapter implements ConfigAdapter {
     );
   }
 
+  async getDeliveryRule(
+    tenantId: string,
+    id: string
+  ): Promise<DeliveryRule | null> {
+    return getStore(tenantId).deliveryRules.find((r) => r.id === id) ?? null;
+  }
+
   async createDeliveryRule(
     tenantId: string,
     input: CreateDeliveryRuleInput

@@ -68,6 +68,16 @@ import "math"
 //   - pCTR: predicted click-through rate from the calibrated sidecar output,
 //     in [0, 1].  This is a probability — float32 is correct here (TX-2 does
 //     not apply to probabilities, only to monetary amounts).
+//     "Calibrated" here means the sidecar has already applied the isotonic
+//     calibration_map.json (ml/calibration/calibrate.py) via
+//     services/ranker-sidecar/internal/calibration.CalibratedInferencer
+//     before this value ever reaches ScoreCandidate — this function does
+//     NOT calibrate; it only multiplies. If the sidecar's calibration map
+//     failed to load, it fails open to serving pCTR_raw (see
+//     services/ranker-sidecar/internal/wiring.BuildInferencer), and this
+//     function receives that raw value unmodified — it has no way to tell
+//     the difference, by design (DA-3: the ranking signal degrades, the hot
+//     path never breaks).
 //   - bidMinorUnits: the campaign's bid/floor in minor-units of its asset
 //     (int64, TX-2).  Must be >= 0.
 //

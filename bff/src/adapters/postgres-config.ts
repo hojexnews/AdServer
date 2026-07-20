@@ -681,6 +681,15 @@ export class PostgresConfigAdapter implements ConfigAdapter {
     });
   }
 
+  getDeliveryRule(tenantId: string, id: string): Promise<DeliveryRule | null> {
+    return this.withTenant(tenantId, async (c) => {
+      const r = await c.query<DeliveryRuleRow>(
+        `SELECT ${DELIVERY_RULE_COLS} FROM config.delivery_rules WHERE id = $1`, [id]
+      );
+      return r.rows[0] ? mapDeliveryRule(r.rows[0]) : null;
+    });
+  }
+
   createDeliveryRule(tenantId: string, input: CreateDeliveryRuleInput): Promise<DeliveryRule> {
     return this.withTenant(tenantId, async (c) => {
       // owner polimórfico (campaign|banner) SEM FK; rule_set_id tem FK que ignora

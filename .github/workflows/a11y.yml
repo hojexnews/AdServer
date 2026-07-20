@@ -3,9 +3,14 @@
 # Materializa o alvo `make web-a11y` (G0/frontend E10): axe-core injetado via
 # @axe-core/puppeteer + puppeteer-core contra o Chrome JÁ INSTALADO no runner
 # (nenhum download de browser — puppeteer-core nunca baixa Chromium; ver
-# web/console/scripts/a11y-check.test.ts). Audita a rota /a11y-harness
-# (client-only, props-fixture, gated por A11Y_HARNESS=1 — nunca acessível em
-# produção real) contra as tags wcag2a/wcag2aa/wcag21a/wcag21aa/wcag22aa.
+# web/console/scripts/a11y-check.test.ts). Audita a rota sintética
+# /a11y-harness (client-only, props-fixture, gated por A11Y_HARNESS=1 — nunca
+# acessível em produção real) E as 9 rotas reais do console (advertisers,
+# campaigns, banners, sites, zones, rules, dashboard, billing, copilot —
+# wave 30, achado a11y-ci-harness-only-real-pages-unaudited; ver
+# PAGES_TO_AUDIT em web/console/scripts/a11y-check.test.ts para o alcance
+# exato de cada rota real sem um BFF vivo) contra as tags
+# wcag2a/wcag2aa/wcag21a/wcag21aa/wcag22aa.
 #
 # Separado do workflow `web.yml` (make web-ci) de propósito: builda o Next.js
 # e sobe um browser real — mais lento que typecheck+lint+test, não deve

@@ -233,6 +233,125 @@ class TestValidateCreative:
         assert result.gate_passed is False
         assert any("dest_url" in v for v in result.violations)
 
+    async def test_pii_in_dest_url_querystring_fails_for_image_creative(self) -> None:
+        """
+        Achado creative-pii-gate-so-html-content: para creative_type=image (sem
+        html_content), PII na querystring de dest_url deve bloquear a
+        publicação. Antes do fix, pii_detected era estruturalmente sempre
+        False para image/video pois só html_content era varrido.
+        """
+        gw = make_gateway()
+        inp = ValidateCreativeInput(
+            creative_type=CreativeType.IMAGE,
+            asset_url="https://cdn.example.com/banner.png",
+            is_ai_generated=False,
+            dest_url="https://lp.example.com/?email=joao@example.com&cpf=123.456.789-00",
+        )
+        result = await gw.validate_creative(TENANT_A, inp)
+        assert result.pii_detected is True, (
+            "PII na querystring de dest_url deve ser detectado mesmo sem html_content"
+        )
+        assert result.gate_passed is False
+        assert any("dest_url" in v for v in result.violations)
+
+    async def test_pii_in_asset_url_fails(self) -> None:
+        """PII embutido em asset_url (URL livre) também deve bloquear."""
+        gw = make_gateway()
+        inp = ValidateCreativeInput(
+            creative_type=CreativeType.VIDEO,
+            asset_url="https://cdn.example.com/video.mp4?uploaded_by=maria@example.com",
+            is_ai_generated=False,
+            dest_url="https://anunciante.com",
+        )
+        result = await gw.validate_creative(TENANT_A, inp)
+        assert result.pii_detected is True
+        assert result.gate_passed is False
+        assert any("asset_url" in v for v in result.violations)
+
+    async def test_no_pii_across_all_fields_passes(self) -> None:
+        """Contraste: nenhum campo com PII → pii_detected=False (sem falso-positivo)."""
+        gw = make_gateway()
+        inp = ValidateCreativeInput(
+            creative_type=CreativeType.IMAGE,
+            asset_url="https://cdn.example.com/banner_limpo.png",
+            is_ai_generated=False,
+            dest_url="https://anunciante.com/promo?utm_source=copilot",
+        )
+        result = await gw.validate_creative(TENANT_A, inp)
+        assert result.pii_detected is False
+        assert result.gate_passed is True
+
+
+class TestPiiScanDefaultDeny:
+    """
+    Achado remediação copilot-honestidade #1 (30ª onda): a varredura de PII
+    em validate_creative tem de cobrir TODO campo de texto livre do schema
+    Pydantic (DEFAULT-DENY), não uma lista hardcoded de 3 nomes conhecidos
+    (html_content/dest_url/asset_url) — a mesma FORMA do defeito da onda,
+    só que com escopo menor.
+    """
+
+    def test_publishable_text_fields_matches_pydantic_introspection(self) -> None:
+        """
+        _publishable_text_fields deve escanear exatamente os campos
+        str/str|None de ValidateCreativeInput MENOS os explicitamente
+        justificados em _PII_SCAN_EXCLUDED_FIELDS — calculado por
+        introspecção do model_fields do Pydantic, não reescrito à mão aqui.
+        """
+        from typing import get_args
+
+        from tools.gateway import _PII_SCAN_EXCLUDED_FIELDS, _publishable_text_fields
+
+        inp = ValidateCreativeInput(
+            creative_type=CreativeType.IMAGE,
+            asset_url="a",
+            html_content="b",
+            dest_url="c",
+            ai_generation_tool="d",
+        )
+        scanned_names = {name for name, _ in _publishable_text_fields(inp)}
+
+        expected_names = {
+            field_name
+            for field_name, field_info in ValidateCreativeInput.model_fields.items()
+            if field_info.annotation is str or str in get_args(field_info.annotation)
+        } - set(_PII_SCAN_EXCLUDED_FIELDS)
+
+        assert scanned_names == expected_names
+        assert scanned_names == {"asset_url", "html_content", "dest_url"}
+        # ai_generation_tool está fora por ser explicitamente justificado, não
+        # por ausência estrutural na varredura.
+        assert "ai_generation_tool" in ValidateCreativeInput.model_fields
+        assert "ai_generation_tool" not in scanned_names
+
+    def test_publishable_text_fields_default_denies_unknown_new_field(self) -> None:
+        """
+        MUTATION-PROOF do default-deny: passa um modelo Pydantic sintético com
+        um campo de texto livre que NÃO existia quando a função foi escrita
+        (não é html_content/dest_url/asset_url). Se a implementação voltasse a
+        ser uma lista hardcoded desses 3 nomes, este campo desapareceria
+        silenciosamente da varredura — este teste captura exatamente essa
+        regressão de forma (não apenas a instância corrigida nesta onda).
+        """
+        from pydantic import BaseModel
+
+        from tools.gateway import _publishable_text_fields
+
+        class _FutureCreativeShape(BaseModel):
+            asset_url: str | None = None
+            a_brand_new_free_text_field_added_later: str | None = None
+
+        inp = _FutureCreativeShape(
+            asset_url="x",
+            a_brand_new_free_text_field_added_later="joão123.456.789-00@example.com",
+        )
+        scanned_names = {name for name, _ in _publishable_text_fields(inp)}
+        assert "a_brand_new_free_text_field_added_later" in scanned_names, (
+            "Campo de texto livre novo deve ser escaneado por DEFAULT — a "
+            "varredura é derivada do schema Pydantic, não de uma lista "
+            "hardcoded de nomes conhecidos"
+        )
+
 
 @pytest.mark.asyncio
 class TestHaikuJudge:

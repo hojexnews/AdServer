@@ -33,6 +33,7 @@ import (
 	"github.com/hojex/adserver/internal/clicktoken"
 	"github.com/hojex/adserver/internal/geo"
 	"github.com/hojex/adserver/internal/telemetry"
+	"github.com/hojex/adserver/internal/telemetry/blank"
 )
 
 // ---------------------------------------------------------------------------
@@ -332,12 +333,13 @@ func TestCA6_ClickToken_TamperedRejected(t *testing.T) {
 // TestCA6_BlankImpression_NotBillable documents and verifies the /lg blank logic.
 // When tier=SERVED_TIER_BLANK or bid is empty, blank=true and billable=false.
 // This is a critical billing invariant: blank impressions must NEVER be billed.
+//
+// This test calls blank.ComputeBlankBillable — the exact same production
+// function invoked by the /lg handler (handleImpression, in
+// services/collector/cmd/collector/main.go). There is no reimplementation
+// here: a regression in the production decision (e.g. billing a blank
+// impression) makes THIS test fail, not a copy of the logic under test.
 func TestCA6_BlankImpression_NotBillable(t *testing.T) {
-	// The handler logic (from collector/main.go lines 308-310):
-	//   blank    = servedTier == BLANK || bannerID == ""
-	//   billable = !blank && servedTier != UNSPECIFIED
-	// We verify this logic here to catch regressions without running the HTTP server.
-
 	type testCase struct {
 		name       string
 		servedTier commonv1.ServedTier
@@ -380,11 +382,10 @@ func TestCA6_BlankImpression_NotBillable(t *testing.T) {
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			blank := tc.servedTier == commonv1.ServedTier_SERVED_TIER_BLANK || tc.bannerID == ""
-			billable := !blank && tc.servedTier != commonv1.ServedTier_SERVED_TIER_UNSPECIFIED
+			isBlank, billable := blank.ComputeBlankBillable(tc.servedTier, tc.bannerID)
 
-			if blank != tc.wantBlank {
-				t.Errorf("blank: got %v, want %v", blank, tc.wantBlank)
+			if isBlank != tc.wantBlank {
+				t.Errorf("blank: got %v, want %v", isBlank, tc.wantBlank)
 			}
 			if billable != tc.wantBill {
 				t.Errorf("billable: got %v, want %v", billable, tc.wantBill)

@@ -27,13 +27,117 @@
 #   ledger (independente mas antes de compliance) →
 #   vector (independente) →
 #   compliance (depende de config para current_tenant_id())
+#
+# DENTRO de cada schema, a ordem das migrations NUNCA é enumerada à mão.
+# db-test-all (FASE 2/FASE 5 abaixo) deriva a lista a partir do conteúdo
+# real de db/<schema>/migrations/ via glob + sort:
+#   _up:   ls db/<schema>/migrations/*_up.sql   | sort    (0001 → 0002 → ...)
+#   _down: ls db/<schema>/migrations/*_down.sql | sort -r (mais recente primeiro)
+# Convenção obrigatória: prefixo numérico de 4 dígitos zero-padded (0001,
+# 0002, ...) — é isso que garante que a ordenação lexicográfica (sort)
+# coincida com a ordem numérica até 9999 migrations por schema. Uma nova
+# migration (ex.: 0005_foo_{up,down}.sql) é pega automaticamente por este
+# glob; NADA nestes runners precisa ser editado. Isto vale tanto para
+# make/db.mk (este arquivo) quanto para .github/workflows/db.yml — os dois
+# runners derivam do mesmo diretório, nunca de uma lista mantida à mão.
+# Se um diretório de migrations não tiver nenhum arquivo *_up.sql/*_down.sql
+# (schema vazio ou mal formado), o runner FALHA explicitamente em vez de
+# silenciosamente pular o schema (sentinela anti-vazio).
+#
+# Duas sentinelas adicionais fecham os pontos-cegos abertos pelo glob acima
+# (achados MEDIUM da 30ª onda, guardiões security/tech-lead/privacy/money):
+#
+#   db-check-migration-pairing: o glob por si só não garante que uma
+#     migration tenha os DOIS lados. Um `NNNN_foo_up.sql` sem o
+#     `NNNN_foo_down.sql` correspondente (ou vice-versa) é aplicado
+#     normalmente por db-migrate-up/db-test-all e só quebra no rollback,
+#     quando já é tarde. Este alvo compara os dois conjuntos por schema e
+#     FALHA explicitamente na divergência.
+#
+#   db-check-schema-list: o glob resolve a ordem DENTRO de cada schema, mas
+#     DB_SCHEMAS/DB_SCHEMAS_REV abaixo continuam uma lista mantida à mão —
+#     um schema novo (diretório com subpasta migrations/) que não seja
+#     acrescentado a DB_SCHEMAS fica invisível para todo runner (mesma
+#     classe de orfandade da migration sem par, um nível acima: schema em
+#     vez de migration). DB_SCHEMAS NÃO é derivado automaticamente do
+#     glob porque a ORDEM ENTRE schemas é uma dependência real de negócio
+#     (ver acima) que um `ls | sort` alfabético não reproduziria (ex.:
+#     "compliance" ordena antes de "ledger" alfabeticamente, mas depende de
+#     config e tem que vir por último) — a sentinela detecta a divergência
+#     sem assumir a responsabilidade de inferir a ordem.
+#
+# Ambas rodam como pré-requisito de db-test-all (fail-fast, antes de subir
+# o container) e como step próprio em .github/workflows/db.yml.
 
 MIGRATE := $(shell command -v migrate 2>/dev/null || echo migrate)
 
-# Schemas e suas pastas de migrations (ordem de aplicação obrigatória).
-# compliance é o último: depende do schema config (função current_tenant_id).
+# Schemas e ORDEM ENTRE schemas (esta, sim, é uma dependência real de
+# schema — asset_registry antes de config, compliance por último — e por
+# isso permanece uma lista explícita). A ordem DENTRO de cada schema não
+# vem daqui: vem do glob descrito acima.
 DB_SCHEMAS     := asset_registry config ledger vector compliance
 DB_SCHEMAS_REV := compliance vector ledger config asset_registry
+
+## db-check-migration-pairing: sentinela — todo *_up.sql precisa ter o
+##   *_down.sql correspondente (mesmo schema, mesmo prefixo) e vice-versa.
+##   Sem isto, uma migration com só um dos lados é aplicada normalmente e
+##   só quebra na reversão (db-migrate-down / FASE 5 de db-test-all), tarde
+##   demais. Roda ANTES de subir qualquer container (fail-fast).
+db-check-migration-pairing:
+	@echo "== db-check-migration-pairing: verificando pareamento _up/_down por schema =="
+	@FAIL=0; \
+	 for schema in $(DB_SCHEMAS); do \
+	   dir="db/$$schema/migrations"; \
+	   [ -d "$$dir" ] || continue; \
+	   for up in "$$dir"/*_up.sql; do \
+	     [ -e "$$up" ] || continue; \
+	     base=$$(basename "$$up" _up.sql); \
+	     down="$$dir/$${base}_down.sql"; \
+	     if [ ! -e "$$down" ]; then \
+	       echo "ERRO: $$schema/$${base}_up.sql não tem par $$schema/$${base}_down.sql"; \
+	       FAIL=1; \
+	     fi; \
+	   done; \
+	   for down in "$$dir"/*_down.sql; do \
+	     [ -e "$$down" ] || continue; \
+	     base=$$(basename "$$down" _down.sql); \
+	     up="$$dir/$${base}_up.sql"; \
+	     if [ ! -e "$$up" ]; then \
+	       echo "ERRO: $$schema/$${base}_down.sql não tem par $$schema/$${base}_up.sql"; \
+	       FAIL=1; \
+	     fi; \
+	   done; \
+	 done; \
+	 if [ "$$FAIL" = "1" ]; then \
+	   echo "ERRO: pareamento _up/_down quebrado — ver mensagens acima."; \
+	   exit 1; \
+	 fi
+	@echo "== db-check-migration-pairing: ok =="
+
+## db-check-schema-list: sentinela — compara os diretórios reais de db/
+##   (os que têm subpasta migrations/) contra DB_SCHEMAS acima. Um schema
+##   novo nasce invisível para db-migrate-*/db-test-all se não for
+##   acrescentado a DB_SCHEMAS/DB_SCHEMAS_REV; esta sentinela FALHA
+##   explicitamente na divergência em vez de deixar o schema órfão em
+##   silêncio. Não deriva DB_SCHEMAS automaticamente porque a ORDEM entre
+##   schemas é uma dependência real (ver comentário no topo do arquivo).
+db-check-schema-list:
+	@echo "== db-check-schema-list: comparando diretórios de db/ com DB_SCHEMAS =="
+	@real=$$(for d in db/*/; do n=$$(basename "$$d"); [ -d "db/$$n/migrations" ] && echo "$$n"; done | LC_ALL=C sort); \
+	 expected=$$(printf '%s\n' $(DB_SCHEMAS) | LC_ALL=C sort); \
+	 expected_rev_sorted=$$(printf '%s\n' $(DB_SCHEMAS_REV) | LC_ALL=C sort); \
+	 if [ "$$real" != "$$expected" ]; then \
+	   echo "ERRO: divergência entre diretórios reais de schema em db/ e DB_SCHEMAS (make/db.mk)."; \
+	   echo "  diretórios reais (com migrations/): $$(echo $$real)"; \
+	   echo "  DB_SCHEMAS declarado:                $$(echo $$expected)"; \
+	   echo "  Um schema novo (ou removido) precisa ser refletido em DB_SCHEMAS e DB_SCHEMAS_REV — a ordem entre schemas não pode ser derivada por glob."; \
+	   exit 1; \
+	 fi; \
+	 if [ "$$expected" != "$$expected_rev_sorted" ]; then \
+	   echo "ERRO: DB_SCHEMAS e DB_SCHEMAS_REV (make/db.mk) não contêm o mesmo conjunto de schemas."; \
+	   exit 1; \
+	 fi
+	@echo "== db-check-schema-list: ok =="
 
 # Container efêmero para db-test-all.
 _DB_TEST_CONTAINER := adserver-db-test-ephemeral
@@ -131,7 +235,7 @@ db-test-vector: _db-check-url
 ##   Imagem: pgvector/pgvector:pg16 (postgres:16 + extensão pgvector — a
 ##   stock postgres:16 não traz a extensão que db/vector/0001 exige via
 ##   `CREATE EXTENSION vector`; alinhado com .github/workflows/db.yml).
-db-test-all:
+db-test-all: db-check-schema-list db-check-migration-pairing
 	@echo "== db-test-all: iniciando Postgres efêmero =="
 	@if ! command -v docker >/dev/null 2>&1; then \
 	  echo "ERRO: docker não encontrado no PATH. db-test-all requer Docker."; \
@@ -176,29 +280,22 @@ db-test-all:
 	@# --------------------------------------------------------------------------
 	@# FASE 2: aplicar migrations _up em ordem obrigatória
 	@# --------------------------------------------------------------------------
-	@echo "-- aplicando migrations _up ..."
+	@echo "-- aplicando migrations _up (lista derivada do diretório, não enumerada à mão) ..."
 	@_DSN="$(_DB_TEST_DSN)"; FAIL=0; \
-	 psql "$$_DSN" -v ON_ERROR_STOP=1 -q \
-	   -f db/asset_registry/migrations/0001_asset_registry_up.sql || FAIL=1; \
-	 echo "  up: asset_registry/0001"; \
-	 for f in 0001_config_schema 0002_config_rls 0003_campaign_zones_rls; do \
-	   echo "  up: config/$$f"; \
-	   psql "$$_DSN" -v ON_ERROR_STOP=1 -q \
-	     -f "db/config/migrations/$${f}_up.sql" || FAIL=1; \
+	 for schema in $(DB_SCHEMAS); do \
+	   dir="db/$$schema/migrations"; \
+	   files=$$(ls "$$dir"/*_up.sql 2>/dev/null | LC_ALL=C sort); \
+	   if [ -z "$$files" ]; then \
+	     echo "ERRO: nenhuma migration *_up.sql encontrada em $$dir (schema '$$schema' vazio ou mal formado) — sentinela anti-vazio."; \
+	     FAIL=1; \
+	     break; \
+	   fi; \
+	   for fpath in $$files; do \
+	     base=$$(basename "$$fpath" _up.sql); \
+	     echo "  up: $$schema/$$base"; \
+	     psql "$$_DSN" -v ON_ERROR_STOP=1 -q -f "$$fpath" || FAIL=1; \
+	   done; \
 	 done; \
-	 for f in 0001_ledger_schema 0002_reconciliation_exceptions 0003_ledger_rls 0004_ledger_postings_immutable; do \
-	   echo "  up: ledger/$$f"; \
-	   psql "$$_DSN" -v ON_ERROR_STOP=1 -q \
-	     -f "db/ledger/migrations/$${f}_up.sql" || FAIL=1; \
-	 done; \
-	 for f in 0001_vector_schema 0002_vector_rls; do \
-	   echo "  up: vector/$$f"; \
-	   psql "$$_DSN" -v ON_ERROR_STOP=1 -q \
-	     -f "db/vector/migrations/$${f}_up.sql" || FAIL=1; \
-	 done; \
-	 psql "$$_DSN" -v ON_ERROR_STOP=1 -q \
-	   -f db/compliance/migrations/0001_compliance_schema_up.sql || FAIL=1; \
-	 echo "  up: compliance/0001_compliance_schema"; \
 	 if [ "$$FAIL" = "1" ]; then \
 	   echo "ERRO: migrations _up falharam."; docker rm -f $(_DB_TEST_CONTAINER); exit 1; \
 	 fi
@@ -258,24 +355,22 @@ db-test-all:
 	@# --------------------------------------------------------------------------
 	@# FASE 5: aplicar migrations _down em ordem inversa e confirmar reversão
 	@# --------------------------------------------------------------------------
-	@echo "-- aplicando migrations _down (reversão) ..."
+	@echo "-- aplicando migrations _down (reversão, lista derivada do diretório) ..."
 	@_DSN="$(_DB_TEST_DSN)"; FAIL=0; \
-	 psql "$$_DSN" -v ON_ERROR_STOP=1 -q \
-	   -f db/compliance/migrations/0001_compliance_schema_down.sql || FAIL=1; \
-	 for f in 0002_vector_rls 0001_vector_schema; do \
-	   psql "$$_DSN" -v ON_ERROR_STOP=1 -q \
-	     -f "db/vector/migrations/$${f}_down.sql" || FAIL=1; \
+	 for schema in $(DB_SCHEMAS_REV); do \
+	   dir="db/$$schema/migrations"; \
+	   files=$$(ls "$$dir"/*_down.sql 2>/dev/null | LC_ALL=C sort -r); \
+	   if [ -z "$$files" ]; then \
+	     echo "ERRO: nenhuma migration *_down.sql encontrada em $$dir (schema '$$schema' vazio ou mal formado) — sentinela anti-vazio."; \
+	     FAIL=1; \
+	     break; \
+	   fi; \
+	   for fpath in $$files; do \
+	     base=$$(basename "$$fpath" _down.sql); \
+	     echo "  down: $$schema/$$base"; \
+	     psql "$$_DSN" -v ON_ERROR_STOP=1 -q -f "$$fpath" || FAIL=1; \
+	   done; \
 	 done; \
-	 for f in 0004_ledger_postings_immutable 0003_ledger_rls 0002_reconciliation_exceptions 0001_ledger_schema; do \
-	   psql "$$_DSN" -v ON_ERROR_STOP=1 -q \
-	     -f "db/ledger/migrations/$${f}_down.sql" || FAIL=1; \
-	 done; \
-	 for f in 0003_campaign_zones_rls 0002_config_rls 0001_config_schema; do \
-	   psql "$$_DSN" -v ON_ERROR_STOP=1 -q \
-	     -f "db/config/migrations/$${f}_down.sql" || FAIL=1; \
-	 done; \
-	 psql "$$_DSN" -v ON_ERROR_STOP=1 -q \
-	   -f db/asset_registry/migrations/0001_asset_registry_down.sql || FAIL=1; \
 	 if [ "$$FAIL" = "1" ]; then \
 	   echo "ERRO: migrations _down falharam."; docker rm -f $(_DB_TEST_CONTAINER); exit 1; \
 	 fi; \
@@ -297,4 +392,5 @@ _db-check-url:
 .PHONY: db-lint db-migrate-up db-migrate-down db-migrate-status \
         db-test db-test-compliance db-test-ledger db-test-ledger-immutability \
         db-test-vector db-test-all \
+        db-check-migration-pairing db-check-schema-list \
         _db-check-url

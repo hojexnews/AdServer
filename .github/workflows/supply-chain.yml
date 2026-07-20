@@ -27,6 +27,13 @@
 #      SBOM e gerado a partir da imagem local (docker-daemon) antes do
 #      push, para nao depender de round-trip extra ao registry.
 #
+#   0) job "trivyignore-lint" (roda primeiro, gate dos dois modos acima
+#      via `needs:`): valida platform/observability/.trivyignore em si —
+#      formato `exp:YYYY-MM-DD` obrigatorio, expiracao (clock do runner
+#      no momento da execucao) e justificativa comentada — ANTES de
+#      qualquer build. Ver comentario completo no bloco `env:` abaixo e
+#      scripts/ci/check-trivyignore.py.
+#
 # cosign KEYLESS (decisao, nao par de chaves gerenciado):
 #   - Sem chave privada para gerar/guardar/rotacionar (nada estatico em
 #     git/imagem, §2.7). A identidade do assinante = o proprio workflow de
@@ -50,6 +57,8 @@ on:
       - "go.mod"
       - "go.sum"
       - "deploy/docker/**"
+      - "platform/observability/.trivyignore"
+      - "scripts/ci/check-trivyignore.py"
       - ".github/workflows/supply-chain.yml"
   push:
     tags:
@@ -66,15 +75,62 @@ env:
   # exit-code=1 se qualquer vulnerabilidade destas severidades for
   # encontrada (fail-closed). HIGH incluido por criterio de seguranca do
   # mandato ("e HIGH conforme criterio") — ajustavel aqui se necessario.
+  #
+  # SEM ignore-unfixed (achado `trivy-ignore-unfixed-doclie`, 30a onda): os
+  # dois steps de Trivy abaixo NAO usam mais `ignore-unfixed: true`. Esse
+  # flag fazia o scanner IGNORAR (nao contar para o exit-code) exatamente as
+  # vulnerabilidades CRITICAL/HIGH sem patch upstream — o cenario mais
+  # perigoso, pois nem existe correcao para o operador aplicar depois — ao
+  # mesmo tempo em que os comentarios deste arquivo prometiam sem ressalva
+  # "FALHA o job em CRITICAL (e HIGH)". Fail-closed de verdade: qualquer
+  # CRITICAL/HIGH — com ou sem fix upstream — derruba o job, ANTES do push.
+  #
+  # Valvula de escape (decisao da 31a onda de remediacao, achado
+  # `trivy-escape-valve-auditavel`): se um CVE especifico sem fix bloquear
+  # um release legitimo, a excecao e EXPLICITA e AUDITAVEL por CVE — nunca
+  # um flag global e silencioso como o `ignore-unfixed` removido acima.
+  # Mecanismo: platform/observability/.trivyignore (formato nativo do
+  # Trivy), referenciado pelo input `trivyignores` dos dois steps de Trivy
+  # abaixo. Comeca VAZIO (nenhuma excecao concedida); cada entrada exige
+  # CVE + justificativa em comentario + expiracao `exp:YYYY-MM-DD`
+  # obrigatoria (o Trivy volta a bloquear sozinho apos a expiracao, sem
+  # segunda acao humana) e so entra via PR revisado — o diff do arquivo E
+  # o registro de auditoria. Ver o cabecalho de
+  # platform/observability/.trivyignore para o processo completo.
+  #
+  # GATE EXECUTAVEL da disciplina acima (achado `trivyignore-regras-so-em-
+  # prosa`, 32a onda): as 4 regras do cabecalho do .trivyignore eram so
+  # texto — nada as impunha, e uma entrada EXPIRADA continuava suprimindo o
+  # CVE indefinidamente, porque nada lia a data. O job `trivyignore-lint`
+  # abaixo roda scripts/ci/check-trivyignore.py, que FALHA o workflow se
+  # qualquer entrada estiver sem `exp:YYYY-MM-DD`, com data ja expirada
+  # (relogio do runner no momento da execucao, sem data fixa no codigo), ou
+  # sem justificativa comentada na linha imediatamente acima.
   TRIVY_SEVERITY: "CRITICAL,HIGH"
+  TRIVYIGNORES: "platform/observability/.trivyignore"
 
 jobs:
+  # --------------------------------------------------------------------
+  # Gate 0: valida o PROPRIO .trivyignore antes de qualquer build/scan —
+  # roda sempre (PR, push de tag, release), pois os dois jobs abaixo
+  # dependem dele via `needs:`. Sem cluster/credenciais; so Python stdlib.
+  # --------------------------------------------------------------------
+  trivyignore-lint:
+    name: "lint .trivyignore (exp: obrigatoria, sem entrada expirada)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: valida platform/observability/.trivyignore (formato + expiracao + justificativa)
+        run: python3 scripts/ci/check-trivyignore.py platform/observability/.trivyignore
+
   # --------------------------------------------------------------------
   # PR: build + scan cedo. Sem push, sem cosign — nunca publica a partir
   # de codigo de PR (pode vir de fork nao confiavel).
   # --------------------------------------------------------------------
   build-and-scan:
     if: github.event_name == 'pull_request'
+    needs: trivyignore-lint
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -118,15 +174,21 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.service }}
           cache-to: type=gha,mode=max,scope=${{ matrix.service }}
 
-      - name: Trivy scan (validacao cedo — nao bloqueia merge sozinho, informa o PR)
+      - name: Trivy scan (fail-closed CRITICAL/HIGH, com ou sem fix upstream)
         uses: aquasecurity/trivy-action@0.24.0
         with:
           image-ref: "local/${{ matrix.service }}:pr-${{ github.sha }}"
           format: table
           severity: ${{ env.TRIVY_SEVERITY }}
           exit-code: "1"
-          ignore-unfixed: true
           vuln-type: os,library
+          # Valvula de escape auditavel POR-CVE (nao um ignore-unfixed
+          # global) — ver comentario em env.TRIVY_SEVERITY acima e o
+          # cabecalho de platform/observability/.trivyignore. Arquivo
+          # comeca vazio: nao muda o comportamento fail-closed hoje.
+          # O PROPRIO arquivo ja foi validado pelo job trivyignore-lint
+          # (needs: acima) — formato/expiracao/justificativa garantidos.
+          trivyignores: ${{ env.TRIVYIGNORES }}
 
   # --------------------------------------------------------------------
   # Tag/release: pipeline completo de supply chain. Publica ghcr.io e
@@ -134,6 +196,7 @@ jobs:
   # --------------------------------------------------------------------
   build-sign-push:
     if: github.event_name == 'push' || github.event_name == 'release'
+    needs: trivyignore-lint
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -227,7 +290,11 @@ jobs:
           retention-days: 90
 
       # ------------------------------------------------------------------
-      # Trivy — FALHA o job em CRITICAL (e HIGH, TRIVY_SEVERITY acima).
+      # Trivy — FALHA o job em CRITICAL (e HIGH, TRIVY_SEVERITY acima),
+      # INCLUSIVE vulnerabilidades sem fix upstream (sem ignore-unfixed —
+      # achado `trivy-ignore-unfixed-doclie`, 30a onda: um `true` ali
+      # deixava passar exatamente o pior caso, CVE CRITICAL sem patch
+      # disponivel, contradizendo esta mesma promessa de comentario).
       # Roda ANTES do push: nunca publicamos uma imagem que falhe o gate.
       # ------------------------------------------------------------------
       - name: Trivy scan (fail-closed, ANTES do push)
@@ -237,8 +304,14 @@ jobs:
           format: table
           severity: ${{ env.TRIVY_SEVERITY }}
           exit-code: "1"
-          ignore-unfixed: true
           vuln-type: os,library
+          # Valvula de escape auditavel POR-CVE (nao um ignore-unfixed
+          # global) — ver comentario em env.TRIVY_SEVERITY acima e o
+          # cabecalho de platform/observability/.trivyignore. Arquivo
+          # comeca vazio: nao muda o comportamento fail-closed hoje.
+          # O PROPRIO arquivo ja foi validado pelo job trivyignore-lint
+          # (needs: acima) — formato/expiracao/justificativa garantidos.
+          trivyignores: ${{ env.TRIVYIGNORES }}
 
       # ------------------------------------------------------------------
       # Push — so acontece se o Trivy acima passou (gate hard).

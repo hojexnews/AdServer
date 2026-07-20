@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import httpx
 import structlog
-from typing import Any
+from typing import Any, get_args
 
 from tools.schemas import (
     SimulateForecastInput,
@@ -48,8 +48,10 @@ from tools.schemas import (
     ValidateCreativeOutput,
     SearchSimilarCreativesInput,
     SearchSimilarCreativesOutput,
+    SimilarCreative,
     SearchHelpDocsInput,
     SearchHelpDocsOutput,
+    HelpDoc,
     CreateCampaignDraftInput,
     UpdateCampaignDraftInput,
     CreateBannerDraftInput,
@@ -345,12 +347,28 @@ class ToolGateway:
             syntid_ok = True
             disclosure_ok = True
 
-        # --- Verificação de PII no HTML (TX-5) ---
-        if inp.html_content:
-            pii_detected = _detect_pii_in_html(inp.html_content)
-            if pii_detected:
+        # --- Verificação de PII (TX-5) — DEFAULT-DENY sobre TODOS os campos de
+        # texto livre do schema `ValidateCreativeInput`, derivados por
+        # introspecção Pydantic (`_publishable_text_fields`), não por uma
+        # lista mantida à mão. Para creative_type=image/video, html_content é
+        # None e o gate de PII não pode ficar estruturalmente sempre False:
+        # dest_url e asset_url também são texto livre e podem carregar PII em
+        # querystring (ex.: ?email=...&cpf=...). O mesmo vetor ja e reconhecido
+        # do outro lado do sistema: em platform/observability/otel-collector.yaml,
+        # o processor `transform/redact-pii` faz `delete_key(attributes,
+        # "url.full")` nos tres tipos de statement exatamente porque uma URL
+        # carrega querystring com PII. (Citado por ANCORA — nome do processor e
+        # da chave —, nunca por numero de linha: numero de linha em prosa
+        # cross-file e doc-lie com data de validade.) Um campo novo entra
+        # automaticamente na varredura; só sai dela via
+        # `_PII_SCAN_EXCLUDED_FIELDS` com justificativa.
+        pii_fields = _publishable_text_fields(inp)
+        pii_detected = False
+        for field_name, field_value in pii_fields:
+            if field_value and _detect_pii_in_html(field_value):
+                pii_detected = True
                 violations.append(
-                    "PII detectado no HTML do criativo (TX-5/DA-11). "
+                    f"PII detectado em '{field_name}' do criativo (TX-5/DA-11). "
                     "Remova dados pessoais antes de publicar."
                 )
 
@@ -411,30 +429,6 @@ class ToolGateway:
             log.warning("search_similar_creatives.db_unavailable", tenant_id=tenant_id)
             return SearchSimilarCreativesOutput(results=[], total_searched=0)
 
-        # Em produção — H2: dois statements separados, ambos parametrizados:
-        #
-        # SQL_SET_CONFIG = "SELECT set_config('adserver.tenant_id', $1, true)"
-        # SQL_SELECT = """
-        #     SELECT
-        #         banner_id::text, campaign_id::text, creative_type, ctr,
-        #         1 - (embedding <=> $1::vector) AS similarity_score,
-        #         description_snippet
-        #     FROM vector_store.creative_embeddings
-        #     WHERE ($2::text IS NULL OR creative_type = $2)
-        #       AND ($3::float IS NULL OR ctr >= $3)
-        #     ORDER BY embedding <=> $1::vector
-        #     LIMIT $4
-        # """
-        # async with self._db.acquire() as conn:
-        #     async with conn.transaction():
-        #         await conn.execute(SQL_SET_CONFIG, tenant_id)
-        #         rows = await conn.fetch(
-        #             SQL_SELECT,
-        #             await self._embed_text(inp.query_text),
-        #             inp.creative_type.value if inp.creative_type else None,
-        #             inp.min_ctr,
-        #             inp.top_k,
-        #         )
         log.info(
             "search_similar_creatives.query",
             tenant_id=tenant_id,
@@ -442,8 +436,50 @@ class ToolGateway:
             top_k=inp.top_k,
             schema="vector_store",
         )
-        # Stub de resultado enquanto não há banco real:
-        return SearchSimilarCreativesOutput(results=[], total_searched=0)
+
+        # H2: dois statements separados, ambos PARAMETRIZADOS. tenant_id NUNCA
+        # é interpolado via f-string no SQL — sempre passado como argumento
+        # posicional ($1) para conn.execute/conn.fetch (asyncpg faz o bind
+        # server-side, eliminando SQL injection). Cada chamada adquire uma
+        # conexão dedicada do pool (acquire()) e o set_config roda na MESMA
+        # transação da SELECT, para não vazar tenant_id em transaction-pooling
+        # (PgBouncer).
+        SQL_SET_CONFIG = "SELECT set_config('adserver.tenant_id', $1, true)"
+        SQL_SELECT = """
+            SELECT
+                banner_id::text, campaign_id::text, creative_type, ctr,
+                1 - (embedding <=> $1::vector) AS similarity_score,
+                description_snippet
+            FROM vector_store.creative_embeddings
+            WHERE ($2::text IS NULL OR creative_type = $2)
+              AND ($3::float IS NULL OR ctr >= $3)
+            ORDER BY embedding <=> $1::vector
+            LIMIT $4
+        """
+        query_embedding = await self._embed_text(inp.query_text)
+        async with self._db.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(SQL_SET_CONFIG, tenant_id)
+                rows = await conn.fetch(
+                    SQL_SELECT,
+                    query_embedding,
+                    inp.creative_type.value if inp.creative_type else None,
+                    inp.min_ctr,
+                    inp.top_k,
+                )
+
+        results = [
+            SimilarCreative(
+                banner_id=row["banner_id"],
+                campaign_id=row["campaign_id"],
+                creative_type=row["creative_type"],
+                ctr=row["ctr"],
+                similarity_score=row["similarity_score"],
+                description_snippet=row["description_snippet"],
+            )
+            for row in rows
+        ]
+        return SearchSimilarCreativesOutput(results=results, total_searched=len(rows))
 
     # =========================================================================
     # READ-ONLY: RAG — search_help_docs
@@ -466,16 +502,33 @@ class ToolGateway:
         if self._db is None:
             return SearchHelpDocsOutput(results=[])
         query_embedding = await self._embed_text(inp.query)
-        # Em produção:
-        # async with self._db.acquire() as conn:
-        #     async with conn.transaction():
-        #         await conn.execute(
-        #             "SELECT set_config('adserver.tenant_id', $1, true)", tenant_id
-        #         )
-        #         rows = await conn.fetch(
-        #             "SELECT ... FROM vector_store.help_doc_embeddings ...", ...
-        #         )
-        return SearchHelpDocsOutput(results=[])
+
+        # H2: set_config parametrizado (nunca f-string com tenant_id), conexão
+        # dedicada por operação, schema vector_store.
+        SQL_SET_CONFIG = "SELECT set_config('adserver.tenant_id', $1, true)"
+        SQL_SELECT = """
+            SELECT
+                doc_id::text, title, snippet,
+                1 - (embedding <=> $1::vector) AS relevance_score
+            FROM vector_store.help_doc_embeddings
+            ORDER BY embedding <=> $1::vector
+            LIMIT $2
+        """
+        async with self._db.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(SQL_SET_CONFIG, tenant_id)
+                rows = await conn.fetch(SQL_SELECT, query_embedding, inp.top_k)
+
+        results = [
+            HelpDoc(
+                doc_id=row["doc_id"],
+                title=row["title"],
+                snippet=row["snippet"],
+                relevance_score=row["relevance_score"],
+            )
+            for row in rows
+        ]
+        return SearchHelpDocsOutput(results=results)
 
     # =========================================================================
     # WRITE DRAFTS (→ HITL obrigatório — retornam WriteDiff, não persistem)
@@ -658,19 +711,42 @@ class ToolGateway:
                 "apply_write: banco de dados não configurado (db_pool=None). "
                 "Configure DATABASE_URL e forneça o pool asyncpg."
             )
-        # Em produção — H2: set_config parametrizado, NUNCA f-string com tenant_id:
-        # async with self._db.acquire() as conn:
-        #     async with conn.transaction():
-        #         # Parametrizado: $1 → tenant_id. Jamais interpolação de string.
-        #         await conn.execute(
-        #             "SELECT set_config('adserver.tenant_id', $1, true)", tenant_id
-        #         )
-        #         if diff.operation == "create_campaign":
-        #             row = await conn.fetchrow(INSERT_CAMPAIGN_SQL, *diff.after.values())
-        #             return {"id": row["id"], "status": "created"}
-        #         ...
-        # NOTA: tenant_id do diff deve ser o DONO do diff (C1: verificado pelo caller).
-        return {"status": "applied", "operation": diff.operation}
+        # H2: set_config PARAMETRIZADO ($1), NUNCA f-string com tenant_id no
+        # SQL. Conexão dedicada (acquire()) + set_config na mesma transação
+        # da escrita, para não vazar tenant_id em transaction-pooling
+        # (PgBouncer). NOTA: tenant_id do diff deve ser o DONO do diff
+        # (C1: verificado pelo caller — apply_write_node — antes de chegar aqui).
+        #
+        # Dispatch por operação (INSERT/UPDATE específicos de cada entidade —
+        # campaign/banner/delivery_rule/cap/campaign_zone) depende do schema
+        # de db/config e ainda não está implementado (pendente de infra real,
+        # G1). O que o H2 exige já está ativo neste ponto: a conexão é
+        # dedicada, e o SET_CONFIG do RLS é sempre parametrizado — nunca
+        # interpolado — ANTES de qualquer tentativa de mutação.
+        SQL_SET_CONFIG = "SELECT set_config('adserver.tenant_id', $1, true)"
+        async with self._db.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(SQL_SET_CONFIG, tenant_id)
+                # Achado remediação copilot-honestidade #3 (30ª onda): NENHUM
+                # INSERT/UPDATE é emitido acima (dispatch por operação ainda
+                # não existe — pendente de G1). Retornar "applied" aqui seria
+                # FALSO: um chamador (grafo/LLM/humano) que confie neste
+                # status acreditaria que a escrita ocorreu quando ela não
+                # ocorreu. status="pending_dispatch" diz a verdade: RLS foi
+                # aplicado e a transação foi aberta, mas nenhuma mutação de
+                # linha foi executada. Trocar para "applied" só quando o
+                # dispatch por operação existir de fato.
+                #
+                # L2: resultado retornado ao LLM NUNCA inclui tenant_id.
+                return {
+                    "status": "pending_dispatch",
+                    "operation": diff.operation,
+                    "detail": (
+                        "Dispatch de INSERT/UPDATE por operação ainda não "
+                        "implementado (pendente de infra real, G1). Nenhuma "
+                        "mutação foi persistida nesta chamada."
+                    ),
+                }
 
     # =========================================================================
     # GUARDRAIL: haiku_judge
@@ -871,3 +947,51 @@ def _detect_pii_in_html(text: str) -> bool:
         if re.search(pat, text):
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# PII scan — DEFAULT-DENY sobre campos de texto livre (Achado remediação
+# copilot-honestidade #1, 30ª onda).
+#
+# Fonte única da verdade: o schema Pydantic `ValidateCreativeInput`. Todo
+# campo `str` ou `str | None` é escaneado por PII por padrão — um campo novo
+# adicionado ao schema (ex.: `alt_text`, `caption`) entra automaticamente na
+# varredura sem exigir edição nesta função. A única forma de tirar um campo
+# da varredura é listá-lo em `_PII_SCAN_EXCLUDED_FIELDS` com uma justificativa
+# de por que ele NÃO é publicado — nunca via uma lista manual dos campos que
+# DEVEM ser escaneados (essa era a forma do defeito: allowlist positiva
+# enumerada de 3 nomes que silenciosamente ignorava qualquer campo novo).
+# ---------------------------------------------------------------------------
+
+_PII_SCAN_EXCLUDED_FIELDS: dict[str, str] = {
+    "ai_generation_tool": (
+        "Rótulo interno da ferramenta de geração (ex.: 'firefly', 'veo3', "
+        "'claude') — metadado de auditoria consumido só pelo pipeline de "
+        "geração; nunca renderizado no criativo publicado nem exposto ao "
+        "usuário final do anúncio."
+    ),
+}
+
+
+def _is_free_text_pydantic_annotation(annotation: Any) -> bool:
+    """True se a anotação de tipo do campo é `str` ou `str | None` (Optional[str])."""
+    if annotation is str:
+        return True
+    return str in get_args(annotation)
+
+
+def _publishable_text_fields(inp: ValidateCreativeInput) -> list[tuple[str, str | None]]:
+    """
+    Deriva por introspecção do modelo Pydantic — não de uma lista mantida à
+    mão — todos os campos de texto livre publicáveis de `inp` a escanear por
+    PII. DEFAULT-DENY: inclui todo campo `str`/`str | None` do schema, exceto
+    os explicitamente justificados em `_PII_SCAN_EXCLUDED_FIELDS`.
+    """
+    fields: list[tuple[str, str | None]] = []
+    for field_name, field_info in type(inp).model_fields.items():
+        if field_name in _PII_SCAN_EXCLUDED_FIELDS:
+            continue
+        if not _is_free_text_pydantic_annotation(field_info.annotation):
+            continue
+        fields.append((field_name, getattr(inp, field_name)))
+    return fields

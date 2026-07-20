@@ -33,6 +33,16 @@ on:
       - "ml/features/testdata/parity_cases.json"
       - "ml/features/python/**"
       - "ml/features/spec/**"
+      # go-onnx-parity (calibration_parity_test.go / onnx_parity_test.go,
+      # -tags onnx): gera ml/registry/artifacts/{pctr_model.onnx,
+      # calibration_map.json} chamando export_onnx/run_calibration
+      # DIRETAMENTE de ml/training/train_pctr.py e ml/calibration/calibrate.py
+      # (services/ranker-sidecar/scripts/gen_calibration_fixtures.py). Sem
+      # estes paths, uma mudanca nessas duas funcoes nunca disparia o gate
+      # que prova que o sidecar Go serve pCTR calibrado, nao so o .onnx cru.
+      - "ml/training/train_pctr.py"
+      - "ml/calibration/calibrate.py"
+      - "make/ml.mk"
   push:
     branches: [main]
     paths:
@@ -42,11 +52,22 @@ on:
       - "gen/go/**"
       - "go.mod"
       - "go.sum"
-      # merges = FF push direto -> push.paths deve espelhar pull_request.paths
-      # (mesma paridade cross-language; ver comentario acima).
+      # merges a main = FF push direto (sem PR intermediario), entao ESTE trigger
+      # e a unica reavaliacao que acontece no merge: push.paths espelha
+      # pull_request.paths na integra, VERBATIM. Um path que exista so no lado
+      # do PR criaria uma classe de mudanca que entra na main sem nunca ser
+      # revalidada. Ao editar um dos dois blocos, edite o outro no mesmo commit.
+      - "make/go.mk"
+      - "make/parity.mk"
+      - ".golangci.yml"
+      - ".github/workflows/go.yml"
+      # Paridade cross-language (mesma justificativa do bloco de pull_request).
       - "ml/features/testdata/parity_cases.json"
       - "ml/features/python/**"
       - "ml/features/spec/**"
+      - "ml/training/train_pctr.py"
+      - "ml/calibration/calibrate.py"
+      - "make/ml.mk"
 
 permissions:
   contents: read
@@ -76,3 +97,139 @@ jobs:
         run: make go-test
       - name: parity golden (gate de cutover, sem infra)
         run: make parity-golden
+
+  # ---------------------------------------------------------------------
+  # go-onnx-parity: prova que a calibracao isotonica esta REALMENTE
+  # aplicada na serving (HIGH "calibration-never-applied-in-serving",
+  # 30a onda). O job `go` acima roda `go test` SEM `-tags onnx` (ADR-0002 §C
+  # build hermetico) — internal/calibration (unit puro, sem ONNX) ja e
+  # coberto la, mas o teste que prova a WIRING DE PRODUCAO de ponta a ponta
+  # (wiring.BuildInferencer -> onnx.New -> calibration.LoadMap ->
+  # calibration.Wrap, contra o modelo .onnx real) so existe sob `-tags onnx`
+  # (calibration_parity_test.go / onnx_parity_test.go) e ate esta onda NUNCA
+  # rodava em CI nenhuma: o build tag excluia o teste do `go test ./...`
+  # padrao, e nenhum job jamais compilava com `-tags onnx` nem provisionava
+  # libonnxruntime.so — os testes so existiam para dar `t.Skip` local.
+  #
+  # Este job fecha as duas metades do buraco:
+  #   1. Runtime nativo: o pacote Python `onnxruntime` do pip EMBARCA
+  #      libonnxruntime.so.* em site-packages/onnxruntime/capi/ — reusamos
+  #      esse binario via ONNXRUNTIME_SHARED_LIBRARY_PATH em vez de baixar/
+  #      compilar outra copia.
+  #   2. Artefatos: ml/registry/artifacts/{pctr_model.onnx,
+  #      calibration_map.json} sao gitignored (ADR-0003 §F — nao versionar
+  #      blobs de modelo) e por isso nunca existem num checkout limpo.
+  #      `make ranker-onnx-fixtures` gera os dois via um booster sintetico
+  #      determinista (seed fixo) chamando export_onnx/run_calibration REAIS
+  #      de ml/training/train_pctr.py e ml/calibration/calibrate.py —
+  #      determinismo provado rodando o gerador duas vezes e comparando as
+  #      testdata/*_golden.json resultantes byte-a-byte (ver docstring de
+  #      services/ranker-sidecar/scripts/gen_calibration_fixtures.py).
+  #
+  # Sentinela anti-skip (licao da 28a onda #8 / 29a onda #8 — teste SKIPPED
+  # dentro de job verde mascara o gate): calibration_parity_test.go e
+  # onnx_parity_test.go dao `t.Skip` (nao falham) se a lib nativa ou os
+  # artefatos estiverem ausentes — exatamente o estado que mantinha isto
+  # invisivel ate agora. Falhamos o job se QUALQUER `--- SKIP` aparecer no
+  # log, e confirmamos explicitamente que os dois testes de paridade
+  # apareceram como PASSED — nunca skiparam em silencio.
+  # ---------------------------------------------------------------------
+  go-onnx-parity:
+    runs-on: ubuntu-latest
+    env:
+      CAPPING_SALT: ci-test-salt-not-a-real-secret
+      CK_HMAC_SECRET: ci-test-hmac-not-a-real-secret
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Mesma lista de dependencias do job ml-full (.github/workflows/ml.yml)
+      # — export_onnx/run_calibration (ml/training/train_pctr.py,
+      # ml/calibration/calibrate.py) importam mlflow+pandas+sklearn no nivel
+      # de modulo, alem de lightgbm/onnx/onnxmltools/onnxruntime.
+      - name: instalar dependencias (treino sintetico + export ONNX + calibracao)
+        run: |
+          pip install --quiet \
+            numpy \
+            pandas \
+            scipy \
+            scikit-learn \
+            lightgbm \
+            mlflow-skinny \
+            onnx \
+            onnxmltools \
+            onnxruntime
+
+      # Sentinela contra re-drift do pip install acima (mesmo padrao do
+      # sentinela ZipMap em ml.yml): se qualquer pacote sair da lista, o
+      # `make ranker-onnx-fixtures` abaixo falharia com ImportError -- o que
+      # e um erro CLARO, mas preferimos falhar aqui, ANTES, com uma mensagem
+      # que aponta exatamente para este step.
+      - name: sentinela lightgbm/onnx/onnxmltools/onnxruntime/mlflow (evita ImportError tardio)
+        run: |
+          python -c "
+          import importlib, sys
+          faltando = [m for m in ('lightgbm', 'onnx', 'onnxmltools', 'onnxruntime', 'mlflow.lightgbm', 'sklearn', 'pandas') if importlib.util.find_spec(m) is None]
+          if faltando:
+              print(f'ERRO: pacote(s) ausente(s) no ambiente de CI: {faltando}.', file=sys.stderr)
+              print('services/ranker-sidecar/scripts/gen_calibration_fixtures.py importa', file=sys.stderr)
+              print('export_onnx/run_calibration de ml/training/train_pctr.py e', file=sys.stderr)
+              print('ml/calibration/calibrate.py, que precisam de todos estes pacotes. Corrija o pip install acima.', file=sys.stderr)
+              sys.exit(1)
+          print('sentinela go-onnx-parity: OK — todos os pacotes presentes.')
+          "
+
+      # Localiza o libonnxruntime.so.* que o pacote pip `onnxruntime` embarca
+      # em site-packages/onnxruntime/capi/ (nao versionamos nem baixamos
+      # outra copia — reusar a que o pip ja trouxe evita um segundo download
+      # e uma segunda fonte de verdade para a versao do runtime).
+      - name: localizar libonnxruntime.so nativo (pacote pip onnxruntime)
+        run: |
+          LIB_PATH="$(python -c "
+          import glob, onnxruntime, os, sys
+          base = os.path.join(os.path.dirname(onnxruntime.__file__), 'capi')
+          matches = sorted(glob.glob(os.path.join(base, 'libonnxruntime.so*')))
+          if not matches:
+              print(f'ERRO: nenhum libonnxruntime.so* encontrado em {base}', file=sys.stderr)
+              sys.exit(1)
+          print(matches[0])
+          ")"
+          echo "libonnxruntime nativo: $LIB_PATH"
+          test -f "$LIB_PATH"
+          echo "ONNXRUNTIME_SHARED_LIBRARY_PATH=$LIB_PATH" >> "$GITHUB_ENV"
+
+      - name: gerar artefatos sinteticos (pctr_model.onnx + calibration_map.json)
+        run: make ranker-onnx-fixtures
+
+      - name: go test -tags onnx (paridade de calibracao + ONNX, sentinela anti-skip)
+        run: |
+          set -o pipefail
+          go test -tags onnx -count=1 -v \
+            ./services/ranker-sidecar/internal/onnx/... \
+            ./services/ranker-sidecar/internal/wiring/... \
+            2>&1 | tee /tmp/go-onnx-parity.log
+
+          if grep -q -- '--- SKIP' /tmp/go-onnx-parity.log; then
+            echo "ERRO: teste(s) SKIPPED sob -tags onnx — o gate de calibracao (HIGH" >&2
+            echo "'calibration-never-applied-in-serving') ficaria mascarado em silencio." >&2
+            grep -- '--- SKIP' /tmp/go-onnx-parity.log >&2
+            exit 1
+          fi
+          if ! grep -q -- '--- PASS: TestCalibratedServingParity' /tmp/go-onnx-parity.log; then
+            echo "ERRO: TestCalibratedServingParity nao apareceu como PASSED — a wiring de" >&2
+            echo "producao (wiring.BuildInferencer -> calibration.Wrap) nao foi validada." >&2
+            exit 1
+          fi
+          if ! grep -q -- '--- PASS: TestOnnxScoreParity' /tmp/go-onnx-parity.log; then
+            echo "ERRO: TestOnnxScoreParity nao apareceu como PASSED — paridade Go<->Python" >&2
+            echo "do grafo ONNX cru nao foi validada." >&2
+            exit 1
+          fi
+          echo "go-onnx-parity: TestCalibratedServingParity + TestOnnxScoreParity confirmados PASSED, 0 skipped."

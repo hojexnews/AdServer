@@ -1,14 +1,29 @@
 # db — migrações + isolamento RLS (Fase 1+3, hardening go-live TX-3).
 #
 # Sobe um Postgres 16 efêmero via service container do GitHub Actions,
-# aplica TODAS as migrations (_up) de todos os schemas em ordem obrigatória:
-#   asset_registry → config → ledger (0001..0004) → vector → compliance
+# aplica TODAS as migrations (_up) de todos os schemas em ordem obrigatória
+# entre schemas: asset_registry → config → ledger → vector → compliance.
 # Roda os testes de banco:
 #   - rls_isolation_test.sql de config, ledger, vector, compliance (TX-3)
 #   - postings_immutability_test.sql (ledger, migration 0004: append-only no
 #     banco via trigger — garantia da 28ª onda #6)
 # Aplica as migrations _down em ordem inversa e confirma reversão limpa.
 # Reporta PASS/FAIL por schema.
+#
+# DENTRO de cada schema a ordem das migrations NUNCA é enumerada à mão neste
+# arquivo: cada step deriva a lista via glob + sort sobre
+# db/<schema>/migrations/ — exatamente a mesma convenção de make/db.mk
+# (db-test-all): _up = *_up.sql ordenado; _down = *_down.sql em ordem
+# reversa. Uma migration nova (ex.: 0005_foo_{up,down}.sql) é aplicada
+# automaticamente; nenhum step deste workflow precisa ser editado. Se o
+# diretório não tiver nenhum *_up.sql/*_down.sql o step falha explicitamente
+# (sentinela anti-vazio) em vez de pular o schema em silêncio.
+#
+# O primeiro job step (make db-check-schema-list db-check-migration-pairing)
+# roda as duas sentinelas de make/db.mk ANTES de qualquer migration: uma
+# migration só com _up (ou só com _down) quebraria a reversão lá embaixo;
+# um schema novo em db/ sem entrada em DB_SCHEMAS ficaria invisível aos
+# steps abaixo. Fonte única com make/db.mk — nada duplicado aqui em YAML.
 #
 # Tudo sem DATABASE_URL externo: usa o service container de CI.
 # Sem credenciais de cloud — completamente offline/efêmero.
@@ -70,6 +85,14 @@ jobs:
           psql --version
 
       # ------------------------------------------------------------------
+      # Sentinelas (make/db.mk): pareamento _up/_down por migration +
+      # diretórios reais de db/ vs. DB_SCHEMAS. Fail-fast antes de tocar
+      # o Postgres — mesmos alvos que db-test-all roda localmente.
+      # ------------------------------------------------------------------
+      - name: sentinelas de schema/migration (db-check-schema-list + db-check-migration-pairing)
+        run: make db-check-schema-list db-check-migration-pairing
+
+      # ------------------------------------------------------------------
       # Roles de aplicação (adserver_loader BYPASSRLS / adserver_app RLS).
       # Devem existir ANTES das migrations que criam GRANTs.
       # ------------------------------------------------------------------
@@ -92,35 +115,73 @@ jobs:
       # Migrations _up em ordem obrigatória
       # ------------------------------------------------------------------
       - name: migrations up — asset_registry
-        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f db/asset_registry/migrations/0001_asset_registry_up.sql
-
-      - name: migrations up — config (0001, 0002, 0003)
         run: |
-          for f in 0001_config_schema 0002_config_rls 0003_campaign_zones_rls; do
-            echo "  up: config/${f}"
-            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "db/config/migrations/${f}_up.sql"
+          dir="db/asset_registry/migrations"
+          files=$(ls "$dir"/*_up.sql 2>/dev/null | LC_ALL=C sort)
+          if [ -z "$files" ]; then
+            echo "ERRO: nenhuma migration *_up.sql encontrada em $dir (schema vazio ou mal formado)." >&2
+            exit 1
+          fi
+          for f in $files; do
+            echo "  up: asset_registry/$(basename "$f" _up.sql)"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
           done
 
-      - name: migrations up — ledger (0001, 0002, 0003, 0004)
+      - name: migrations up — config
         run: |
-          # 0004_ledger_postings_immutable: trigger BEFORE UPDATE/DELETE +
-          # append-only em ledger.postings (garantia da 28a onda #6). Sem ele
-          # aplicado na CI, o postings_immutability_test.sql abaixo nunca provaria
-          # a imutabilidade por-PR.
-          for f in 0001_ledger_schema 0002_reconciliation_exceptions 0003_ledger_rls 0004_ledger_postings_immutable; do
-            echo "  up: ledger/${f}"
-            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "db/ledger/migrations/${f}_up.sql"
+          dir="db/config/migrations"
+          files=$(ls "$dir"/*_up.sql 2>/dev/null | LC_ALL=C sort)
+          if [ -z "$files" ]; then
+            echo "ERRO: nenhuma migration *_up.sql encontrada em $dir (schema vazio ou mal formado)." >&2
+            exit 1
+          fi
+          for f in $files; do
+            echo "  up: config/$(basename "$f" _up.sql)"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
           done
 
-      - name: migrations up — vector (0001, 0002)
+      - name: migrations up — ledger
         run: |
-          for f in 0001_vector_schema 0002_vector_rls; do
-            echo "  up: vector/${f}"
-            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "db/vector/migrations/${f}_up.sql"
+          # A ordem/lista vem do diretório (glob + sort), não é enumerada à
+          # mão — inclui automaticamente 0004_ledger_postings_immutable
+          # (trigger BEFORE UPDATE/DELETE + append-only, garantia da 28a
+          # onda #6) e qualquer migration futura, sem editar este step.
+          dir="db/ledger/migrations"
+          files=$(ls "$dir"/*_up.sql 2>/dev/null | LC_ALL=C sort)
+          if [ -z "$files" ]; then
+            echo "ERRO: nenhuma migration *_up.sql encontrada em $dir (schema vazio ou mal formado)." >&2
+            exit 1
+          fi
+          for f in $files; do
+            echo "  up: ledger/$(basename "$f" _up.sql)"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
           done
 
-      - name: migrations up — compliance (0001)
-        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f db/compliance/migrations/0001_compliance_schema_up.sql
+      - name: migrations up — vector
+        run: |
+          dir="db/vector/migrations"
+          files=$(ls "$dir"/*_up.sql 2>/dev/null | LC_ALL=C sort)
+          if [ -z "$files" ]; then
+            echo "ERRO: nenhuma migration *_up.sql encontrada em $dir (schema vazio ou mal formado)." >&2
+            exit 1
+          fi
+          for f in $files; do
+            echo "  up: vector/$(basename "$f" _up.sql)"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
+          done
+
+      - name: migrations up — compliance
+        run: |
+          dir="db/compliance/migrations"
+          files=$(ls "$dir"/*_up.sql 2>/dev/null | LC_ALL=C sort)
+          if [ -z "$files" ]; then
+            echo "ERRO: nenhuma migration *_up.sql encontrada em $dir (schema vazio ou mal formado)." >&2
+            exit 1
+          fi
+          for f in $files; do
+            echo "  up: compliance/$(basename "$f" _up.sql)"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
+          done
 
       # ------------------------------------------------------------------
       # Grants sobre os schemas criados pelas migrations
@@ -192,32 +253,71 @@ jobs:
       # Migrations _down em ordem inversa — confirma reversão limpa
       # ------------------------------------------------------------------
       - name: migrations down — compliance
-        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f db/compliance/migrations/0001_compliance_schema_down.sql
-
-      - name: migrations down — vector (0002, 0001)
         run: |
-          for f in 0002_vector_rls 0001_vector_schema; do
-            echo "  down: vector/${f}"
-            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "db/vector/migrations/${f}_down.sql"
+          dir="db/compliance/migrations"
+          files=$(ls "$dir"/*_down.sql 2>/dev/null | LC_ALL=C sort -r)
+          if [ -z "$files" ]; then
+            echo "ERRO: nenhuma migration *_down.sql encontrada em $dir (schema vazio ou mal formado)." >&2
+            exit 1
+          fi
+          for f in $files; do
+            echo "  down: compliance/$(basename "$f" _down.sql)"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
           done
 
-      - name: migrations down — ledger (0004, 0003, 0002, 0001)
+      - name: migrations down — vector
         run: |
-          # ordem inversa do _up: 0004 (imutabilidade) reverte PRIMEIRO.
-          for f in 0004_ledger_postings_immutable 0003_ledger_rls 0002_reconciliation_exceptions 0001_ledger_schema; do
-            echo "  down: ledger/${f}"
-            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "db/ledger/migrations/${f}_down.sql"
+          dir="db/vector/migrations"
+          files=$(ls "$dir"/*_down.sql 2>/dev/null | LC_ALL=C sort -r)
+          if [ -z "$files" ]; then
+            echo "ERRO: nenhuma migration *_down.sql encontrada em $dir (schema vazio ou mal formado)." >&2
+            exit 1
+          fi
+          for f in $files; do
+            echo "  down: vector/$(basename "$f" _down.sql)"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
           done
 
-      - name: migrations down — config (0003, 0002, 0001)
+      - name: migrations down — ledger
         run: |
-          for f in 0003_campaign_zones_rls 0002_config_rls 0001_config_schema; do
-            echo "  down: config/${f}"
-            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "db/config/migrations/${f}_down.sql"
+          # Ordem inversa do _up derivada do diretório (sort -r): a
+          # migration mais recente (ex.: imutabilidade) reverte PRIMEIRO.
+          dir="db/ledger/migrations"
+          files=$(ls "$dir"/*_down.sql 2>/dev/null | LC_ALL=C sort -r)
+          if [ -z "$files" ]; then
+            echo "ERRO: nenhuma migration *_down.sql encontrada em $dir (schema vazio ou mal formado)." >&2
+            exit 1
+          fi
+          for f in $files; do
+            echo "  down: ledger/$(basename "$f" _down.sql)"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
+          done
+
+      - name: migrations down — config
+        run: |
+          dir="db/config/migrations"
+          files=$(ls "$dir"/*_down.sql 2>/dev/null | LC_ALL=C sort -r)
+          if [ -z "$files" ]; then
+            echo "ERRO: nenhuma migration *_down.sql encontrada em $dir (schema vazio ou mal formado)." >&2
+            exit 1
+          fi
+          for f in $files; do
+            echo "  down: config/$(basename "$f" _down.sql)"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
           done
 
       - name: migrations down — asset_registry
-        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f db/asset_registry/migrations/0001_asset_registry_down.sql
+        run: |
+          dir="db/asset_registry/migrations"
+          files=$(ls "$dir"/*_down.sql 2>/dev/null | LC_ALL=C sort -r)
+          if [ -z "$files" ]; then
+            echo "ERRO: nenhuma migration *_down.sql encontrada em $dir (schema vazio ou mal formado)." >&2
+            exit 1
+          fi
+          for f in $files; do
+            echo "  down: asset_registry/$(basename "$f" _down.sql)"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
+          done
 
       - name: confirmar schema vazio apos reversao
         run: |

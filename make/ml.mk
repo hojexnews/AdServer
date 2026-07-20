@@ -78,5 +78,27 @@ ml-deep-test:
 	PYTHONPATH=. $(PYTEST_ML) ml/deep/test_deep.py -v
 	@echo "ml-deep-test: OK"
 
+## ranker-onnx-fixtures: gera ml/registry/artifacts/{pctr_model.onnx,
+## calibration_map.json} (booster sintetico, seed fixo — determinismo provado
+## em services/ranker-sidecar/scripts/gen_calibration_fixtures.py) para os
+## testes de paridade `-tags onnx` do sidecar Go:
+##   - internal/onnx/onnx_parity_test.go (TestOnnxScoreParity)
+##   - internal/wiring/calibration_parity_test.go (TestCalibratedServingParity
+##     — HIGH "calibration-never-applied-in-serving": prova que
+##     wiring.BuildInferencer chama calibration.Wrap na wiring real de
+##     producao, nao uma reimplementacao)
+## NAO reescreve os goldens JSON commitados (testdata/*_golden.json) — isso e
+## o modo manual `--write-golden` do script, fora deste alvo (o script freia
+## sozinho se o gap raw-vs-calibrado ficar fraco demais para discriminar).
+## Usa ml/.venv se existir (dev local); senao cai para python3 do PATH (CI —
+## mesmo padrao de make/data.mk).
+ranker-onnx-fixtures:
+	@if [ -x ml/.venv/bin/python ]; then \
+		PYTHONPATH=. ml/.venv/bin/python services/ranker-sidecar/scripts/gen_calibration_fixtures.py; \
+	else \
+		PYTHONPATH=. python3 services/ranker-sidecar/scripts/gen_calibration_fixtures.py; \
+	fi
+
 .PHONY: ml-ope-test ml-features-test ml-training-test ml-calibration-test \
-        ml-promote-test ml-j4-test ml-test-fast ml-test ml-deep-test
+        ml-promote-test ml-j4-test ml-test-fast ml-test ml-deep-test \
+        ranker-onnx-fixtures

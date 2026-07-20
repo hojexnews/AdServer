@@ -462,6 +462,31 @@ def make_hitl_approval_node():
     return hitl_approval_node
 
 
+# Achado remediação copilot-honestidade #2 (30ª onda): allowlist ESTREITA e
+# EXPLÍCITA de `entity_type` para os quais um WriteDiff sem
+# `validation_result` é um caminho LEGÍTIMO — não um buraco fail-open geral.
+#
+# Critério: a entidade não carrega conteúdo de criativo (C2PA/SynthID/
+# disclosure/PII — EU AI Act Art. 50, ver `validate_creative`) nem regras de
+# entrega sujeitas a anti-contradição (§4.6/CA-4, ver `validate_segmentation`).
+#   - "campaign": metadados de campanha (nome/orçamento/datas) — sem asset.
+#   - "cap": limite numérico de frequência/orçamento — sem texto publicável.
+#   - "campaign_zone": vínculo campanha↔zona (só IDs) — sem texto publicável.
+#
+# "banner" (contém asset_url/dest_url/creative_type — é o próprio criativo)
+# e "delivery_rule" (regras §4.6) NÃO estão aqui: um WriteDiff desses tipos
+# sem validation_result é bloqueado (fail-closed), nunca silenciosamente
+# aplicado. Isto é intencional — hoje `create_banner_draft` ainda não invoca
+# `validate_creative` (dispatch pendente de G1); até que invoque, escritas de
+# banner via copiloto ficam corretamente bloqueadas em vez de vazar o gate de
+# proveniência.
+_ENTITY_TYPES_EXEMPT_FROM_VALIDATION_GATE: frozenset[str] = frozenset({
+    "campaign",
+    "cap",
+    "campaign_zone",
+})
+
+
 def make_apply_write_node(gateway: ToolGateway):
     """
     Nó que aplica o WriteDiff APROVADO pelo humano.
@@ -481,6 +506,19 @@ def make_apply_write_node(gateway: ToolGateway):
       humano tenha clicado em aprovar no HITL (a UI deve impedir aprovação de
       diffs reprovados, mas o backend não pode confiar só nisso: fail-closed
       em profundidade). Nenhuma exceção — retorna next_action='error'.
+
+    SEGURANÇA (Achado remediação copilot-honestidade #2, 30ª onda —
+    FAIL-CLOSED quando validation_result é None):
+      Um WriteDiff SEM validation_result (None) só é aplicado se
+      diff.entity_type estiver na allowlist estreita e explícita
+      `_ENTITY_TYPES_EXEMPT_FROM_VALIDATION_GATE` (entidades que
+      estruturalmente não carregam criativo nem regra de entrega). Para
+      qualquer outro entity_type (ex.: "banner"), a AUSÊNCIA de
+      validation_result é tratada como reprovação — o gate de conformidade
+      do EU AI Act Art. 50 (vigor 02/08/2026) não pode ser contornado por
+      omissão. Antes desta remediação, validation_result=None pulava o gate
+      inteiro para QUALQUER entity_type — um WriteDiff de banner sem
+      validação alguma persistia sem checagem nenhuma.
     """
 
     async def apply_write_node(state: CopilotState) -> dict[str, Any]:
@@ -512,7 +550,29 @@ def make_apply_write_node(gateway: ToolGateway):
         # validation_result reprovou (gate_passed=False e/ou is_valid=False)
         # NUNCA chega a gateway.apply_write, independentemente de hitl_approved.
         validation = diff.validation_result
-        if validation is not None:
+        if validation is None:
+            # Achado remediação copilot-honestidade #2: FAIL-CLOSED por padrão.
+            # Só é legítimo pular o gate se entity_type estiver na allowlist
+            # estreita e explícita (entidades sem criativo/regra de entrega).
+            if diff.entity_type not in _ENTITY_TYPES_EXEMPT_FROM_VALIDATION_GATE:
+                log.error(
+                    "apply_write_node.validation_result_missing",
+                    tenant_id=tenant_id,
+                    operation=diff.operation,
+                    entity_type=diff.entity_type,
+                )
+                return {
+                    "next_action": "error",
+                    "error_message": (
+                        "Escrita bloqueada: nenhum resultado de validação de "
+                        "proveniência (C2PA/SynthID/PII) ou anti-contradição "
+                        "(§4.6/CA-4) foi anexado a este diff. Gere um novo "
+                        "draft com validação antes de aplicar."
+                    ),
+                    "pending_diff": None,
+                    "hitl_approved": None,
+                }
+        else:
             gate_passed = validation.get("gate_passed", True)
             is_valid = validation.get("is_valid", True)
             if gate_passed is False or is_valid is False:
@@ -550,9 +610,14 @@ def make_apply_write_node(gateway: ToolGateway):
             result = await gateway.apply_write(tenant_id, diff)
             # C1/L2: não incluir tenant_id no resultado retornado ao LLM
             safe_result = {k: v for k, v in result.items() if k != "tenant_id"}
+            # Achado remediação copilot-honestidade #3 (30ª onda): o status
+            # relatado ao LLM/humano é o que gateway.apply_write REALMENTE
+            # retornou (ex.: "pending_dispatch" enquanto o dispatch por
+            # operação não existir) — nunca um "applied" hardcoded que
+            # afirmaria uma persistência que pode não ter ocorrido.
             tool_msg = ToolMessage(
                 content=json.dumps({
-                    "status": "applied",
+                    "status": safe_result.get("status", "unknown"),
                     "operation": diff.operation,
                     "result": safe_result,
                 }, ensure_ascii=False),

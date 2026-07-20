@@ -351,6 +351,17 @@ export const CreateDeliveryRuleInputSchema = z.object({
   logicalOp: LogicalOpSchema.default("AND"),
   ruleSetId: IdSchema.nullable().default(null),
   orderSeq: z.number().int().min(0).default(0),
+  /**
+   * CA-4 backstop (wave 30, achado contradiction-vector-allowlist-gap): o
+   * router deliveryRule.create roda detectContradictions() server-side
+   * (bff/src/lib/contradiction.ts) contra as regras AND já existentes do
+   * mesmo owner. Se houver conflito e este flag for false (padrão), a
+   * mutação é rejeitada com TRPCError CONFLICT — espelha o botão "Salvar
+   * mesmo assim (ciente do risco)" do builder (app/rules/page.tsx): o
+   * usuário só persiste uma regra mutuamente exclusiva depois de ver o
+   * alerta e confirmar explicitamente.
+   */
+  acknowledgeContradiction: z.boolean().default(false),
 });
 
 export const UpdateDeliveryRuleInputSchema = z.object({
@@ -361,6 +372,15 @@ export const UpdateDeliveryRuleInputSchema = z.object({
   logicalOp: LogicalOpSchema.optional(),
   orderSeq: z.number().int().min(0).optional(),
   active: z.boolean().optional(),
+  /**
+   * CA-4 backstop (wave 30 remediação: o backstop original só cobria
+   * deliveryRule.create — deliveryRule.update podia levar um owner a um
+   * estado contraditório sem checagem alguma). Mesma semântica do campo
+   * homônimo em CreateDeliveryRuleInputSchema: default false; a mutação só
+   * persiste um estado AND mutuamente exclusivo se o cliente confirmar
+   * explicitamente.
+   */
+  acknowledgeContradiction: z.boolean().default(false),
 });
 
 export type DeliveryRule = z.infer<typeof DeliveryRuleSchema>;

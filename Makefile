@@ -84,9 +84,27 @@ proto-gen-check:
 	fi; \
 	echo "OK — gen/ esta em sync com proto/."
 
-## no-float: roda os guards anti-float (TX-2) se os scripts existirem
+# Numero de guards scripts/ci/no-float-*.sh esperados (TX-2). Atualize este
+# numero SEMPRE que adicionar/remover um guard. Existe como SENTINELA
+# anti-skip (achado make-no-float-sem-sentinela-de-contagem, 30a onda): sem
+# ela, um glob que nao casa nada (script renomeado/movido, sparse-checkout,
+# checkout parcial) deixa o loop vazio, 'failed' fica 0 e o alvo sai 0 —
+# "verde silencioso" que engana `verify` e o go-live-runbook.
+NO_FLOAT_SCRIPTS_EXPECTED := 6
+
+## no-float: roda os guards anti-float (TX-2); FALHA se descobrir menos que
+## NO_FLOAT_SCRIPTS_EXPECTED scripts (sentinela anti-skip, nao so "se existirem")
 no-float:
-	@failed=0; for s in scripts/ci/no-float-*.sh; do [ -f "$$s" ] && { echo "== $$s"; bash "$$s" || failed=1; }; done; exit $$failed
+	@scripts=(scripts/ci/no-float-*.sh); \
+	count=0; \
+	for s in "$${scripts[@]}"; do [ -f "$$s" ] && count=$$((count + 1)); done; \
+	if [ "$$count" -lt $(NO_FLOAT_SCRIPTS_EXPECTED) ]; then \
+	  echo "FAIL — esperava >= $(NO_FLOAT_SCRIPTS_EXPECTED) guards em scripts/ci/no-float-*.sh, encontrei $$count. O glob nao casou algum script (renomeado, movido, sparse-checkout?). Restaure o script ou ajuste NO_FLOAT_SCRIPTS_EXPECTED no Makefile de proposito." >&2; \
+	  exit 1; \
+	fi; \
+	failed=0; \
+	for s in "$${scripts[@]}"; do [ -f "$$s" ] && { echo "== $$s"; bash "$$s" || failed=1; }; done; \
+	exit $$failed
 
 ## verify: lint + format-check + build + breaking + no-float (espelha a CI)
 verify: proto-lint proto-format-check proto-build proto-breaking no-float
