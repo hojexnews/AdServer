@@ -103,7 +103,12 @@ psql "$PGURL" -f db/vector/migrations/0001_vector_schema_up.sql
 psql "$PGURL" -f db/vector/migrations/0002_vector_rls_up.sql
 ```
 
-Aplicar em ordem (0001 -> 0002).
+Aplicar em ordem (0001 -> 0002). `db/seed/dev_roles.sql` depende deste schema
+existir ANTES de rodar (faz `GRANT ... ON SCHEMA vector_store TO
+adserver_copilot`) — tanto `make dev-db-setup` (`make/dev.mk`) quanto o gate de
+CI (`.github/workflows/db.yml`) aplicam 0001/0002 antes de chamar
+`dev_roles.sql` (achado HIGH / bundle F: `make dev-db-setup` costumava pular
+o schema vector e abortar no GRANT).
 
 ### 2.5 Schema `compliance` (instancia separada — celula AML/KYC)
 
@@ -177,7 +182,8 @@ nunca estaticas. Cada celula tem seu proprio role Postgres com privilegios minim
 | Celula | Role Postgres | Permissoes |
 |--------|--------------|-----------|
 | delivery | `adserver_app` | SELECT/INSERT/UPDATE em schemas config, asset_registry (via RLS) |
-| ml | `adserver_ml` | SELECT em asset_registry; INSERT em vector (RLS) |
+| ml (pipeline batch de embeddings) | `adserver_ml` | SELECT em asset_registry; INSERT em vector (RLS). **Nao materializado em nenhuma migration/seed** — role futuro do pipeline batch (J2/J6) que escreve `vector_store.creative_embeddings`; distinto do role do copiloto abaixo (que so LE). Fora do escopo deste bundle (achado #7 e so sobre o DSN do copiloto). |
+| copiloto (RAG, servico `services/copilot`) | `adserver_copilot` | SELECT-only em `vector_store.{creative_embeddings,help_doc_embeddings}` (RLS); **NOBYPASSRLS explicito** (`db/seed/dev_roles.sql`) — as queries pgvector do RAG (`services/copilot/tools/gateway.py`) dependem 100% do RLS para isolar tenant; usar `adserver_loader` (BYPASSRLS) aqui seria um buraco de isolamento cross-tenant (achado #7, auditoria bundle F). |
 | pci | `adserver_pci` | SELECT/INSERT em `ledger.postings` (**nunca UPDATE/DELETE** — append-only, §2.3.1); SELECT/INSERT/UPDATE nas demais tabelas de ledger (RLS); BYPASSRLS para `adserver_loader` |
 | aml-kyc | `adserver_compliance` | SELECT/INSERT/UPDATE em compliance (RLS); sem acesso a ledger de outros tenants |
 
@@ -344,6 +350,15 @@ Confirma:
 - [ ] Kyverno PCI proibe volumes hostPath e imagens sem digest na celula pci.
 - [ ] Kyverno AML/KYC proibe acesso a secret de outra celula e imagens sem digest.
 - [ ] OpenBao: nenhuma credencial estatica em imagem ou git.
+- [ ] `DATABASE_URL` do copiloto (`services/copilot`) provisionado via OpenBao com o
+      role `adserver_copilot` (`db/seed/dev_roles.sql`) — **NOBYPASSRLS explicito**,
+      SELECT-only em `vector_store.{creative_embeddings,help_doc_embeddings}`.
+      NUNCA usar `adserver_loader` (BYPASSRLS) neste DSN: as queries pgvector do RAG
+      (`services/copilot/tools/gateway.py`) dependem 100% do RLS por tenant_id (TX-3)
+      para isolar os embeddings de um tenant dos demais — um role BYPASSRLS aqui
+      apagaria esse isolamento sem que nenhum erro apareca em teste funcional
+      (achado #7, auditoria bundle F; prova de mutacao em
+      `db/vector/tests/vector_rls_isolation_test.sql` BLOCO 8).
 - [ ] cosign + Trivy + Falco ativos no cluster antes de redirecionar trafego.
 - [ ] SHA256 dos binarios de CI verificados (kubeconform, kyverno, tofu — M-1 fechado).
 

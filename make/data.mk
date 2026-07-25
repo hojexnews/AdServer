@@ -16,7 +16,12 @@ RP_DIR           := $(DATA_DIR)/redpanda
 
 .PHONY: data-lint data-no-float data-sql-check data-yaml-check data-py-syntax \
         data-validate data-schema-invariants data-ivt-test data-ivt-sql-check \
-        data-billing-test data-help
+        data-billing-test data-integration-test data-help
+
+# Host/porta do ClickHouse usado por data-integration-test. Sobrescrevivel
+# via ambiente (CH_HOST=... CH_PORT=... make data-integration-test).
+CH_HOST ?= localhost
+CH_PORT ?= 9000
 
 ## data-lint: valida DDL SQL, specs YAML e jobs Python de data/ (sem subir ClickHouse)
 data-lint: data-no-float data-sql-check data-yaml-check data-py-syntax
@@ -79,6 +84,44 @@ data-schema-invariants:
 data-billing-test:
 	@echo "== data-billing-test (CPM floor, BILLING.md 4.1 / sweep MONEY-01) =="
 	@python3 data/iceberg/jobs/test_billing_batch_hourly.py
+
+## data-integration-test: aplica as migrations do ClickHouse e roda o teste de
+##   isolamento cross-tenant (TX-3, data/clickhouse/tests/tenant_isolation_test.sql)
+##   statement-a-statement, com asserções reais (nao so ausencia de erro SQL),
+##   contra um ClickHouse REAL. Fecha o achado #10 (31a onda): o arquivo .sql
+##   existia mas nenhum alvo make/workflow o executava.
+##   NAO tem modo skip/stub: falha em voz alta (exit 1) se clickhouse-client
+##   nao estiver no PATH, se nao houver ClickHouse acessivel em
+##   CH_HOST:CH_PORT (default localhost:9000), ou se qualquer migration ou
+##   asserção falhar. Ao contrario de db-test-all (make/db.mk), este alvo NAO
+##   sobe container nenhum sozinho -- espera um ClickHouse ja rodando (dev
+##   local, ou o job data-integration-test de .github/workflows/data.yml, que
+##   sobe um ClickHouse efemero via `docker run` + data/clickhouse/ci/single_node_cluster.xml).
+data-integration-test:
+	@echo "== data-integration-test: isolamento cross-tenant (TX-3) contra ClickHouse real =="
+	@if ! command -v clickhouse-client >/dev/null 2>&1; then \
+	  echo "ERRO: clickhouse-client nao encontrado no PATH. data-integration-test requer um cliente ClickHouse real (sem modo skip/stub)."; \
+	  exit 1; \
+	fi
+	@if ! clickhouse-client --host $(CH_HOST) --port $(CH_PORT) --query "SELECT 1" >/dev/null 2>&1; then \
+	  echo "ERRO: nao foi possivel conectar a um ClickHouse em $(CH_HOST):$(CH_PORT)."; \
+	  echo "  data-integration-test NAO pula em silencio -- suba um ClickHouse real"; \
+	  echo "  (ex.: docker run --rm -p 9000:9000 -v \$$(pwd)/data/clickhouse/ci/single_node_cluster.xml:/etc/clickhouse-server/config.d/single_node_cluster.xml clickhouse/clickhouse-server)"; \
+	  echo "  ou exporte CH_HOST/CH_PORT apontando para uma instancia acessivel."; \
+	  exit 1; \
+	fi
+	@echo "-- aplicando migrations (lista derivada do diretorio, ordem lexicografica) --"
+	@files=$$(ls $(CH_DDL_DIR)/*.sql 2>/dev/null | LC_ALL=C sort); \
+	 if [ -z "$$files" ]; then \
+	   echo "ERRO: nenhuma migration *.sql encontrada em $(CH_DDL_DIR) -- sentinela anti-vazio."; \
+	   exit 1; \
+	 fi; \
+	 for f in $$files; do \
+	   echo "  aplicando: $$(basename $$f)"; \
+	   clickhouse-client --host $(CH_HOST) --port $(CH_PORT) --multiquery < "$$f" || { echo "ERRO: migration $$f falhou ao aplicar."; exit 1; }; \
+	 done
+	@echo "-- rodando data/clickhouse/tests/tenant_isolation_test.sql (statement-a-statement, com asserções) --"
+	@CH_HOST=$(CH_HOST) CH_PORT=$(CH_PORT) python3 scripts/ci/data-integration-test.py
 
 ## data-help: lista os alvos de data/
 data-help:

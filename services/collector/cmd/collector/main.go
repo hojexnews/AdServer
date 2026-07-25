@@ -67,6 +67,7 @@ import (
 	commonv1 "github.com/hojex/adserver/gen/go/adserver/common/v1"
 	"github.com/hojex/adserver/internal/clicktoken"
 	"github.com/hojex/adserver/internal/geo"
+	"github.com/hojex/adserver/internal/referer"
 	"github.com/hojex/adserver/internal/telemetry"
 	"github.com/hojex/adserver/internal/telemetry/blank"
 	"github.com/hojex/adserver/internal/useragent"
@@ -186,7 +187,7 @@ func (h *collectorHandler) handleAsyncJS(w http.ResponseWriter, r *http.Request)
 
 	// PRIVACY: sanitize referer — strip query string and fragment to avoid
 	// leaking session tokens or identifiers embedded in URLs.
-	refererURL := sanitizeReferer(r.Referer())
+	refererURL := referer.Sanitize(r.Referer())
 
 	// Record the ad-request event (top-of-funnel).
 	// IP is already discarded above; derivedGeo carries only country+city.
@@ -285,6 +286,17 @@ func (h *collectorHandler) handleAsyncJS(w http.ResponseWriter, r *http.Request)
 //	so the collector can forward it to EmitImpression/EmitClick.  This closes
 //	the loop: every downstream event carries the ranker version that produced
 //	the decision, enabling OPE attribution by model_version in J4.
+//
+// # Privacy (TX-5/DA-11, PRIV-01)
+//
+// site_url is built from location.origin + location.pathname — NOT the full
+// location.href. The query string and fragment are stripped IN THE BROWSER,
+// before anything leaves the page, so that session tokens, UTM parameters,
+// or other identifiers embedded in the URL never travel over the network at
+// all. This is redundant with (belt-and-suspenders for) the server-side
+// sanitization the decision service also applies to whatever site_url it
+// receives (internal/referer.Sanitize) — this endpoint is called directly by
+// the ad tag, so decision cannot assume the client already sanitized it.
 func buildAdTagJS(decisionBase, lgBase, zoneID, tenantID, cachebuster, decisionID string) string {
 	return fmt.Sprintf(`(async function(){
   "use strict";
@@ -295,7 +307,7 @@ func buildAdTagJS(decisionBase, lgBase, zoneID, tenantID, cachebuster, decisionI
       body: JSON.stringify({
         zone_id:   %q,
         user_agent: navigator.userAgent,
-        site_url:   location.href
+        site_url:   location.origin + location.pathname
       })
     });
     if (!resp.ok) return;
@@ -1014,39 +1026,6 @@ func (h *collectorHandler) extractClientIP(r *http.Request) string {
 		return r.RemoteAddr
 	}
 	return host
-}
-
-// sanitizeReferer strips the query string and fragment from a referer URL,
-// retaining only scheme + host + path.
-//
-// PRIVACY: query strings and fragments frequently carry session tokens,
-// user identifiers, UTM parameters, and other identifying information.
-// We retain only the structural page location (scheme + host + path).
-//
-// If the URL cannot be parsed, does not have an absolute scheme (http/https),
-// or has no host, the empty string is returned — emit nothing rather than
-// risk leaking a token buried in a malformed value.
-func sanitizeReferer(raw string) string {
-	if raw == "" {
-		return ""
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return ""
-	}
-	// Require an absolute URL with a recognised scheme and a non-empty host.
-	// Relative URLs, opaque URIs, and anything without http/https are discarded.
-	scheme := strings.ToLower(u.Scheme)
-	if (scheme != "http" && scheme != "https") || u.Host == "" {
-		return ""
-	}
-	// Reconstruct with only scheme + host + path (no query, no fragment).
-	clean := &url.URL{
-		Scheme: u.Scheme,
-		Host:   u.Host,
-		Path:   u.Path,
-	}
-	return clean.String()
 }
 
 // ---------------------------------------------------------------------------

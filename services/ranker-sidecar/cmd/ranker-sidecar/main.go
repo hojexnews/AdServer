@@ -20,6 +20,14 @@
 //	                     In stub mode, use "stub-j1" (or leave empty for "stub-j1").
 //	                     Default: "stub-j1"
 //
+//	RANKER_HEALTHZ_ADDR  HTTP listen address for GET /healthz (observability only —
+//	                     NOT the scoring hot path, which stays the Unix socket above).
+//	                     Reports whether isotonic calibration is actually being
+//	                     applied (see wiring.Status / Mandato #3 "Calibracao isotonica
+//	                     monitorada"): {"calibrated": true|false, "calibration_reason": ...}.
+//	                     A bind failure here (e.g. port in use) logs an error and does
+//	                     NOT stop the sidecar from serving scores. Default: ":9102"
+//
 //	RANKER_CALIBRATION_PATH  Path to the isotonic calibration_map.json artefact
 //	                     (ml/calibration/calibrate.py:save_calibration_map, versioned
 //	                     in the MLflow registry alongside the .onnx model). Applied as
@@ -111,10 +119,13 @@
 package main
 
 import (
+	"context"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/hojex/adserver/services/ranker-sidecar/internal/stub"
 	"github.com/hojex/adserver/services/ranker-sidecar/internal/wiring"
@@ -180,7 +191,7 @@ func main() {
 				"Set DEEP_ENABLED=true only after K8 uplift A/B proof.")
 	}
 
-	inf := wiring.BuildInferencer(wiring.Config{
+	inf, calStatus := wiring.BuildInferencer(wiring.Config{
 		ModelPath:       modelPath,
 		ModelVersion:    modelVersion,
 		CalibrationPath: os.Getenv("RANKER_CALIBRATION_PATH"),
@@ -196,6 +207,30 @@ func main() {
 
 	srv := stub.NewServer(socketPath, inf, logger)
 
+	// Observability endpoint (Mandato #3 — "Calibracao isotonica
+	// monitorada"): GET /healthz exposes calStatus, captured once here at
+	// startup, so a bad/missing calibration_map.json is no longer visible
+	// ONLY as the slog.Warn line wiring.BuildInferencer already emitted —
+	// see healthz.go. A bind failure here is logged and non-fatal: the
+	// scoring Unix socket below is the only thing that gates the hot path.
+	healthzAddr := envOr("RANKER_HEALTHZ_ADDR", ":9102")
+	healthzSrv := &http.Server{
+		Addr:              healthzAddr,
+		Handler:           newHealthzHandler(modelVersion, calStatus),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		logger.Info("ranker-sidecar: /healthz listening",
+			"addr", healthzAddr,
+			"calibrated", calStatus.Calibrated,
+			"calibration_reason", calStatus.Reason)
+		if err := healthzSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("ranker-sidecar: /healthz server error (non-fatal — scoring socket unaffected)",
+				"addr", healthzAddr,
+				"err", err)
+		}
+	}()
+
 	// Signal handling: SIGINT/SIGTERM → graceful shutdown.
 	stopCh := make(chan struct{})
 	sigCh := make(chan os.Signal, 1)
@@ -204,6 +239,9 @@ func main() {
 	go func() {
 		sig := <-sigCh
 		logger.Info("ranker-sidecar: shutdown signal received", "signal", sig.String())
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = healthzSrv.Shutdown(shutdownCtx) //nolint:errcheck // best-effort
 		close(stopCh)
 	}()
 

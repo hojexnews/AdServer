@@ -33,8 +33,10 @@ FERRAMENTAS DISPONÍVEIS:
 
 from __future__ import annotations
 
+import hashlib
 import httpx
 import structlog
+from pydantic import BaseModel
 from typing import Any, get_args
 
 from tools.schemas import (
@@ -543,7 +545,11 @@ class ToolGateway:
         Cria draft de campanha. NÃO persiste — retorna WriteDiff para HITL.
         A persistência acontece em apply_campaign_write() APÓS aprovação humana.
         """
-        log.info("create_campaign_draft", tenant_id=tenant_id, name=inp.name)
+        log.info(
+            "create_campaign_draft",
+            tenant_id=tenant_id,
+            **_safe_log_free_text_kwargs(inp.name, key="name"),
+        )
         after = inp.model_dump()
         after["tenant_id"] = tenant_id  # injetado server-side
         return WriteDiff(
@@ -580,7 +586,11 @@ class ToolGateway:
         tenant_id: str,
         inp: CreateBannerDraftInput,
     ) -> WriteDiff:
-        log.info("create_banner_draft", tenant_id=tenant_id, name=inp.name)
+        log.info(
+            "create_banner_draft",
+            tenant_id=tenant_id,
+            **_safe_log_free_text_kwargs(inp.name, key="name"),
+        )
         after = inp.model_dump()
         after["tenant_id"] = tenant_id
         return WriteDiff(
@@ -930,6 +940,47 @@ def _stub_verify_disclosure_metadata(asset_url: str | None) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Achado PRIV-06 remediação (32ª onda) — PII EM LOG: campos de texto livre
+# PUBLICÁVEL (ex.: `name` de campanha/banner, fornecido pelo anunciante via
+# LLM) nunca podem ser logados verbatim em `structlog`. Antes desta
+# remediação, `create_campaign_draft` e `create_banner_draft` logavam
+# `name=inp.name` cru — a MESMA forma do defeito nas duas entidades (achado
+# pré-existente, exposto pelo fix PRIV-03 desta onda: o próprio campo `name`
+# agora É escaneado por PII em `_run_creative_validation`, o que tornou
+# visível que o valor cru continuava indo para o log de qualquer forma,
+# independente do resultado do scan).
+#
+# Por que não "logar só depois do scan aprovar": o scan de
+# `_detect_pii_in_html` é heurístico (regex para CPF/email/IPv4/telefone/
+# cartão) — não exaustivo. Uma aprovação do scan não é garantia de ausência
+# de PII (ex.: nome completo sem CPF/e-mail associado não é pego pelos
+# padrões atuais). Logar verbatim "só quando aprovado" ainda vazaria esses
+# falsos-negativos. A correção estrutural é nunca logar o texto livre em si:
+# `_safe_log_free_text_kwargs` substitui o valor por comprimento + prefixo
+# de hash SHA-256 — suficiente para correlacionar linhas de log do MESMO
+# texto (ex.: dedução/depuração) sem jamais expor o conteúdo.
+#
+# Padrão único reutilizável (corrige a FORMA, não uma instância isolada) —
+# usado por TODAS as entidades de draft com campo de texto livre publicável
+# logado (`create_campaign_draft`/`create_banner_draft`, abaixo).
+# ---------------------------------------------------------------------------
+
+def _safe_log_free_text_kwargs(text: str | None, *, key: str) -> dict[str, Any]:
+    """
+    Kwargs seguros para `log.info(...)` a partir de um campo de texto livre
+    publicável: NUNCA inclui o texto em si, só `{key}_len` e um prefixo de
+    hash SHA-256 (`{key}_sha256_12`, 12 hex chars — suficiente para
+    correlação, não reversível para o texto original).
+    """
+    if not text:
+        return {f"{key}_len": 0, f"{key}_sha256_12": None}
+    return {
+        f"{key}_len": len(text),
+        f"{key}_sha256_12": hashlib.sha256(text.encode("utf-8")).hexdigest()[:12],
+    }
+
+
 def _detect_pii_in_html(text: str) -> bool:
     """
     Detecção leve de PII em texto/HTML (TX-5/DA-11).
@@ -951,16 +1002,27 @@ def _detect_pii_in_html(text: str) -> bool:
 
 # ---------------------------------------------------------------------------
 # PII scan — DEFAULT-DENY sobre campos de texto livre (Achado remediação
-# copilot-honestidade #1, 30ª onda).
+# copilot-honestidade #1, 30ª onda; generalizado para BaseModel arbitrário no
+# Achado PRIV-03 / #5, 31ª onda).
 #
-# Fonte única da verdade: o schema Pydantic `ValidateCreativeInput`. Todo
-# campo `str` ou `str | None` é escaneado por PII por padrão — um campo novo
-# adicionado ao schema (ex.: `alt_text`, `caption`) entra automaticamente na
-# varredura sem exigir edição nesta função. A única forma de tirar um campo
-# da varredura é listá-lo em `_PII_SCAN_EXCLUDED_FIELDS` com uma justificativa
+# `_publishable_text_fields` NÃO está mais amarrado a `ValidateCreativeInput`:
+# aceita qualquer `pydantic.BaseModel` e deriva por introspeção (`model_fields`)
+# todo campo `str`/`str | None` a escanear. Isto é o que permite reutilizá-la
+# tanto sobre o schema-espelho `ValidateCreativeInput` (dentro de
+# `validate_creative`, abaixo) quanto sobre o PAYLOAD DE ESCRITA real
+# (`CreateBannerDraftInput`/`UpdateBannerDraftInput` em
+# `graph/nodes.py::_run_creative_validation`) — o nome/texto do banner
+# (`name`) é publicável, persistido e logado verbatim, mas nunca existiu em
+# `ValidateCreativeInput`; escaneá-lo exige rodar a introspecção sobre o
+# schema de escrita, não sobre o schema-espelho de validação. Um campo novo
+# adicionado a QUALQUER um desses schemas entra automaticamente na varredura
+# sem exigir edição nesta função. A única forma de tirar um campo da
+# varredura é listá-lo em `_PII_SCAN_EXCLUDED_FIELDS` com uma justificativa
 # de por que ele NÃO é publicado — nunca via uma lista manual dos campos que
-# DEVEM ser escaneados (essa era a forma do defeito: allowlist positiva
-# enumerada de 3 nomes que silenciosamente ignorava qualquer campo novo).
+# DEVEM ser escaneados (essa era a forma do defeito original: allowlist
+# positiva enumerada de 3 nomes que silenciosamente ignorava qualquer campo
+# novo — e depois, forma repetida em escopo menor: escanear só o
+# schema-espelho em vez do payload de escrita real).
 # ---------------------------------------------------------------------------
 
 _PII_SCAN_EXCLUDED_FIELDS: dict[str, str] = {
@@ -980,12 +1042,18 @@ def _is_free_text_pydantic_annotation(annotation: Any) -> bool:
     return str in get_args(annotation)
 
 
-def _publishable_text_fields(inp: ValidateCreativeInput) -> list[tuple[str, str | None]]:
+def _publishable_text_fields(inp: BaseModel) -> list[tuple[str, str | None]]:
     """
     Deriva por introspecção do modelo Pydantic — não de uma lista mantida à
     mão — todos os campos de texto livre publicáveis de `inp` a escanear por
     PII. DEFAULT-DENY: inclui todo campo `str`/`str | None` do schema, exceto
     os explicitamente justificados em `_PII_SCAN_EXCLUDED_FIELDS`.
+
+    Genérica em `BaseModel`: funciona sobre QUALQUER schema Pydantic passado
+    — `ValidateCreativeInput` (schema-espelho) ou o próprio payload de
+    escrita (`CreateBannerDraftInput`/`UpdateBannerDraftInput`) — para que um
+    campo de texto livre publicável não fique invisível à varredura só por
+    existir no schema errado.
     """
     fields: list[tuple[str, str | None]] = []
     for field_name, field_info in type(inp).model_fields.items():

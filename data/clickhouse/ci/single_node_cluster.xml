@@ -1,0 +1,49 @@
+<!--
+  data/clickhouse/ci/single_node_cluster.xml
+
+  Config de servidor ClickHouse SOMENTE para o ClickHouse efemero usado por
+  `make data-integration-test` / .github/workflows/data.yml (achado #10,
+  31a onda). NAO e topologia de producao — producao usa a topologia real
+  do cluster provisionada pela plataforma (fora do escopo deste bundle).
+
+  POR QUE ISTO EXISTE:
+    Toda migration em data/clickhouse/migrations/*.sql usa
+    `ON CLUSTER '{cluster}'` (necessario em producao para propagar DDL a
+    todos os nos do cluster real). A macro `{cluster}` so resolve se o
+    servidor ClickHouse tiver, no seu proprio config, uma entrada
+    <macros><cluster>...</cluster></macros> E um <remote_servers> com um
+    cluster de mesmo nome. Um `clickhouse-server` "de fabrica" (imagem
+    oficial sem este arquivo) nao tem nenhum dos dois: toda migration
+    falharia com "There was no macro 'cluster' defined" antes de qualquer
+    tabela ser criada, e o teste de isolamento de tenant (que depende das
+    tabelas existirem) nunca chegaria a rodar.
+
+  O QUE ESTE ARQUIVO DECLARA:
+    Um cluster de UM SO no (o proprio processo, localhost:9000), sem
+    replicacao (nenhuma migration usa engine Replicated*, entao nao ha
+    dependencia de ClickHouse Keeper/ZooKeeper aqui). E suficiente para
+    `ON CLUSTER` executar a DDL localmente e nada mais; nao modela
+    sharding/replicacao real.
+
+  COMO E USADO:
+    Montado em /etc/clickhouse-server/config.d/ do container efemero
+    (ver make/data.mk::data-integration-test e
+    .github/workflows/data.yml::data-integration-test).
+-->
+<clickhouse>
+    <macros>
+        <cluster>ci_single_node</cluster>
+        <shard>1</shard>
+        <replica>1</replica>
+    </macros>
+    <remote_servers>
+        <ci_single_node>
+            <shard>
+                <replica>
+                    <host>localhost</host>
+                    <port>9000</port>
+                </replica>
+            </shard>
+        </ci_single_node>
+    </remote_servers>
+</clickhouse>

@@ -23,7 +23,7 @@ import (
 )
 
 func TestBuildInferencer_EmptyModelPath_ReturnsStub(t *testing.T) {
-	inf := BuildInferencer(Config{ModelVersion: "v-test"}, nil)
+	inf, status := BuildInferencer(Config{ModelVersion: "v-test"}, nil)
 	defer inf.Close() //nolint:errcheck
 	if _, ok := inf.(*stub.StubInferencer); !ok {
 		t.Fatalf("BuildInferencer with empty ModelPath = %T, want *stub.StubInferencer", inf)
@@ -31,16 +31,28 @@ func TestBuildInferencer_EmptyModelPath_ReturnsStub(t *testing.T) {
 	if inf.ModelVersion() != "v-test" {
 		t.Errorf("ModelVersion() = %q, want %q", inf.ModelVersion(), "v-test")
 	}
+	if status.Calibrated {
+		t.Errorf("Status.Calibrated = true in stub mode, want false")
+	}
+	if status.Reason == "" {
+		t.Errorf("Status.Reason is empty in stub mode — the degradation must be observable (Mandato #3), not silent")
+	}
 }
 
 func TestBuildInferencer_MissingModelFile_FailsSafeToStub(t *testing.T) {
-	inf := BuildInferencer(Config{
+	inf, status := BuildInferencer(Config{
 		ModelPath:    filepath.Join(t.TempDir(), "does-not-exist.onnx"),
 		ModelVersion: "v-test",
 	}, nil)
 	defer inf.Close() //nolint:errcheck
 	if _, ok := inf.(*stub.StubInferencer); !ok {
 		t.Fatalf("BuildInferencer with a missing model file = %T, want *stub.StubInferencer", inf)
+	}
+	if status.Calibrated {
+		t.Errorf("Status.Calibrated = true with a missing model file, want false")
+	}
+	if status.Reason == "" {
+		t.Errorf("Status.Reason is empty with a missing model file — the degradation must be observable, not silent")
 	}
 }
 
@@ -54,12 +66,18 @@ func TestBuildInferencer_ModelPresentButRuntimeNotCompiled_FailsSafeToStub(t *te
 		t.Fatalf("os.WriteFile: %v", err)
 	}
 
-	inf := BuildInferencer(Config{
+	inf, status := BuildInferencer(Config{
 		ModelPath:    modelPath,
 		ModelVersion: "v-test",
 	}, nil)
 	defer inf.Close() //nolint:errcheck
 	if _, ok := inf.(*stub.StubInferencer); !ok {
 		t.Fatalf("BuildInferencer without -tags onnx = %T, want *stub.StubInferencer (onnx.ErrNotCompiled fallback)", inf)
+	}
+	if status.Calibrated {
+		t.Errorf("Status.Calibrated = true with ONNX runtime not compiled in, want false")
+	}
+	if status.Reason == "" {
+		t.Errorf("Status.Reason is empty with ONNX runtime not compiled in — the degradation must be observable, not silent")
 	}
 }

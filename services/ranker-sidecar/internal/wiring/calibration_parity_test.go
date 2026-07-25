@@ -175,11 +175,18 @@ func TestCalibratedServingParity(t *testing.T) {
 		t.Skipf("calibration map %q not found: %v — skipping (run ml/calibration/calibrate.py's run_calibration first)", calPath, err)
 	}
 
+	// Loaded independently of BuildInferencer purely as ground truth for the
+	// Status.Method/Status.NPoints assertions below.
+	calMap, err := calibration.LoadMap(calPath)
+	if err != nil {
+		t.Fatalf("calibration.LoadMap(%q) (ground truth for Status assertions): %v", calPath, err)
+	}
+
 	// Build the Inferencer via the EXACT production wiring — not a
 	// reimplementation. If BuildInferencer (or calibration.Wrap inside it)
 	// is ever changed to skip calibration, this call's return value stops
 	// applying it and every comparison below fails.
-	inf := BuildInferencer(Config{
+	inf, status := BuildInferencer(Config{
 		ModelPath:       modelPath,
 		ModelVersion:    "calibration-parity-test",
 		CalibrationPath: calPath,
@@ -194,6 +201,19 @@ func TestCalibratedServingParity(t *testing.T) {
 		t.Fatalf("wiring.BuildInferencer did not return a *calibration.CalibratedInferencer (got %T) — "+
 			"calibration was not wired into serving despite a valid model and calibration map being present",
 			inf)
+	}
+	// Status is the OBSERVABLE counterpart of the type assertion above
+	// (Mandato #3 — "Calibracao isotonica monitorada"): a regression that
+	// keeps returning *calibration.CalibratedInferencer but stops setting
+	// Status.Calibrated=true would leave monitoring blind even though
+	// scoring itself is still correct.
+	if !status.Calibrated {
+		t.Fatalf("wiring.BuildInferencer returned a CalibratedInferencer but Status.Calibrated=false (Reason=%q) — "+
+			"the /healthz signal would report uncalibrated despite serving calibrated pCTR", status.Reason)
+	}
+	if status.Method != calMap.Method || status.NPoints != len(calMap.Thresholds) {
+		t.Errorf("Status={Method:%q NPoints:%d}, want {Method:%q NPoints:%d} (loaded from %s)",
+			status.Method, status.NPoints, calMap.Method, len(calMap.Thresholds), calPath)
 	}
 
 	for _, c := range golden.Cases {

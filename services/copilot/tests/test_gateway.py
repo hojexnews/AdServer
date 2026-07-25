@@ -471,6 +471,128 @@ class TestWriteDrafts:
             await gw.apply_write(TENANT_A, diff)
 
 
+# =============================================================================
+# Achado PRIV-06 remediação (32ª onda) — PII EM LOG: `create_campaign_draft`
+# e `create_banner_draft` logavam `name=inp.name` verbatim (texto livre
+# fornecido pelo anunciante via LLM, possivelmente com PII). Corrigido para
+# `_safe_log_free_text_kwargs` (comprimento + prefixo de hash SHA-256, nunca
+# o texto em si) — mesma FORMA aplicada às duas entidades.
+# =============================================================================
+
+@pytest.mark.asyncio
+class TestNoRawFreeTextInDraftLogs:
+    """
+    MUTATION-PROOF: captura os eventos de log REAIS emitidos por
+    `create_campaign_draft`/`create_banner_draft` (via `structlog.testing.
+    capture_logs`, não por inspeção de código-fonte) e prova que o valor cru
+    de `name` (com PII) NUNCA aparece em nenhum campo de nenhum evento —
+    nem sob a chave `name`, nem embutido em outra chave.
+    """
+
+    async def test_create_campaign_draft_never_logs_raw_name(self) -> None:
+        from structlog.testing import capture_logs
+
+        gw = make_gateway()
+        pii_name = "Campanha CPF 123.456.789-00 do João"
+        inp = CreateCampaignDraftInput(
+            name=pii_name,
+            advertiser_id=1,
+            campaign_type=CampaignType.REMNANT,
+            pricing_model=PricingModel.CPM,
+            rate_minor_units=500,
+            currency="BRL",
+            goal_target=10_000,
+            goal_metric=GoalMetric.IMPRESSIONS,
+            start_at="2026-07-01T00:00:00Z",
+            end_at="2026-07-31T23:59:59Z",
+        )
+
+        with capture_logs() as captured:
+            diff = await gw.create_campaign_draft(TENANT_A, inp)
+
+        # A escrita em si (WriteDiff.after, mostrado só no HITL) contém o
+        # nome real — isto é esperado e necessário para o humano revisar.
+        assert diff.after["name"] == pii_name
+
+        # Mas NENHUM evento de log (destino: observabilidade/Langfuse, uma
+        # superfície de exposição mais ampla que o diff do HITL) pode conter
+        # o texto cru em NENHUM valor de NENHUM campo.
+        assert captured, "esperava ao menos um evento de log capturado"
+        for event in captured:
+            for value in event.values():
+                assert pii_name not in str(value), (
+                    f"nome cru vazou em log: campo={event!r}"
+                )
+                assert "123.456.789-00" not in str(value), (
+                    f"CPF vazou em log: campo={event!r}"
+                )
+        # E o comprimento/hash seguro devem estar presentes (prova positiva
+        # de que a FORMA nova — não uma simples remoção do campo — está em
+        # uso: um mutante que apagasse a chamada de log inteira não seria
+        # pego só pelas asserções acima).
+        create_event = next(
+            e for e in captured if e.get("event") == "create_campaign_draft"
+        )
+        assert create_event["name_len"] == len(pii_name)
+        assert create_event["name_sha256_12"] is not None
+        assert len(create_event["name_sha256_12"]) == 12
+
+    async def test_create_banner_draft_never_logs_raw_name(self) -> None:
+        from structlog.testing import capture_logs
+        from tools.schemas import CreateBannerDraftInput
+
+        gw = make_gateway()
+        pii_name = "Contato joao@example.com para detalhes"
+        inp = CreateBannerDraftInput(
+            campaign_id=1,
+            name=pii_name,
+            creative_type=CreativeType.IMAGE,
+            asset_url="https://cdn.example.com/banner.png",
+            dest_url="https://anunciante.com",
+            width=300,
+            height=250,
+            is_ai_generated=False,
+        )
+
+        with capture_logs() as captured:
+            diff = await gw.create_banner_draft(TENANT_A, inp)
+
+        assert diff.after["name"] == pii_name
+
+        assert captured, "esperava ao menos um evento de log capturado"
+        for event in captured:
+            for value in event.values():
+                assert pii_name not in str(value)
+                assert "joao@example.com" not in str(value)
+
+        create_event = next(
+            e for e in captured if e.get("event") == "create_banner_draft"
+        )
+        assert create_event["name_len"] == len(pii_name)
+        assert create_event["name_sha256_12"] is not None
+        assert len(create_event["name_sha256_12"]) == 12
+
+
+class TestSafeLogFreeTextKwargs:
+    """Unidade direta do helper — não amarrada a nenhuma entidade específica (não é async, fora da classe acima)."""
+
+    def test_never_includes_raw_text(self) -> None:
+        from tools.gateway import _safe_log_free_text_kwargs
+
+        pii_text = "e-mail joao@example.com"
+        kwargs = _safe_log_free_text_kwargs(pii_text, key="name")
+
+        assert set(kwargs) == {"name_len", "name_sha256_12"}
+        assert kwargs["name_len"] == len(pii_text)
+        for value in kwargs.values():
+            assert pii_text not in str(value)
+            assert "joao@example.com" not in str(value)
+
+        # None/"" -> forma degenerada, ainda sem vazar nada
+        empty_kwargs = _safe_log_free_text_kwargs(None, key="name")
+        assert empty_kwargs == {"name_len": 0, "name_sha256_12": None}
+
+
 # ---------------------------------------------------------------------------
 # _detect_pii_in_html — helper de detecção de PII
 # ---------------------------------------------------------------------------

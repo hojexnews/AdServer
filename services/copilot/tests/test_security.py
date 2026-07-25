@@ -831,6 +831,285 @@ class TestM2CreativeGateInWriteDraft:
 
 
 # =============================================================================
+# Achado PRIV-03 remediação #5 (31ª onda) — PII scan sobre o PAYLOAD DE
+# ESCRITA real (CreateBannerDraftInput/UpdateBannerDraftInput), não apenas
+# sobre o schema-espelho ValidateCreativeInput. `name` (nome do banner) é
+# texto livre PUBLICÁVEL — aparece na UI do anunciante, é persistido e
+# LOGADO verbatim — e antes do fix NUNCA era escaneado por PII porque
+# `_run_creative_validation` só construía um `ValidateCreativeInput`
+# (asset_url/html_content/dest_url/creative_type/is_ai_generated/
+# ai_generation_tool) a partir de `tool_input`, descartando `name`
+# silenciosamente.
+# =============================================================================
+
+class TestPiiScanCoversWritePayloadNotJustMirror:
+    """
+    MUTATION-PROOF: PII no NOME do banner deve bloquear o gate mesmo quando
+    nenhum outro campo (asset_url/html_content/dest_url) carrega PII —
+    prova que a varredura cobre o payload de escrita real, não só o
+    schema-espelho ValidateCreativeInput (que nem tem campo `name`).
+    """
+
+    @staticmethod
+    def _base_state(tenant_id: str, write_tool: str, tool_input: dict) -> dict[str, Any]:
+        return {
+            "tenant_id": tenant_id,
+            "session_id": "s1",
+            "requested_model_tier": None,
+            "messages": [],
+            "pending_diff": None,
+            "hitl_approved": None,
+            "hitl_rejection_reason": None,
+            "last_tool_result": {"write_tool": write_tool, "input": tool_input},
+            "judge_result": None,
+            "langfuse_trace_id": None,
+            "input_tokens_used": 0,
+            "output_tokens_used": 0,
+            "next_action": None,
+            "error_message": None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_pii_in_banner_name_blocks_gate_on_create(self) -> None:
+        """
+        CPF no `name` de create_banner_draft (nenhum outro campo com PII)
+        deve reprovar o gate de validação — antes do fix, `name` não
+        existia em ValidateCreativeInput e a varredura de PII nunca via
+        este campo, deixando pii_detected estruturalmente False.
+        """
+        from graph.nodes import make_write_draft_node
+
+        gw = make_gateway()
+        node = make_write_draft_node(gw)
+        state = self._base_state(
+            TENANT_A,
+            "create_banner_draft",
+            {
+                "campaign_id": 1,
+                "name": "Promo João CPF 123.456.789-00",
+                "creative_type": "image",
+                "asset_url": "https://cdn.example.com/banner.png",
+                "dest_url": "https://anunciante.com",
+                "width": 300,
+                "height": 250,
+                "is_ai_generated": False,
+            },
+        )
+
+        result = await node(state)
+
+        diff = result["pending_diff"]
+        assert diff is not None, "draft deve ser gerado mesmo com gate reprovado (humano decide no HITL)"
+        validation = diff.validation_result
+        assert validation is not None
+        assert validation["pii_detected"] is True, (
+            "PII no nome do banner deve ser detectado — a varredura tem de "
+            "cobrir o payload de escrita real (CreateBannerDraftInput), não "
+            "só o schema-espelho ValidateCreativeInput"
+        )
+        assert validation["gate_passed"] is False
+        assert validation["is_valid"] is False
+        assert any("name" in v for v in validation["violations"]), (
+            "A violação deve identificar o campo 'name' como fonte do PII"
+        )
+        # Contraste: nenhum PII em asset_url/dest_url/html_content — a única
+        # fonte de PII é o campo `name`, fora do schema-espelho.
+        assert result["next_action"] == "await_hitl"
+
+    @pytest.mark.asyncio
+    async def test_pii_in_banner_name_blocks_gate_on_update(self) -> None:
+        """
+        Mesma cobertura para update_banner_draft (e-mail no nome).
+
+        NOTA (32ª onda, hardening anti-confundidor): `dest_url`/`asset_url`
+        são preenchidos de propósito para que o schema-espelho
+        (`ValidateCreativeInput`) já reprove por ausência de `dest_url` NÃO
+        seja o motivo do `gate_passed is False` abaixo — isolando o sinal
+        para que só possa vir do scan de PII sobre o payload de escrita
+        (`name`). Sem isto, uma mutação que desligasse o scan adicional
+        ainda deixaria `gate_passed is False` verdadeiro pelo motivo ERRADO
+        (dest_url ausente), mascarando parcialmente a checagem — por isso
+        a asserção de `pii_detected is True` é a que carrega o peso da
+        prova (ver também `TestRunCreativeValidationDirect`, que testa a
+        função isoladamente, sem depender do resto do nó).
+        """
+        from graph.nodes import make_write_draft_node
+
+        gw = make_gateway()
+        node = make_write_draft_node(gw)
+        state = self._base_state(
+            TENANT_A,
+            "update_banner_draft",
+            {
+                "banner_id": 42,
+                "name": "Contato joao@example.com para detalhes",
+                "asset_url": "https://cdn.example.com/banner.png",
+                "dest_url": "https://anunciante.com",
+            },
+        )
+
+        result = await node(state)
+
+        diff = result["pending_diff"]
+        assert diff is not None
+        validation = diff.validation_result
+        assert validation is not None
+        assert validation["pii_detected"] is True, (
+            "PII no nome do banner (update) deve ser detectado mesmo com "
+            "dest_url/asset_url válidos e sem PII — isola o sinal para a "
+            "varredura do payload de escrita, não para o gate mirror"
+        )
+        assert validation["gate_passed"] is False
+        assert any("name" in v for v in validation["violations"])
+
+    @pytest.mark.asyncio
+    async def test_no_pii_in_banner_name_passes_gate(self) -> None:
+        """Contraste: nome sem PII não deve gerar falso-positivo."""
+        from graph.nodes import make_write_draft_node
+
+        gw = make_gateway()
+        node = make_write_draft_node(gw)
+        state = self._base_state(
+            TENANT_A,
+            "create_banner_draft",
+            {
+                "campaign_id": 1,
+                "name": "Promoção de verão 50% OFF",
+                "creative_type": "image",
+                "asset_url": "https://cdn.example.com/banner.png",
+                "dest_url": "https://anunciante.com",
+                "width": 300,
+                "height": 250,
+                "is_ai_generated": False,
+            },
+        )
+
+        result = await node(state)
+
+        diff = result["pending_diff"]
+        validation = diff.validation_result
+        assert validation["pii_detected"] is False
+        assert validation["gate_passed"] is True
+
+
+# =============================================================================
+# Achado PRIV-03 remediação #6 (32ª onda, mutation-hardening) —
+# `_run_creative_validation` chamada DIRETAMENTE, isolada do resto de
+# `write_draft_node`/`make_write_draft_node`.
+#
+# Por que este teste existe além de `TestPiiScanCoversWritePayloadNotJustMirror`
+# (que já cobre o mesmo achado ponta-a-ponta via o nó completo): testar só
+# através do nó insere uma camada de indireção (branching do tool_name,
+# reconstrução de `WriteDiff` via `gateway.create_banner_draft`/
+# `update_banner_draft`, `model_copy`) entre a mutação e a asserção — e ao
+# menos um cenário ponta-a-ponta (update sem dest_url) tinha um confundidor
+# incidental (`gate_passed=False` por outro motivo, dest_url ausente) que já
+# foi corrigido acima, mas serve de lição: quanto mais indireção, mais fácil
+# um mutante sobreviver por coincidência. Chamando `_run_creative_validation`
+# diretamente com um `tool_input` mínimo e limpo (sem nenhum outro campo que
+# possa reprovar o gate-espelho), a ÚNICA forma do dict retornado indicar
+# `pii_detected=True` é o scan sobre o payload de escrita realmente ter
+# rodado — nenhum caminho alternativo, nenhuma coincidência possível.
+# =============================================================================
+
+class TestRunCreativeValidationDirect:
+    """
+    MUTATION-PROOF (camada direta): chama `_run_creative_validation` sem
+    passar por `write_draft_node`, isolando precisamente a lógica do scan de
+    PII sobre o payload de escrita (CreateBannerDraftInput/
+    UpdateBannerDraftInput) — ver docstring do módulo acima.
+    """
+
+    @pytest.mark.asyncio
+    async def test_pii_only_in_write_payload_name_is_detected(self) -> None:
+        from graph.nodes import _run_creative_validation
+
+        gw = make_gateway()
+        tool_input = {
+            "campaign_id": 1,
+            "name": "Contato CPF 123.456.789-00",
+            "creative_type": "image",
+            "asset_url": "https://cdn.example.com/banner.png",
+            "dest_url": "https://anunciante.com",
+            "width": 300,
+            "height": 250,
+            "is_ai_generated": False,
+        }
+
+        result = await _run_creative_validation(
+            gw, TENANT_A, "create_banner_draft", tool_input
+        )
+
+        assert result is not None
+        assert result["pii_detected"] is True, (
+            "sem nenhum confundidor (dest_url/asset_url válidos, sem PII "
+            "neles), pii_detected só pode vir do scan do payload de escrita "
+            "(campo 'name') — se uma mutação pular esse scan (return "
+            "antecipado, condição invertida, loop desativado), este dict "
+            "permaneceria pii_detected=False e este assert vai VERMELHO"
+        )
+        assert result["gate_passed"] is False
+        assert result["is_valid"] is False
+        assert any("name" in v for v in result["violations"])
+
+    @pytest.mark.asyncio
+    async def test_pii_only_in_write_payload_name_is_detected_on_update(self) -> None:
+        from graph.nodes import _run_creative_validation
+
+        gw = make_gateway()
+        tool_input = {
+            "banner_id": 42,
+            "name": "Falar com joao@example.com",
+            "asset_url": "https://cdn.example.com/banner.png",
+            "dest_url": "https://anunciante.com",
+        }
+
+        result = await _run_creative_validation(
+            gw, TENANT_A, "update_banner_draft", tool_input
+        )
+
+        assert result is not None
+        assert result["pii_detected"] is True
+        assert result["gate_passed"] is False
+
+    @pytest.mark.asyncio
+    async def test_clean_name_does_not_trigger_false_positive(self) -> None:
+        """Contraste — evita que o hardening acima vire um mutante na direção oposta (sempre True)."""
+        from graph.nodes import _run_creative_validation
+
+        gw = make_gateway()
+        tool_input = {
+            "campaign_id": 1,
+            "name": "Campanha de inverno",
+            "creative_type": "image",
+            "asset_url": "https://cdn.example.com/banner.png",
+            "dest_url": "https://anunciante.com",
+            "width": 300,
+            "height": 250,
+            "is_ai_generated": False,
+        }
+
+        result = await _run_creative_validation(
+            gw, TENANT_A, "create_banner_draft", tool_input
+        )
+
+        assert result is not None
+        assert result["pii_detected"] is False
+        assert result["gate_passed"] is True
+
+    @pytest.mark.asyncio
+    async def test_non_banner_tool_returns_none(self) -> None:
+        """Guarda de forma: tool_name fora de `_BANNER_DRAFT_INPUT_BY_TOOL` retorna None (não aplicável)."""
+        from graph.nodes import _run_creative_validation
+
+        gw = make_gateway()
+        result = await _run_creative_validation(
+            gw, TENANT_A, "create_cap_draft", {"owner_type": "campaign", "scope": "campaign_total"}
+        )
+        assert result is None
+
+
+# =============================================================================
 # M4 — Vazamento de mensagem de erro
 # =============================================================================
 

@@ -10,12 +10,18 @@
 //   - No synchronous network call in the hot path beyond Redis capping
 //     (best-effort + fail-safe DA-6).
 //   - Every response includes a decision_id and model_version (even blank — TX-1).
-//   - The IP address is resolved to geo and then immediately discarded (TX-5/DA-11).
+//   - This service never sees a client IP at all: it is the collector
+//     (services/collector), not decision, that resolves IP→geo and
+//     immediately discards the IP (TX-5/DA-11). See the DecideRequest.GeoCountry/
+//     GeoCity doc comment below for the current (empty, on the served path)
+//     reality of how geo reaches this handler.
 //   - tenant_id is DERIVED SERVER-SIDE from the zone_id via snapshot (CA-1).
 //     Any tenant_id supplied by the client is IGNORED.
 //   - DecisionSink (I2): Redpanda producer with WAL + at-least-once + dedupe.
 //   - Capper (I2): Redis-backed with fail-safe — no id → abort capped campaigns.
-//   - GeoResolver (I2): MaxMind GeoLite2 in memory; degraded to empty on miss.
+//   - GeoResolver (I2): MaxMind GeoLite2 in memory; constructed at boot but NOT
+//     currently wired into the served request path (see geoDBPath below) —
+//     it degrades to empty, same as an absent GeoCountry/GeoCity in the request.
 //   - Ranker (Fase 2 extension point): DefaultRanker in I0/I2; ML ranker in I4+.
 //   - Click tokens: HMAC-SHA256 signed at serve time (CK_HMAC_SECRET, fail-closed).
 //   - Capping salt: CAPPING_SALT required at boot; fail-closed if absent.
@@ -41,6 +47,7 @@ import (
 	"github.com/hojex/adserver/internal/configload"
 	"github.com/hojex/adserver/internal/geo"
 	mlranker "github.com/hojex/adserver/internal/ranker"
+	"github.com/hojex/adserver/internal/referer"
 	"github.com/hojex/adserver/internal/rules"
 	"github.com/hojex/adserver/internal/snapshot"
 	"github.com/hojex/adserver/internal/telemetry"
@@ -93,15 +100,38 @@ type DecideRequest struct {
 	// The tenant_id is derived SERVER-SIDE from this zone_id via the snapshot (CA-1).
 	// Any "tenant_id" field sent by the client is IGNORED.
 	ZoneID string `json:"zone_id"`
-	// Geo fields: pre-derived by the collector before reaching this endpoint.
-	// The collector discards the IP after deriving these (TX-5/DA-11).
-	// When called from the asyncjs JS tag, the collector derives geo from
-	// the client IP and passes only country+city here.
+	// Geo fields: OPTIONAL, and on the actual served path — the async ad tag's
+	// direct browser fetch() to POST /v1/decide (see buildAdTagJS in
+	// services/collector) — ALWAYS EMPTY today. The collector's IP→geo
+	// derivation (resolveAndDiscardIP, TX-5/DA-11) runs ONLY for the separate
+	// GET /asyncjs → AdRequest telemetry event; the collector never makes a
+	// server-to-server call to this endpoint, so it cannot pre-populate these
+	// fields, and the browser itself has no IP-to-geo capability. Net effect:
+	// Geo-Country/Geo-City delivery rules (§4.6) are currently inert on the
+	// served path. geo.NewMaxMindResolver is constructed at boot (see main())
+	// as the extension point for a future caller that does supply these.
 	GeoCountry string `json:"geo_country,omitempty"`
 	GeoCity    string `json:"geo_city,omitempty"`
-	// UserAgent of the end-user browser (coarse class only — never raw UA).
+	// UserAgent of the end-user browser. On the served path this is the RAW
+	// navigator.userAgent string sent directly by the ad tag — NOT a coarse
+	// class. It is used only within this request's stack frame for
+	// Client-Useragent rule matching (rules.Context.UserAgent) and is never
+	// logged, persisted, or included in the emitted Decision event. Rule
+	// matching intentionally needs the raw string — legacy-parity device
+	// targeting relies on substrings such as "contains android" (see the
+	// CA-4 golden tests); reducing it to a coarse class here would change
+	// rule-matching semantics. The coarse-class reduction (useragent.Classify)
+	// is a SEPARATE value used only by the collector's /asyncjs → AdRequest
+	// telemetry event — the two paths do not share a UA representation today.
 	UserAgent string `json:"user_agent,omitempty"`
-	// SiteURL is the referer / page URL (sanitized: scheme+host+path only).
+	// SiteURL is the page location reported directly by the ad tag as
+	// location.origin + location.pathname (query string and fragment are
+	// stripped client-side before this request is ever sent — see
+	// buildAdTagJS). It is defensively re-sanitized server-side
+	// (internal/referer.Sanitize, the same function the collector uses for
+	// its Referer header) before being used for Site-URL rule matching,
+	// since this endpoint is called directly by the browser and cannot
+	// assume the caller already sanitized its input.
 	SiteURL string `json:"site_url,omitempty"`
 	// SiteVars are first-party custom variables from the ad tag.
 	SiteVars map[string]string `json:"site_vars,omitempty"`
@@ -141,6 +171,36 @@ type DecideResponse struct {
 	VideoURL string `json:"video_url,omitempty"`
 	Width    int32  `json:"width,omitempty"`
 	Height   int32  `json:"height,omitempty"`
+}
+
+// buildRulesContext constructs the rules.Context used for cascade/rule
+// evaluation from an incoming DecideRequest.
+//
+// PRIVACY (TX-5/DA-11, PRIV-01): SiteURL is re-sanitized here with the SAME
+// function the collector uses for its Referer header (internal/referer.
+// Sanitize — query string and fragment stripped, only scheme+host+path
+// retained). This endpoint is called directly by the browser's ad tag (see
+// buildAdTagJS in services/collector), so decision cannot assume the caller
+// already stripped identifying query parameters or fragments; sanitizing on
+// receipt, before the value is used for rule matching or could reach any
+// future log/telemetry field, closes that gap regardless of what the client
+// actually sent.
+//
+// UserAgent is passed through UNCHANGED (raw, not classified): Client-
+// Useragent rule matching requires raw substring semantics (e.g. "contains
+// android") for parity with legacy device-targeting rules (CA-4 golden
+// tests) — reducing it to a coarse class here would change that matching
+// behaviour. See the DecideRequest.UserAgent doc comment for the full
+// rationale and the confinement invariant (raw UA never leaves this
+// request's stack frame into any persisted or logged artifact).
+func buildRulesContext(req DecideRequest, g *commonv1.Geo, now time.Time) *rules.Context {
+	return &rules.Context{
+		Geo:         g,
+		SiteURL:     referer.Sanitize(req.SiteURL),
+		UserAgent:   req.UserAgent,
+		RequestTime: now,
+		SiteVars:    req.SiteVars,
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -286,8 +346,9 @@ func (h *decisionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// tenantID is authoritative from snapshot — never from client input.
 	tenantID := zone.TenantID
 
-	// Geo is passed in already-derived by the collector (TX-5/DA-11):
-	// no IP is present or needed in this handler.
+	// Geo: this handler never sees a client IP (TX-5/DA-11 — see the
+	// DecideRequest.GeoCountry doc comment). On the served path these fields
+	// arrive empty; g carries whatever the caller sent (empty today).
 	g := &commonv1.Geo{
 		Country: req.GeoCountry,
 		City:    req.GeoCity,
@@ -299,13 +360,7 @@ func (h *decisionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// including blank (TX-1 invariant).
 	decisionID := telemetry.NewULID()
 
-	rulesCtx := &rules.Context{
-		Geo:         g,
-		SiteURL:     req.SiteURL,
-		UserAgent:   req.UserAgent,
-		RequestTime: now,
-		SiteVars:    req.SiteVars,
-	}
+	rulesCtx := buildRulesContext(req, g, now)
 
 	cascadeReq := cascade.Request{
 		ZoneID:      req.ZoneID,
@@ -610,12 +665,17 @@ func main() {
 
 	// ---------------------------------------------------------------------------
 	// Geo resolver (I2): MaxMind GeoLite2 in memory.
-	// NOTE: The decision service itself does NOT see raw IPs — geo is derived
-	// by the collector and passed as pre-resolved fields in the JSON body (TX-5).
-	// The geo resolver is kept here for any future direct-client paths.
+	// NOTE (reality, not aspiration — see DecideRequest.GeoCountry doc comment):
+	// this service never sees a raw client IP, and on the CURRENT served path
+	// (the ad tag's direct browser fetch() to POST /v1/decide) GeoCountry/
+	// GeoCity arrive EMPTY — the collector's IP→geo derivation only feeds its
+	// own separate /asyncjs → AdRequest telemetry event, not this endpoint.
+	// The resolver below is constructed but NOT consulted in the request path;
+	// it exists as the extension point for a future caller that supplies an
+	// IP (or pre-derived geo) directly to decision.
 	// ---------------------------------------------------------------------------
 	geoDBPath := envOr("GEOIP_DB_PATH", "")
-	_ = geo.NewMaxMindResolver(geoDBPath, logger) // wired; unused in I2 direct path
+	_ = geo.NewMaxMindResolver(geoDBPath, logger) // wired; unused in the served request path
 
 	// ---------------------------------------------------------------------------
 	// Capper (I2): Redis-backed with fail-safe (DA-6).

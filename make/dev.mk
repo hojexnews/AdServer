@@ -42,6 +42,15 @@ dev-db-setup:
 	  psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q -f db/config/migrations/$$f\_up.sql; \
 	done
 	@psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q -f db/ledger/migrations/0001_ledger_schema_up.sql
+	@# vector precisa existir ANTES de db/seed/dev_roles.sql (que faz GRANT ... ON
+	@# SCHEMA vector_store TO adserver_copilot) — mesma ordem canonica de
+	@# DB_SCHEMAS em make/db.mk e do workflow .github/workflows/db.yml
+	@# (asset_registry -> config -> ledger -> vector -> compliance). Faltar este
+	@# passo faz dev_roles.sql abortar com "schema vector_store does not exist"
+	@# (achado HIGH / bundle F).
+	@for f in 0001_vector_schema 0002_vector_rls; do \
+	  psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q -f db/vector/migrations/$$f\_up.sql; \
+	done
 	@psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q -f db/seed/dev_roles.sql
 	@psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q -f db/seed/dev_seed.sql
 	@# Provisionamento real do publisher Hojex News: zonas por-placement (E11).

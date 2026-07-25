@@ -5,12 +5,27 @@
 #
 # Requires: go >= 1.26.4 in PATH.
 #
-# TARGETS ADDED IN I2:
-#   go-test-integration — SCAFFOLDING RESERVADO (I2): destinado a testes tagged
-#                          //go:build integration (Redis + Redpanda + MaxMind .mmdb
-#                          vivos). NENHUM teste //go:build integration existe hoje;
-#                          o alvo se AUTO-VERIFICA e FALHA ate um ser adicionado
-#                          (nao roda no CI padrao; gatilho: cutover G1).
+# TARGETS ADDED IN I2, TORNADO REAL NO BUNDLE A (achado HIGH, money-ledger-guardian):
+#   go-test-integration — roda os testes tagged //go:build integration que
+#                          exigem infra viva. O ESCOPO DE PACOTES E DERIVADO
+#                          (nunca hardcoded): so pacotes que de fato contem um
+#                          arquivo `//go:build integration` sao compilados sob
+#                          -tags=integration — nunca $(GOPKGS) inteiro. Rodar a
+#                          suite TODA sob a tag re-executaria os testes SEM
+#                          infra de pacotes nao relacionados sob um ambiente
+#                          (env vars, etc.) que eles nao esperam; escopo
+#                          estreito por pacote e o default-deny correto aqui.
+#                          Hoje: internal/ledger (Postgres 16 real via
+#                          DATABASE_URL — ver internal/ledger/posting_integration_test.go
+#                          e .github/workflows/db.yml). Redis/Redpanda/MaxMind
+#                          .mmdb (I2) seguem SEM teste tagged ainda; quando o
+#                          primeiro existir, o pacote entra automaticamente no
+#                          escopo derivado (nada aqui precisa mudar). Cada
+#                          pacote integration-tagged e responsavel pelo seu
+#                          proprio fail-fast de env (t.Fatal, nao t.Skip — um
+#                          teste tagged que roda sem a infra que promete e o
+#                          "no-op mascarado de validacao real" que este alvo
+#                          existe para evitar).
 
 GO      := go
 GOFLAGS :=
@@ -44,16 +59,24 @@ go-vet:
 go-test:
 	$(GO) test $(GOFLAGS) -count=1 -race $(GOPKGS)
 
-## go-test-integration: testes que requerem Redis + Redpanda + MaxMind mmdb (I2).
-## SCAFFOLDING RESERVADO: nenhum teste //go:build integration existe hoje; o guard
-## abaixo FALHA (em vez de rodar um no-op verde que finge validar infra real).
-## Ao adicionar o 1o teste: REDIS_ADDR=... REDPANDA_BROKERS=... make go-test-integration
+## go-test-integration: testes tagged //go:build integration (infra viva).
+## Escopo DERIVADO por pacote (nao $(GOPKGS) inteiro sob a tag — ver comentario
+## de topo do arquivo). Hoje: internal/ledger, que exige DATABASE_URL apontando
+## para um Postgres 16 com db/ledger/migrations/0001..0004 JA aplicadas (as
+## QUATRO — dev-db-setup em make/dev.mk hoje aplica so a 0001; use
+## .github/workflows/db.yml como referencia de provisionamento completo, ou
+## aplique 0001..0004 manualmente). Falha explicitamente se NENHUM pacote
+## tiver teste tagged (evita um no-op verde mascarando validacao real).
 go-test-integration:
-	@grep -rlq '//go:build integration' ./internal ./services ./tests 2>/dev/null || { \
-	  echo "go-test-integration: nenhum teste //go:build integration definido — alvo e scaffolding reservado (I2)."; \
-	  echo "  Adicione ao menos um teste tagged antes de usar; rodar hoje seria um no-op mascarado de validacao real."; \
-	  exit 1; }
-	$(GO) test $(GOFLAGS) -count=1 -race -tags=integration $(GOPKGS)
+	@_PKGS="$$(grep -rl '//go:build integration' ./internal ./services ./tests 2>/dev/null \
+	            | xargs -r -n1 dirname | LC_ALL=C sort -u | sed 's#$$#/...#')"; \
+	 if [ -z "$$_PKGS" ]; then \
+	   echo "go-test-integration: nenhum teste //go:build integration definido — alvo e scaffolding reservado."; \
+	   echo "  Adicione ao menos um teste tagged antes de usar; rodar hoje seria um no-op mascarado de validacao real."; \
+	   exit 1; \
+	 fi; \
+	 echo "== go-test-integration: pacotes com teste tagged (escopo derivado): $$_PKGS =="; \
+	 $(GO) test $(GOFLAGS) -count=1 -race -tags=integration $$_PKGS
 
 ## go-lint: gate TX-2 forbidigo (float PROIBIDO em codigo monetario) via golangci-lint.
 ## Metade "lint" de contracts/lint/no-float.md; a "teste" sao os known-answer (ex.:

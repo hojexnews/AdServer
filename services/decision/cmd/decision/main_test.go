@@ -6,10 +6,14 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+
+	commonv1 "github.com/hojex/adserver/gen/go/adserver/common/v1"
 	decisionv1 "github.com/hojex/adserver/gen/go/adserver/decision/v1"
 	"github.com/hojex/adserver/internal/cascade"
 	mlranker "github.com/hojex/adserver/internal/ranker"
@@ -575,5 +579,87 @@ func TestJ4_ABSwitch_AllTreatment_PreservesTierAndFailsOpen(t *testing.T) {
 	}
 	if d.GetCampaignId() != pureDecision.GetCampaignId() {
 		t.Errorf("treatment: campaign_id = %q, want cascade-pure %q", d.GetCampaignId(), pureDecision.GetCampaignId())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PRIVACY (PRIV-01, TX-5/DA-11): site_url sanitization + raw-input confinement
+//
+// The async ad tag calls POST /v1/decide DIRECTLY from the browser with
+// site_url = location.origin + location.pathname (query/fragment already
+// stripped client-side) and user_agent = navigator.userAgent (RAW — needed
+// for Client-Useragent rule matching, see buildRulesContext's doc comment).
+// decision cannot assume the caller sanitized site_url, so it re-sanitizes
+// defensively on receipt. These tests prove that invariant and prove that
+// NEITHER raw input ever reaches the emitted Decision event or the HTTP
+// response, regardless of what arrives in the request body.
+// ---------------------------------------------------------------------------
+
+// TestBuildRulesContext_SiteURLSanitized_QueryAndFragmentStripped is a
+// mutation-provable unit test of the sanitization itself: it calls
+// buildRulesContext directly (bypassing HTTP) so a regression that removes
+// the referer.Sanitize call is caught precisely, without depending on any
+// particular rule set being configured.
+func TestBuildRulesContext_SiteURLSanitized_QueryAndFragmentStripped(t *testing.T) {
+	req := DecideRequest{
+		ZoneID:  "z1",
+		SiteURL: "https://publisher.example.com/article?session=abc123&utm_source=x#frag",
+	}
+	ctx := buildRulesContext(req, &commonv1.Geo{}, time.Now())
+
+	if ctx.SiteURL != "https://publisher.example.com/article" {
+		t.Errorf("buildRulesContext SiteURL = %q, want sanitized scheme+host+path only", ctx.SiteURL)
+	}
+	if strings.Contains(ctx.SiteURL, "session=") || strings.Contains(ctx.SiteURL, "utm_source") || strings.Contains(ctx.SiteURL, "#") {
+		t.Errorf("buildRulesContext SiteURL still contains query/fragment: %q", ctx.SiteURL)
+	}
+}
+
+// TestPrivacy_ServeHTTP_RawSiteURLAndUserAgent_NeverLeakToOutputs drives the
+// FULL HTTP handler (the exact path the ad tag hits) with a site_url query
+// string and a user_agent, each carrying a unique marker, and proves neither
+// marker reaches the emitted Decision event (the WAL/Redpanda-bound payload)
+// or the HTTP JSON response — even though both raw values are used
+// internally for rule matching within this request.
+func TestPrivacy_ServeHTTP_RawSiteURLAndUserAgent_NeverLeakToOutputs(t *testing.T) {
+	sink := &captureSink{}
+	h := newTestDecisionHandler(buildTestSnap(snapshot.TierRemnant), sink)
+
+	const secretMarker = "SESSION_TOKEN_SECRET_9f8e7d"
+	const uaMarker = "UA-CANARY-MARKER-1a2b3c"
+
+	body, _ := json.Marshal(DecideRequest{
+		ZoneID:    "z1",
+		SiteURL:   "https://publisher.example.com/article?session=" + secretMarker + "#frag",
+		UserAgent: "Mozilla/5.0 " + uaMarker,
+	})
+	r := httptest.NewRequest(http.MethodPost, "/v1/decide", bytes.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, r)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), secretMarker) {
+		t.Error("HTTP response leaks the raw site_url query string — PRIV-01 violation")
+	}
+	if strings.Contains(rr.Body.String(), uaMarker) {
+		t.Error("HTTP response leaks the raw user_agent — PRIV-01 violation")
+	}
+
+	d := sink.last()
+	if d == nil {
+		t.Fatal("no Decision emitted to sink")
+	}
+	raw, err := proto.Marshal(d)
+	if err != nil {
+		t.Fatalf("proto.Marshal(Decision): %v", err)
+	}
+	if bytes.Contains(raw, []byte(secretMarker)) {
+		t.Error("emitted Decision event leaks the raw site_url query string — PRIV-01 violation")
+	}
+	if bytes.Contains(raw, []byte(uaMarker)) {
+		t.Error("emitted Decision event leaks the raw user_agent — PRIV-01 violation")
 	}
 }

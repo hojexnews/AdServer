@@ -280,21 +280,20 @@ func insertPostings(ctx context.Context, tx pgx.Tx, entryID int64, postings []Po
 			SELECT
 				$1,
 				je.tenant_id,
+				$2,
 				$3,
 				$4,
-				$5,
+				$5::numeric,
 				$6::numeric,
-				$7::numeric,
 				now()
 			FROM ledger.journal_entries je
 			WHERE je.id = $1
-			  AND je.tenant_id = (SELECT tenant_id FROM ledger.accounts WHERE id = $3)
+			  AND je.tenant_id = (SELECT tenant_id FROM ledger.accounts WHERE id = $2)
 		`
 		debit := int64ToNumericStr(pl.DebitMinorUnits)
 		credit := int64ToNumericStr(pl.CreditMinorUnits)
 
 		tag, err := tx.Exec(ctx, sql,
-			entryID,
 			entryID,
 			pl.AccountID,
 			pl.AssetCode,

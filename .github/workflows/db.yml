@@ -38,10 +38,19 @@ on:
       - "db/**"
       - "make/db.mk"
       - ".github/workflows/db.yml"
+      # go-test-integration (achado HIGH / Bundle A): o gate de banco agora
+      # também roda internal/ledger contra este Postgres — uma mudança em
+      # posting.go/crypto.go/posting_integration_test.go ou no alvo
+      # go-test-integration precisa reavaliar este workflow, não só go.yml.
+      - "internal/ledger/**"
+      - "make/go.mk"
   push:
     branches: [main]
     paths:
       - "db/**"
+      # Mesma justificativa do bloco pull_request acima.
+      - "internal/ledger/**"
+      - "make/go.mk"
 
 permissions:
   contents: read
@@ -78,6 +87,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Necessário para o step "go test -tags integration" abaixo (achado HIGH
+      # / Bundle A, money-ledger-guardian): internal/ledger/posting_integration_test.go
+      # chama ledger.RecordEntry/FinalizeEntry/RecordPayout REAIS contra este
+      # mesmo Postgres, depois que o schema ledger estiver todo migrado.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
       - name: instalar psql (cliente PostgreSQL)
         run: |
           sudo apt-get update -qq
@@ -93,8 +111,21 @@ jobs:
         run: make db-check-schema-list db-check-migration-pairing
 
       # ------------------------------------------------------------------
-      # Roles de aplicação (adserver_loader BYPASSRLS / adserver_app RLS).
-      # Devem existir ANTES das migrations que criam GRANTs.
+      # Roles de aplicação (adserver_loader BYPASSRLS / adserver_app RLS /
+      # adserver_copilot NOBYPASSRLS). Devem existir ANTES das migrations
+      # que criam GRANTs.
+      #
+      # adserver_copilot é criado aqui explicitamente por simetria/
+      # auditabilidade do caminho de enforcement (achado do guardião
+      # security, bundle F): antes, o role só passava a existir como efeito
+      # colateral de "grants adserver_loader + adserver_app" chamar
+      # db/seed/dev_roles.sql (que também cria o role via IF NOT EXISTS)
+      # mais adiante no job — funcionalmente correto (a ordem de migrations
+      # já garante que vector_store existe quando esse step roda), mas
+      # invisível para quem lê só este step. O CREATE ROLE aqui é idempotente
+      # com o de dev_roles.sql (IF NOT EXISTS em ambos); os GRANTs em
+      # vector_store para adserver_copilot continuam vindo de
+      # db/seed/dev_roles.sql, DEPOIS de "migrations up — vector" abaixo.
       # ------------------------------------------------------------------
       - name: criar roles de aplicação
         run: |
@@ -106,6 +137,11 @@ jobs:
             END IF;
             IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'adserver_app') THEN
               CREATE ROLE adserver_app LOGIN PASSWORD 'app_dev_only';
+            END IF;
+            IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'adserver_copilot') THEN
+              -- NOBYPASSRLS explicit (db/seed/dev_roles.sql header): the
+              -- copiloto's RAG reads MUST go through RLS.
+              CREATE ROLE adserver_copilot LOGIN PASSWORD 'copilot_dev_only' NOBYPASSRLS;
             END IF;
           END
           $$;
@@ -184,9 +220,15 @@ jobs:
           done
 
       # ------------------------------------------------------------------
-      # Grants sobre os schemas criados pelas migrations
+      # Grants sobre os schemas criados pelas migrations.
+      #
+      # db/seed/dev_roles.sql concede config/asset_registry (loader+app) E
+      # vector_store (SELECT-only) para adserver_copilot — só é seguro chamá-lo
+      # aqui porque "migrations up — vector" já rodou acima (schema
+      # vector_store existe). Ver comentário do step "criar roles de
+      # aplicação" para o porquê de adserver_copilot já existir antes disso.
       # ------------------------------------------------------------------
-      - name: grants adserver_loader + adserver_app
+      - name: grants adserver_loader + adserver_app + adserver_copilot
         run: |
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f db/seed/dev_roles.sql
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q <<'SQL'
@@ -238,6 +280,26 @@ jobs:
         run: |
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
                -f db/ledger/tests/postings_immutability_test.sql
+
+      # ------------------------------------------------------------------
+      # Go real contra o Postgres (achado HIGH, money-ledger-guardian):
+      # ledger.RecordEntry / ledger.FinalizeEntry / ledger.RecordPayout
+      # (internal/ledger/posting.go, crypto.go) são as ÚNICAS funções que
+      # gravam journal_entries/postings em produção, mas antes desta suite
+      # nenhum teste as exercitava contra um Postgres real — o antigo
+      # ledger_test.go batia só numa reimplementação em memória
+      # (ver internal/ledger/ledger_test.go, comentário de topo). Cobre:
+      # idempotência via ON CONFLICT, transição pending->posted guardada por
+      # status, ordem de validação de asset (rejeita ANTES do INSERT) e
+      # direção dos postings de RecordPayout — as 4 mutações do achado, cada
+      # uma provada em internal/ledger/posting_integration_test.go.
+      #
+      # `make go-test-integration` deriva o escopo de pacotes a partir de
+      # quem tem arquivo `//go:build integration` (hoje só internal/ledger) —
+      # não roda a suite inteira do monorepo sob a tag. DATABASE_URL já está
+      # no env do job (mesmo Postgres, schema ledger já migrado acima).
+      - name: "go test -tags integration — internal/ledger contra Postgres real (achado HIGH)"
+        run: make go-test-integration
 
       - name: "RLS isolation — vector (TX-3)"
         run: |
