@@ -1115,6 +1115,63 @@ Fecha o **G0** (Onda de Ativação de Go-Live). Dois itens em 3 commits + o focu
 > case-sensitive, sentinela ZipMap ausente no `ml-full`, doc-lie "4 regras" do console; 5 guardiões PASS — a
 > barreira de dinheiro pegou um falso-positivo que o próprio sweep criou [exclusão `non_money` por-linha]).**
 > Antes da 29ª, o seed **E11 (lado-AdServer)** provisionou as zonas reais 1001–1004 do Hojex News (ver acima).
+> A **30ª** (27 falsos-positivos) achou o que não era gate frouxo e sim **código faltando**: a calibração
+> isotônica era computada e versionada mas **nunca lida no caminho servido** — produção serviria
+> `pCTR_raw × bid`.
+
+> **31ª onda — 11 falsos-positivos e um BUG DE PRODUÇÃO no ledger.** Auditoria adversarial por mutação em
+> 5 superfícies (18 agentes: dono-por-família *find* → cético *default-refute* obrigado a **executar** a
+> mutação) → 13 candidatos, **11 CONFIRMED, 2 REFUTED**.
+>
+> **O achado que nenhum teste pegava.** [internal/ledger/posting.go](internal/ledger/posting.go)
+> `insertPostings` enviava o parâmetro `$2` (um `entryID` duplicado) sem que o SQL **jamais referenciasse
+> `$2`** → o Postgres rejeita com `could not determine data type of parameter $2` (SQLSTATE 42P18). Ou seja,
+> **qualquer** `RecordEntry`/`RecordDeposit`/`RecordPayout`/`RecordReversal`/`RecordFXExchange` real falharia
+> — toda captura Stripe/Asaas/MercadoPago daria 500. Só apareceu ao apontar o **primeiro teste de integração
+> contra um Postgres de verdade**. Causa-raiz: os "testes-guarda de double-entry" validavam uma
+> **reimplementação em memória** (`store` stub), não o código que move dinheiro — 17 das 25 funções de teste
+> nunca tocaram `ledger.RecordEntry`. Fechado com `posting_integration_test.go` (`//go:build integration`)
+> contra PG16 real (idempotência via `ON CONFLICT`, transição `pending→posted`, ordem de validação de asset,
+> direção dos postings); `make go-test-integration` deixou de ser scaffolding (deriva pacotes por build tag,
+> falha se nenhum existir) e entrou no `db.yml`; os testes do stub viraram `TestStub*` para não mentirem
+> cobertura.
+>
+> **Demais achados** (cada um provado por mutação): novo pacote `internal/privacyscan` — gate TX-5
+> **default-deny** de IP bruto em evento/WAL/log (não existia); ad tag deixa de enviar `location.href`
+> completo; doc-lie triplo do contrato `DecideRequest`; scan de PII do copiloto passa a rodar sobre o
+> **payload de escrita** por introspecção (campo de texto livre novo é coberto **por construção**) e para de
+> logar texto livre verbatim; `RAW_TABLES_REQUIRING_DEDUPE` deixa de ser lista hardcoded; teste de isolamento
+> de tenant do ClickHouse deixa de ser órfão da CI; **fail-open da calibração deixa de ser silencioso**
+> (status observável + `healthz` — residual que a 30ª registrou); `policy-check.py` compara capability
+> case-insensitive.
+>
+> **A barreira de guardiões pegou o que o sweep quebrou — 3 de 4 BLOQUEARAM.** (a) **CRITICAL**: o scanner de
+> IP recém-criado **não era default-deny** — `strings.Trim(cand, ".:")` decapitava IPv6, então `::1`,
+> `2001:db8::` e **`::ffff:203.0.113.5`** (a forma que o stack dual-stack do Go entrega o IP do cliente)
+> passavam batido; reescrito com sub-candidatos + `netip.ParseAddr` (entende zona RFC 4007). (b) **HIGH**:
+> `db/seed/dev_roles.sql` **quebrou `make dev-db-setup`** (GRANT em `vector_store` antes da migration existir,
+> sob `ON_ERROR_STOP=1`) e o role não existia na CI. (c) **HIGH**: a derivação nova de dedupe **enfraqueceu**
+> o gate — remover o `ReplacingMergeTree` passou a *isentar* a tabela em vez de violar. (d) **HIGH**:
+> `data-integration-test.py` podia ficar **oco** (sem sentinela de asserção). Todos remediados; **re-guarda
+> 3/3 PASS**.
+>
+> **LIÇÃO NOVA: interromper um sweep no meio deixa sonda de mutação no código.** Ao detectar uma **sessão
+> concorrente viva** no repo, parei a auditoria — e o `TaskStop` matou dois agentes *entre* mutar e restaurar,
+> deixando duas violações TX-2 (`parseFloat("12.34")` e `Number(header) * 1.15`) em arquivos do console/BFF.
+> Elas só ficaram visíveis porque o gate passou a enxergar arquivos antes **untracked** (os 5 scripts
+> `no-float` selecionam por `git ls-files`) — reincidência da lição nº2 da 30ª. Removidas; `make verify` verde.
+> **Corolário: código untracked é invisível a todo gate por `git ls-files` — torne-o visível ao índice antes
+> de alegar cobertura.**
+>
+> Gates de 1ª mão (não auto-relato de subagente): `verify`, `go-build`, `go-vet`, `go-test`, `go-lint`,
+> `parity-golden-short`, `ml-test`, `data-validate`, `db-lint`, `platform-validate`, `copilot-test` — **todos
+> PASS**.
+>
+> ⚠️ **Colisão de numeração a reconciliar:** há trabalho **não-commitado** de outra sessão que também se
+> intitula "31ª onda" no plano (o conserto do gate `web-ci`/`a11y`, que dependia ocultamente de
+> `bff/node_modules`). Como esta onda foi commitada sobre a 30ª, aquela deve ser renumerada para **32ª** ao
+> ser commitada. Esta onda **não tocou** `bff/` nem `web/`.
+
 > **G0 segue código-completo; próximo movimento real = G1 (cutover de infra, gated).**
 
 ### ⏭️ Pendente da Fase 3
