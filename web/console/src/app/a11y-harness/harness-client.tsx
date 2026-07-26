@@ -26,6 +26,7 @@ import { MoneyDisplay } from "@/components/ui/money-display";
 import { PaymentStatusBadge, PaymentRailBadge } from "@/components/ui/payment-status-badge";
 import { HitlDiffPreview } from "@/components/copilot/hitl-diff-preview";
 import { ChatPanel } from "@/components/copilot/chat-panel";
+import { ThemeToggle } from "@/components/ui/theme-toggle";
 import type { WriteDiff, MoneyWire } from "@/lib/copilot-schemas";
 
 // ---------------------------------------------------------------------------
@@ -76,10 +77,10 @@ export function A11yHarness() {
   return (
     <div className="space-y-10">
       <div>
-        <h1 className="text-2xl font-bold text-gray-900">
+        <h1 className="text-2xl font-bold text-foreground">
           Harness de acessibilidade (CI-only)
         </h1>
-        <p className="mt-1 text-sm text-gray-500">
+        <p className="mt-1 text-sm text-muted-foreground">
           Rota gated por <code>A11Y_HARNESS=1</code> — nunca acessível em
           produção. Monta os componentes reais do design system com dados
           fixos, sem BFF/tRPC vivo, para o gate <code>make web-a11y</code>{" "}
@@ -87,8 +88,17 @@ export function A11yHarness() {
         </p>
       </div>
 
+      <section aria-labelledby="h-theme">
+        <h2 id="h-theme" className="text-lg font-semibold text-foreground">
+          Seletor de tema (claro/escuro)
+        </h2>
+        <div className="mt-3">
+          <ThemeToggle />
+        </div>
+      </section>
+
       <section aria-labelledby="h-datasource">
-        <h2 id="h-datasource" className="text-lg font-semibold text-gray-900">
+        <h2 id="h-datasource" className="text-lg font-semibold text-foreground">
           Fonte de dados (ADR-0001)
         </h2>
         <div className="mt-3 flex flex-wrap items-center gap-3">
@@ -101,7 +111,7 @@ export function A11yHarness() {
       </section>
 
       <section aria-labelledby="h-states">
-        <h2 id="h-states" className="text-lg font-semibold text-gray-900">
+        <h2 id="h-states" className="text-lg font-semibold text-foreground">
           Estados de empty / loading / error
         </h2>
         <div className="mt-3 space-y-4">
@@ -119,17 +129,17 @@ export function A11yHarness() {
       </section>
 
       <section aria-labelledby="h-money">
-        <h2 id="h-money" className="text-lg font-semibold text-gray-900">
+        <h2 id="h-money" className="text-lg font-semibold text-foreground">
           Dinheiro (TX-2/DA-10)
         </h2>
-        <div className="mt-3 flex flex-wrap items-center gap-4 text-sm text-gray-900">
+        <div className="mt-3 flex flex-wrap items-center gap-4 text-sm text-foreground">
           <MoneyDisplay money={MONEY_FIAT} />
           <MoneyDisplay money={MONEY_CRYPTO} locale="en-US" />
         </div>
       </section>
 
       <section aria-labelledby="h-payment">
-        <h2 id="h-payment" className="text-lg font-semibold text-gray-900">
+        <h2 id="h-payment" className="text-lg font-semibold text-foreground">
           Status e trilho de pagamento (K7)
         </h2>
         <div className="mt-3 flex flex-wrap items-center gap-2">
@@ -144,10 +154,10 @@ export function A11yHarness() {
       </section>
 
       <section aria-labelledby="h-hitl">
-        <h2 id="h-hitl" className="text-lg font-semibold text-gray-900">
+        <h2 id="h-hitl" className="text-lg font-semibold text-foreground">
           Diff HITL do copiloto (TX-3/CA-4)
         </h2>
-        <p className="mt-1 text-xs text-gray-500">
+        <p className="mt-1 text-xs text-muted-foreground">
           NOTA: este modal implementa focus-trap (Tab/Shift+Tab ciclam dentro do
           diálogo; Escape sai) — verificado mecanicamente por este gate a11y
           (scripts/a11y-check.test.ts simula Tab e afirma que o foco fica no
@@ -168,7 +178,7 @@ export function A11yHarness() {
       </section>
 
       <section aria-labelledby="h-querybuilder">
-        <h2 id="h-querybuilder" className="text-lg font-semibold text-gray-900">
+        <h2 id="h-querybuilder" className="text-lg font-semibold text-foreground">
           Builder de segmentação (§4.6/CA-4) — react-querybuilder
         </h2>
         <div className="mt-3">
@@ -177,15 +187,15 @@ export function A11yHarness() {
       </section>
 
       <section aria-labelledby="h-copilot">
-        <h2 id="h-copilot" className="text-lg font-semibold text-gray-900">
+        <h2 id="h-copilot" className="text-lg font-semibold text-foreground">
           Shell do chat do copiloto (J5)
         </h2>
-        <p className="mt-1 text-xs text-gray-500">
+        <p className="mt-1 text-xs text-muted-foreground">
           Estado idle — nenhuma sessão iniciada, nenhuma chamada de rede
           (startChat só dispara em submit explícito do formulário, que o
           harness não simula).
         </p>
-        <div className="mt-3 h-96 rounded-lg border border-gray-200">
+        <div className="mt-3 h-96 rounded-lg border border-border">
           <ChatPanel />
         </div>
       </section>

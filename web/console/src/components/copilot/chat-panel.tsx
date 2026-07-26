@@ -68,12 +68,12 @@ export function ChatPanel() {
   return (
     <div className="flex h-full flex-col">
       {/* Cabeçalho do painel */}
-      <div className="flex items-center justify-between border-b border-gray-200 px-4 py-3">
+      <div className="flex items-center justify-between border-b border-border px-4 py-3">
         <div>
-          <h2 className="text-sm font-semibold text-gray-900">
+          <h2 className="text-sm font-semibold text-foreground">
             Copiloto do anunciante
           </h2>
-          <p className="text-xs text-gray-500">
+          <p className="text-xs text-muted-foreground">
             Assistente de IA — toda escrita requer aprovacao humana (HITL)
           </p>
         </div>
@@ -82,7 +82,7 @@ export function ChatPanel() {
             type="button"
             onClick={reset}
             disabled={isBusy && state.status !== "hitl_pending"}
-            className="text-xs text-gray-500 underline hover:text-gray-700 focus-visible:ring-2 focus-visible:ring-brand-500 disabled:opacity-40"
+            className="text-xs text-muted-foreground underline hover:text-foreground focus-visible:ring-2 focus-visible:ring-brand-500 disabled:opacity-40"
             aria-label="Iniciar nova sessao"
           >
             Nova sessao
@@ -100,10 +100,10 @@ export function ChatPanel() {
       >
         {state.messages.length === 0 && (
           <div className="flex flex-col items-center justify-center h-full py-12 text-center">
-            <p className="text-sm font-medium text-gray-900">
+            <p className="text-sm font-medium text-foreground">
               Bem-vindo ao copiloto
             </p>
-            <p className="mt-1 text-xs text-gray-500 max-w-xs">
+            <p className="mt-1 text-xs text-muted-foreground max-w-xs">
               Pergunte sobre suas campanhas, solicite analises ou pecas
               sugestoes de otimizacao. Toda acao de escrita requer sua
               aprovacao antes de ser aplicada.
@@ -114,6 +114,8 @@ export function ChatPanel() {
         {state.messages.map((msg, i) => (
           <MessageBubble
             key={i}
+            // prop de DOMÍNIO ("user" | "assistant"), não atributo ARIA —
+            // MessageBubble nunca a repassa para o `role` do elemento.
             role={msg.role}
             content={msg.content}
             streaming={msg.streaming}
@@ -152,10 +154,10 @@ export function ChatPanel() {
           <div
             role="status"
             aria-live="polite"
-            className="flex items-center gap-2 rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-800"
+            className="flex items-center gap-2 rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-800 dark:border-blue-500/25 dark:bg-blue-500/10 dark:text-blue-200"
           >
             <span
-              className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-blue-300 border-t-blue-600"
+              className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-blue-300 border-t-blue-600 dark:border-blue-500/25"
               aria-hidden="true"
             />
             {state.status === "hitl_approving" ? "Aplicando alteração..." : "Cancelando..."}
@@ -167,7 +169,7 @@ export function ChatPanel() {
           <div
             role="alert"
             aria-live="assertive"
-            className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-800"
+            className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-800 dark:border-red-500/25 dark:bg-red-500/10 dark:text-red-200"
           >
             <strong>Erro:</strong> {state.error}
           </div>
@@ -177,7 +179,7 @@ export function ChatPanel() {
         {state.status === "done" && state.usage && (
           <div
             role="status"
-            className="text-xs text-gray-400 text-right"
+            className="text-xs text-muted-foreground text-right"
           >
             Tokens usados: {state.usage.input_tokens} entrada /
             {state.usage.output_tokens} saida
@@ -188,7 +190,7 @@ export function ChatPanel() {
       </div>
 
       {/* Input de mensagem */}
-      <div className="border-t border-gray-200 px-4 py-3">
+      <div className="border-t border-border px-4 py-3">
         <form
           onSubmit={handleSubmit}
           aria-label="Enviar mensagem ao copiloto"
@@ -222,9 +224,9 @@ export function ChatPanel() {
             aria-describedby="copilot-input-hint"
             className={[
               "flex-1 resize-none rounded-lg border px-3 py-2 text-sm",
-              "border-gray-300 bg-white text-gray-900 placeholder-gray-400",
+              "border-border bg-card text-foreground placeholder:text-muted-foreground",
               "focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:outline-none",
-              "disabled:bg-gray-50 disabled:text-gray-400",
+              "disabled:bg-muted disabled:text-muted-foreground",
             ].join(" ")}
           />
           <p id="copilot-input-hint" className="sr-only">
@@ -270,16 +272,42 @@ function MessageBubble({ role, content, streaming }: MessageBubbleProps) {
     <div
       className={["flex", isUser ? "justify-end" : "justify-start"].join(" ")}
     >
+      {/*
+        FIX (31ª onda): este contêiner era um <div> nu com `aria-label`. Um
+        <div>/<span> sem role mapeia para o role implícito `generic`, que
+        PROÍBE nome acessível — o aria-label é descartado pelos leitores de
+        tela (é a regra `aria-prohibited-attr` do axe). Na prática a atribuição
+        de quem falou ("Sua mensagem" / "Resposta do copiloto") simplesmente
+        não era anunciada, e numa conversa alternada isso é a informação mais
+        importante depois do próprio texto.
+        `role="article"` aceita nome de autor e é a semântica correta para uma
+        entrada individual num histórico de conversa.
+      */}
       <div
         className={[
           "max-w-prose rounded-2xl px-4 py-2.5 text-sm",
           isUser
             ? "bg-brand-600 text-white"
-            : "bg-gray-100 text-gray-900",
+            : "bg-muted text-foreground",
           streaming ? "animate-pulse" : "",
         ].join(" ")}
-        aria-label={isUser ? "Sua mensagem" : "Resposta do copiloto"}
       >
+        {/*
+          Atribuição de quem falou como TEXTO visualmente oculto, e não como
+          `aria-label` (31ª onda).
+
+          O `aria-label` estava num <div> nu: role implícito `generic`, que
+          PROÍBE nome acessível — o rótulo era descartado pelos leitores de
+          tela (regra `aria-prohibited-attr` do axe), e numa conversa alternada
+          "quem falou" é a informação mais importante depois do próprio texto.
+          A primeira tentativa desta onda foi pôr `role="article"` para tornar o
+          nome válido; a revisão adversarial apontou o risco de o nome competir
+          com a leitura do conteúdo, dependendo do AT. Texto sr-only não tem
+          essa ambiguidade: é conteúdo, é lido em ordem, funciona em todo AT.
+        */}
+        <span className="sr-only">
+          {isUser ? "Sua mensagem: " : "Resposta do copiloto: "}
+        </span>
         {/* Conteúdo renderizado como whitespace-pre-wrap — React escapa automaticamente */}
         <p className="whitespace-pre-wrap break-words">{content}</p>
         {streaming && (

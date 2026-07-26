@@ -18,6 +18,7 @@
  */
 
 import { createHTTPServer } from "@trpc/server/adapters/standalone";
+import type { Pool as PgPool } from "pg";
 import { router } from "./lib/trpc.js";
 import { createContext } from "./lib/context.js";
 import { createConfigRouter } from "./routers/config.js";
@@ -28,6 +29,12 @@ import { InMemoryConfigAdapter } from "./adapters/in-memory-config.js";
 import { PostgresConfigAdapter } from "./adapters/postgres-config.js";
 import type { ConfigAdapter } from "./adapters/config-adapter.js";
 import { InMemoryStatsAdapter } from "./adapters/in-memory-stats.js";
+import { PostgresStatsAdapter } from "./adapters/postgres-stats.js";
+import type { StatsAdapter } from "./adapters/stats-adapter.js";
+import {
+  UnconfiguredStatsAdapter,
+  syntheticStatsAllowed,
+} from "./adapters/unconfigured-stats.js";
 import { InMemoryPaymentsAdapter } from "./adapters/in-memory-payments.js";
 import {
   PostgresPaymentsAdapter,
@@ -46,7 +53,36 @@ const pgPool = createPgPool();
 const configAdapter: ConfigAdapter = pgPool
   ? new PostgresConfigAdapter(pgPool)
   : new InMemoryConfigAdapter();
-const statsAdapter = new InMemoryStatsAdapter();
+/**
+ * Stats: com BFF_PG_DSN configurado, lê dados REAIS de stats.live_kpis no
+ * Postgres (onda "perfil beta" — sem ClickHouse ainda; queryConsolidated
+ * continua recusando, sem fonte faturável neste perfil — ver
+ * adapters/postgres-stats.ts). Sem BFF_PG_DSN, comportamento intacto: NÃO
+ * podemos servir `Math.random()` rotulado como "Consolidado ≤1h /
+ * faturável" na UI — em produção, sem opt-in explícito, o dashboard falha
+ * de forma visível em vez de fabricar número de cobrança. Ver
+ * adapters/unconfigured-stats.ts para o racional completo (31ª onda).
+ *
+ * Extraída como função pura (em vez de inline) para ser testável por
+ * import direto sem subir o servidor HTTP — ver
+ * adapters/postgres-stats.test.ts ("Fiação em bff/src/index.ts").
+ */
+export function pickStatsAdapter(
+  pool: PgPool | undefined,
+  nodeEnv: string | undefined,
+  allowSyntheticStats: string | undefined
+): StatsAdapter {
+  if (pool) return new PostgresStatsAdapter(pool);
+  return syntheticStatsAllowed(nodeEnv, allowSyntheticStats)
+    ? new InMemoryStatsAdapter()
+    : new UnconfiguredStatsAdapter();
+}
+
+const statsAdapter: StatsAdapter = pickStatsAdapter(
+  pgPool,
+  process.env["NODE_ENV"],
+  process.env["ALLOW_SYNTHETIC_STATS"]
+);
 
 /**
  * K7: adapter de pagamentos — Postgres real quando BFF_PG_DSN configurado;

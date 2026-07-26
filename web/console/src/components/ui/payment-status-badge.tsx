@@ -26,17 +26,20 @@ const STATUS_CONFIG: Record<
 > = {
   pending: {
     label: "Pendente",
-    classes: "bg-amber-100 text-amber-800 ring-1 ring-amber-300",
+    classes:
+      "bg-amber-100 text-amber-800 ring-1 ring-amber-300 dark:bg-amber-500/15 dark:text-amber-200 dark:ring-amber-500/30",
     ariaLabel: "Status: pagamento pendente de confirmacao",
   },
   posted: {
     label: "Confirmado",
-    classes: "bg-green-100 text-green-800 ring-1 ring-green-300",
+    classes:
+      "bg-green-100 text-green-800 ring-1 ring-green-300 dark:bg-green-500/15 dark:text-green-200 dark:ring-green-500/30",
     ariaLabel: "Status: pagamento confirmado e lancado no ledger",
   },
   void: {
     label: "Cancelado",
-    classes: "bg-red-100 text-red-800 ring-1 ring-red-300",
+    classes:
+      "bg-red-100 text-red-800 ring-1 ring-red-300 dark:bg-red-500/15 dark:text-red-200 dark:ring-red-500/30",
     ariaLabel: "Status: pagamento cancelado ou estornado",
   },
 };
@@ -76,22 +79,26 @@ const RAIL_CONFIG: Record<
 > = {
   fiat_stripe: {
     label: "Stripe",
-    classes: "bg-indigo-100 text-indigo-800 ring-1 ring-indigo-200",
+    classes:
+      "bg-indigo-100 text-indigo-800 ring-1 ring-indigo-200 dark:bg-indigo-500/15 dark:text-indigo-200 dark:ring-indigo-500/30",
     ariaLabel: "Trilho: Stripe (cartao/fiat)",
   },
   fiat_asaas: {
     label: "PIX / Asaas",
-    classes: "bg-blue-100 text-blue-800 ring-1 ring-blue-200",
+    classes:
+      "bg-blue-100 text-blue-800 ring-1 ring-blue-200 dark:bg-blue-500/15 dark:text-blue-200 dark:ring-blue-500/30",
     ariaLabel: "Trilho: PIX via Asaas (fiat BRL)",
   },
   fiat_mp: {
     label: "Mercado Pago",
-    classes: "bg-sky-100 text-sky-800 ring-1 ring-sky-200",
+    classes:
+      "bg-sky-100 text-sky-800 ring-1 ring-sky-200 dark:bg-sky-500/15 dark:text-sky-200 dark:ring-sky-500/30",
     ariaLabel: "Trilho: Mercado Pago (failover fiat)",
   },
   crypto_safe: {
     label: "USDC / Safe",
-    classes: "bg-violet-100 text-violet-800 ring-1 ring-violet-200",
+    classes:
+      "bg-violet-100 text-violet-800 ring-1 ring-violet-200 dark:bg-violet-500/15 dark:text-violet-200 dark:ring-violet-500/30",
     ariaLabel: "Trilho: USDC via Safe multisig (cripto)",
   },
 };

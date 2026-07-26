@@ -41,22 +41,22 @@ export function ToolCallIndicator({ tool }: ToolCallIndicatorProps) {
       role="status"
       aria-live="polite"
       aria-label={isDone ? `${label} — concluído` : label}
-      className="flex items-center gap-2 rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-800"
+      className="flex items-center gap-2 rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-800 dark:border-blue-500/25 dark:bg-blue-500/10 dark:text-blue-200"
     >
       {isDone ? (
-        <span aria-hidden="true" className="text-green-600">
+        <span aria-hidden="true" className="text-green-600 dark:text-green-400">
           {/* Checkmark não-colorístico */}
           [OK]
         </span>
       ) : (
         <span
-          className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-blue-300 border-t-blue-600"
+          className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-blue-300 border-t-blue-600 dark:border-blue-500/30 dark:border-t-blue-400"
           aria-hidden="true"
         />
       )}
       <span>{label}</span>
       {isDone && (
-        <span className="ml-auto text-xs text-green-700">Concluído</span>
+        <span className="ml-auto text-xs text-green-700 dark:text-green-300">Concluído</span>
       )}
     </div>
   );

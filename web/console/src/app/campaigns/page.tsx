@@ -92,7 +92,7 @@ export default function CampaignsPage() {
   return (
     <div>
       <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold text-gray-900">Campanhas</h1>
+        <h1 className="text-2xl font-bold text-foreground">Campanhas</h1>
         <button
           onClick={() => setShowForm((v) => !v)}
           className="rounded-md bg-brand-600 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-700 focus-visible:ring-2 focus-visible:ring-brand-500"
@@ -113,13 +113,13 @@ export default function CampaignsPage() {
           })}
           aria-label="Criar campanha"
           noValidate
-          className="mt-4 space-y-4 rounded-lg border border-gray-200 bg-white p-6"
+          className="mt-4 space-y-4 rounded-lg border border-border bg-card p-6"
         >
-          <h2 className="font-semibold text-gray-800">Nova campanha</h2>
+          <h2 className="font-semibold text-foreground">Nova campanha</h2>
 
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label htmlFor="advertiserId" className="block text-sm font-medium text-gray-700">
+              <label htmlFor="advertiserId" className="block text-sm font-medium text-foreground">
                 ID do Anunciante
               </label>
               <input
@@ -127,44 +127,44 @@ export default function CampaignsPage() {
                 type="text"
                 inputMode="numeric"
                 {...register("advertiserId")}
-                className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-500"
+                className="mt-1 w-full rounded-md border border-border px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-500"
               />
               {errors.advertiserId && (
-                <p role="alert" className="mt-1 text-xs text-red-600">{errors.advertiserId.message}</p>
+                <p role="alert" className="mt-1 text-xs text-red-600 dark:text-red-300">{errors.advertiserId.message}</p>
               )}
             </div>
             <div>
-              <label htmlFor="campName" className="block text-sm font-medium text-gray-700">
+              <label htmlFor="campName" className="block text-sm font-medium text-foreground">
                 Nome
               </label>
               <input
                 id="campName"
                 type="text"
                 {...register("name")}
-                className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-500"
+                className="mt-1 w-full rounded-md border border-border px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-500"
               />
               {errors.name && (
-                <p role="alert" className="mt-1 text-xs text-red-600">{errors.name.message}</p>
+                <p role="alert" className="mt-1 text-xs text-red-600 dark:text-red-300">{errors.name.message}</p>
               )}
             </div>
           </div>
 
           <div className="grid grid-cols-3 gap-4">
             <div>
-              <label htmlFor="type" className="block text-sm font-medium text-gray-700">Tipo</label>
-              <select id="type" {...register("type")} className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-500">
+              <label htmlFor="type" className="block text-sm font-medium text-foreground">Tipo</label>
+              <select id="type" {...register("type")} className="mt-1 w-full rounded-md border border-border px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-500">
                 <option value="override">Override</option>
                 <option value="contract">Contract</option>
                 <option value="remnant">Remnant</option>
               </select>
             </div>
             <div>
-              <label htmlFor="priority" className="block text-sm font-medium text-gray-700">Prioridade (1-10)</label>
-              <input id="priority" type="number" min={1} max={10} {...register("priority")} className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-500" />
+              <label htmlFor="priority" className="block text-sm font-medium text-foreground">Prioridade (1-10)</label>
+              <input id="priority" type="number" min={1} max={10} {...register("priority")} className="mt-1 w-full rounded-md border border-border px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-500" />
             </div>
             <div>
-              <label htmlFor="pricingModel" className="block text-sm font-medium text-gray-700">Modelo</label>
-              <select id="pricingModel" {...register("pricingModel")} className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-500">
+              <label htmlFor="pricingModel" className="block text-sm font-medium text-foreground">Modelo</label>
+              <select id="pricingModel" {...register("pricingModel")} className="mt-1 w-full rounded-md border border-border px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-500">
                 <option value="cpm">CPM</option>
                 <option value="cpc">CPC</option>
                 <option value="cpa">CPA</option>
@@ -176,7 +176,7 @@ export default function CampaignsPage() {
           {/* Rate — string DECIMAL, nunca Number (TX-2) */}
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label htmlFor="rateAmount" className="block text-sm font-medium text-gray-700">
+              <label htmlFor="rateAmount" className="block text-sm font-medium text-foreground">
                 Rate (valor decimal, ex.: 5.00)
               </label>
               <input
@@ -185,14 +185,14 @@ export default function CampaignsPage() {
                 inputMode="decimal"
                 placeholder="ex.: 12.50"
                 {...register("rateAmount")}
-                className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-500"
+                className="mt-1 w-full rounded-md border border-border px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-500"
               />
               {errors.rateAmount && (
-                <p role="alert" className="mt-1 text-xs text-red-600">{errors.rateAmount.message}</p>
+                <p role="alert" className="mt-1 text-xs text-red-600 dark:text-red-300">{errors.rateAmount.message}</p>
               )}
             </div>
             <div>
-              <label htmlFor="rateCurrency" className="block text-sm font-medium text-gray-700">
+              <label htmlFor="rateCurrency" className="block text-sm font-medium text-foreground">
                 Moeda (ex.: BRL, USD, USDC)
               </label>
               <input
@@ -200,10 +200,10 @@ export default function CampaignsPage() {
                 type="text"
                 placeholder="BRL"
                 {...register("rateCurrency")}
-                className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-500"
+                className="mt-1 w-full rounded-md border border-border px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-500"
               />
               {errors.rateCurrency && (
-                <p role="alert" className="mt-1 text-xs text-red-600">{errors.rateCurrency.message}</p>
+                <p role="alert" className="mt-1 text-xs text-red-600 dark:text-red-300">{errors.rateCurrency.message}</p>
               )}
             </div>
           </div>
@@ -211,12 +211,12 @@ export default function CampaignsPage() {
           {pricingModel !== "tenancy" && (
             <div className="grid grid-cols-2 gap-4">
               <div>
-                <label htmlFor="goalTarget" className="block text-sm font-medium text-gray-700">Goal Target</label>
-                <input id="goalTarget" type="number" min={1} {...register("goalTarget", { setValueAs: (v: string) => v === "" ? null : parseInt(v, 10) })} className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-500" />
+                <label htmlFor="goalTarget" className="block text-sm font-medium text-foreground">Goal Target</label>
+                <input id="goalTarget" type="number" min={1} {...register("goalTarget", { setValueAs: (v: string) => v === "" ? null : parseInt(v, 10) })} className="mt-1 w-full rounded-md border border-border px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-500" />
               </div>
               <div>
-                <label htmlFor="goalMetric" className="block text-sm font-medium text-gray-700">Goal Metric</label>
-                <select id="goalMetric" {...register("goalMetric")} className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-500">
+                <label htmlFor="goalMetric" className="block text-sm font-medium text-foreground">Goal Metric</label>
+                <select id="goalMetric" {...register("goalMetric")} className="mt-1 w-full rounded-md border border-border px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-500">
                   <option value="impressions">Impressões</option>
                   <option value="clicks">Cliques</option>
                   <option value="conversions">Conversões</option>
@@ -227,14 +227,14 @@ export default function CampaignsPage() {
 
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label htmlFor="startAt" className="block text-sm font-medium text-gray-700">Início</label>
-              <input id="startAt" type="datetime-local" {...register("startAt")} className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-500" />
-              {errors.startAt && <p role="alert" className="mt-1 text-xs text-red-600">{errors.startAt.message}</p>}
+              <label htmlFor="startAt" className="block text-sm font-medium text-foreground">Início</label>
+              <input id="startAt" type="datetime-local" {...register("startAt")} className="mt-1 w-full rounded-md border border-border px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-500" />
+              {errors.startAt && <p role="alert" className="mt-1 text-xs text-red-600 dark:text-red-300">{errors.startAt.message}</p>}
             </div>
             <div>
-              <label htmlFor="endAt" className="block text-sm font-medium text-gray-700">Fim</label>
-              <input id="endAt" type="datetime-local" {...register("endAt")} className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-500" />
-              {errors.endAt && <p role="alert" className="mt-1 text-xs text-red-600">{errors.endAt.message}</p>}
+              <label htmlFor="endAt" className="block text-sm font-medium text-foreground">Fim</label>
+              <input id="endAt" type="datetime-local" {...register("endAt")} className="mt-1 w-full rounded-md border border-border px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-500" />
+              {errors.endAt && <p role="alert" className="mt-1 text-xs text-red-600 dark:text-red-300">{errors.endAt.message}</p>}
             </div>
           </div>
 
@@ -244,7 +244,7 @@ export default function CampaignsPage() {
             <button type="submit" disabled={create.isPending} aria-busy={create.isPending} className="rounded-md bg-brand-600 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-700 focus-visible:ring-2 focus-visible:ring-brand-500 disabled:opacity-50">
               {create.isPending ? "Salvando..." : "Criar"}
             </button>
-            <button type="button" onClick={() => { setShowForm(false); reset(); }} className="rounded-md border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 focus-visible:ring-2 focus-visible:ring-brand-500">
+            <button type="button" onClick={() => { setShowForm(false); reset(); }} className="rounded-md border border-border px-4 py-2 text-sm font-medium text-foreground hover:bg-muted focus-visible:ring-2 focus-visible:ring-brand-500">
               Cancelar
             </button>
           </div>
@@ -255,30 +255,30 @@ export default function CampaignsPage() {
         {data?.length === 0 ? (
           <EmptyState title="Nenhuma campanha" description="Crie a primeira campanha." />
         ) : (
-          <table className="w-full border-collapse rounded-lg border border-gray-200 bg-white text-sm" aria-label="Lista de campanhas">
+          <table className="w-full border-collapse rounded-lg border border-border bg-card text-sm" aria-label="Lista de campanhas">
             <thead>
-              <tr className="border-b border-gray-200 bg-gray-50">
-                <th scope="col" className="px-4 py-3 text-left font-semibold text-gray-700">ID</th>
-                <th scope="col" className="px-4 py-3 text-left font-semibold text-gray-700">Nome</th>
-                <th scope="col" className="px-4 py-3 text-left font-semibold text-gray-700">Tipo</th>
-                <th scope="col" className="px-4 py-3 text-left font-semibold text-gray-700">Modelo</th>
-                <th scope="col" className="px-4 py-3 text-left font-semibold text-gray-700">Rate</th>
-                <th scope="col" className="px-4 py-3 text-left font-semibold text-gray-700">Ativo</th>
+              <tr className="border-b border-border bg-muted">
+                <th scope="col" className="px-4 py-3 text-left font-semibold text-foreground">ID</th>
+                <th scope="col" className="px-4 py-3 text-left font-semibold text-foreground">Nome</th>
+                <th scope="col" className="px-4 py-3 text-left font-semibold text-foreground">Tipo</th>
+                <th scope="col" className="px-4 py-3 text-left font-semibold text-foreground">Modelo</th>
+                <th scope="col" className="px-4 py-3 text-left font-semibold text-foreground">Rate</th>
+                <th scope="col" className="px-4 py-3 text-left font-semibold text-foreground">Ativo</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-gray-100">
+            <tbody className="divide-y divide-border">
               {data?.map((c) => (
-                <tr key={c.id} className="hover:bg-gray-50">
-                  <td className="px-4 py-3 font-mono text-xs text-gray-500">{c.id}</td>
-                  <td className="px-4 py-3 font-medium text-gray-900">{c.name}</td>
-                  <td className="px-4 py-3 capitalize text-gray-600">{c.type}</td>
-                  <td className="px-4 py-3 uppercase text-gray-600">{c.pricingModel}</td>
+                <tr key={c.id} className="hover:bg-muted">
+                  <td className="px-4 py-3 font-mono text-xs text-muted-foreground">{c.id}</td>
+                  <td className="px-4 py-3 font-medium text-foreground">{c.name}</td>
+                  <td className="px-4 py-3 capitalize text-muted-foreground">{c.type}</td>
+                  <td className="px-4 py-3 uppercase text-muted-foreground">{c.pricingModel}</td>
                   <td className="px-4 py-3">
                     {/* MoneyDisplay — NUNCA Number para dinheiro (TX-2) */}
                     <MoneyDisplay money={c.rate} />
                   </td>
                   <td className="px-4 py-3">
-                    <span className={`inline-flex rounded-full px-2 py-0.5 text-xs font-medium ${c.active ? "bg-green-100 text-green-800" : "bg-gray-100 text-gray-600"}`}>
+                    <span className={`inline-flex rounded-full px-2 py-0.5 text-xs font-medium ${c.active ? "bg-green-100 text-green-800 dark:bg-green-500/15 dark:text-green-200" : "bg-muted text-muted-foreground"}`}>
                       {c.active ? "Ativo" : "Inativo"}
                     </span>
                   </td>

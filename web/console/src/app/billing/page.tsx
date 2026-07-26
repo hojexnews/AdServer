@@ -89,10 +89,10 @@ export default function BillingPage() {
 
   return (
     <div>
-      <h1 className="text-2xl font-bold text-gray-900">
+      <h1 className="text-2xl font-bold text-foreground">
         Faturamento e Pagamentos
       </h1>
-      <p className="mt-1 text-sm text-gray-500">
+      <p className="mt-1 text-sm text-muted-foreground">
         Saldo atual e histórico de transacoes do seu tenant.
       </p>
 
@@ -103,11 +103,11 @@ export default function BillingPage() {
       <section aria-labelledby="balances-heading" className="mt-8">
         <h2
           id="balances-heading"
-          className="text-lg font-semibold text-gray-900"
+          className="text-lg font-semibold text-foreground"
         >
           Saldo atual
         </h2>
-        <p className="text-sm text-gray-500">
+        <p className="text-sm text-muted-foreground">
           Valores em tempo real do ledger do seu tenant.
         </p>
 
@@ -140,15 +140,15 @@ export default function BillingPage() {
           ================================================================ */}
       <section
         aria-labelledby="history-heading"
-        className="mt-10 border-t border-gray-200 pt-8"
+        className="mt-10 border-t border-border pt-8"
       >
         <h2
           id="history-heading"
-          className="text-lg font-semibold text-gray-900"
+          className="text-lg font-semibold text-foreground"
         >
           Historico de pagamentos
         </h2>
-        <p className="text-sm text-gray-500">
+        <p className="text-sm text-muted-foreground">
           Transacoes confirmadas, pendentes e canceladas do seu tenant.
         </p>
 
@@ -205,15 +205,15 @@ function BalanceCards({ balances }: { balances: BalanceItem[] }) {
       {balances.map((bal) => (
         <div
           key={bal.asset_code}
-          className="rounded-lg border border-gray-200 bg-white p-5"
+          className="rounded-lg border border-border bg-card p-5"
         >
           <dt className="flex items-center gap-2">
-            <span className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+            <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
               {bal.asset_code}
             </span>
-            <span className="text-xs text-gray-400">{bal.label}</span>
+            <span className="text-xs text-muted-foreground">{bal.label}</span>
           </dt>
-          <dd className="mt-2 text-2xl font-bold text-gray-900">
+          <dd className="mt-2 text-2xl font-bold text-foreground">
             {/*
               MoneyDisplay recebe { amount: string, currency: string }.
               amount é string DECIMAL — NUNCA Number (TX-2).
@@ -223,7 +223,7 @@ function BalanceCards({ balances }: { balances: BalanceItem[] }) {
               money={{ amount: bal.amount, currency: bal.asset_code }}
             />
           </dd>
-          <p className="mt-1 text-xs text-gray-400">
+          <p className="mt-1 text-xs text-muted-foreground">
             {bal.scale} casas decimais
           </p>
         </div>
@@ -240,61 +240,61 @@ function BalanceCards({ balances }: { balances: BalanceItem[] }) {
 
 function PaymentTable({ items }: { items: PaymentStatusItem[] }) {
   return (
-    <div className="mt-4 overflow-x-auto rounded-lg border border-gray-200 bg-white">
+    <div className="mt-4 overflow-x-auto rounded-lg border border-border bg-card">
       <table
         className="w-full border-collapse text-sm"
         aria-label="Historico de pagamentos"
       >
         <thead>
-          <tr className="border-b border-gray-200 bg-gray-50">
+          <tr className="border-b border-border bg-muted">
             <th
               scope="col"
-              className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-600"
+              className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground"
             >
               ID
             </th>
             <th
               scope="col"
-              className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-600"
+              className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground"
             >
               Data
             </th>
             <th
               scope="col"
-              className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-600"
+              className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground"
             >
               Trilho
             </th>
             <th
               scope="col"
-              className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-600"
+              className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground"
             >
               Status
             </th>
             <th
               scope="col"
-              className="px-4 py-3 text-right text-xs font-semibold uppercase tracking-wide text-gray-600"
+              className="px-4 py-3 text-right text-xs font-semibold uppercase tracking-wide text-muted-foreground"
             >
               Valor
             </th>
             <th
               scope="col"
-              className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-gray-600"
+              className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground"
             >
               Referencia
             </th>
           </tr>
         </thead>
-        <tbody className="divide-y divide-gray-100">
+        <tbody className="divide-y divide-border">
           {items.map((item) => (
-            <tr key={item.payment_id} className="hover:bg-gray-50">
+            <tr key={item.payment_id} className="hover:bg-muted">
               {/* ID opaco — não revela PII */}
-              <td className="px-4 py-3 font-mono text-xs text-gray-400">
+              <td className="px-4 py-3 font-mono text-xs text-muted-foreground">
                 {item.payment_id}
               </td>
 
               {/* Data formatada via Intl — sem Number() para dinheiro */}
-              <td className="whitespace-nowrap px-4 py-3 text-xs text-gray-600">
+              <td className="whitespace-nowrap px-4 py-3 text-xs text-muted-foreground">
                 {new Date(item.created_at).toLocaleString("pt-BR", {
                   dateStyle: "short",
                   timeStyle: "short",
@@ -312,7 +312,7 @@ function PaymentTable({ items }: { items: PaymentStatusItem[] }) {
               </td>
 
               {/* Valor: MoneyDisplay — string DECIMAL + currency, NUNCA Number (TX-2) */}
-              <td className="px-4 py-3 text-right font-semibold tabular-nums text-gray-900">
+              <td className="px-4 py-3 text-right font-semibold tabular-nums text-foreground">
                 <MoneyDisplay money={item.amount} />
               </td>
 
@@ -347,7 +347,7 @@ function OpaqueRef({
     const short = pix.length > 12 ? `${pix.slice(0, 8)}...${pix.slice(-4)}` : pix;
     return (
       <span
-        className="font-mono text-xs text-gray-500"
+        className="font-mono text-xs text-muted-foreground"
         title={`PIX E2E: ${pix}`}
         aria-label={`Identificador PIX: ${pix}`}
       >
@@ -363,7 +363,7 @@ function OpaqueRef({
         : txHash;
     return (
       <span
-        className="font-mono text-xs text-gray-500"
+        className="font-mono text-xs text-muted-foreground"
         title={`TX: ${txHash}`}
         aria-label={`Hash da transacao on-chain: ${txHash}`}
       >
@@ -372,7 +372,7 @@ function OpaqueRef({
     );
   }
 
-  return <span className="text-xs text-gray-400" aria-label="Sem referencia">—</span>;
+  return <span className="text-xs text-muted-foreground" aria-label="Sem referencia">—</span>;
 }
 
 // ---------------------------------------------------------------------------
@@ -401,7 +401,7 @@ function Pagination({
 
   return (
     <nav
-      className="mt-4 flex items-center justify-between text-sm text-gray-600"
+      className="mt-4 flex items-center justify-between text-sm text-muted-foreground"
       aria-label="Paginacao do historico de pagamentos"
     >
       <span>
@@ -411,7 +411,7 @@ function Pagination({
         <button
           onClick={onPrev}
           disabled={page === 1}
-          className="rounded-md border border-gray-300 px-3 py-1.5 text-sm font-medium hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:ring-2 focus-visible:ring-brand-500"
+          className="rounded-md border border-border px-3 py-1.5 text-sm font-medium hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40 focus-visible:ring-2 focus-visible:ring-brand-500"
           aria-label="Pagina anterior"
         >
           Anterior
@@ -419,7 +419,7 @@ function Pagination({
         <button
           onClick={onNext}
           disabled={!hasMore}
-          className="rounded-md border border-gray-300 px-3 py-1.5 text-sm font-medium hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-40 focus-visible:ring-2 focus-visible:ring-brand-500"
+          className="rounded-md border border-border px-3 py-1.5 text-sm font-medium hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40 focus-visible:ring-2 focus-visible:ring-brand-500"
           aria-label="Proxima pagina"
         >
           Proxima

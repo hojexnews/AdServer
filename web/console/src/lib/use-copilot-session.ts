@@ -22,7 +22,7 @@
 
 "use client";
 
-import { useCallback, useReducer, useRef } from "react";
+import { useCallback, useEffect, useReducer, useRef } from "react";
 import { trpc } from "@/lib/trpc";
 import { parseSseEvent } from "@/lib/copilot-schemas";
 import type {
@@ -84,7 +84,7 @@ export interface CopilotSessionState {
 // Reducer
 // ---------------------------------------------------------------------------
 
-type Action =
+export type Action =
   | { type: "START_CHAT"; sessionId: string; threadId: string }
   | { type: "ADD_USER_MESSAGE"; content: string }
   | { type: "BEGIN_STREAMING" }
@@ -98,7 +98,7 @@ type Action =
   | { type: "HITL_RESOLVED" }
   | { type: "RESET" };
 
-const INITIAL_STATE: CopilotSessionState = {
+export const INITIAL_STATE: CopilotSessionState = {
   status: "idle",
   messages: [],
   activeTool: null,
@@ -109,7 +109,16 @@ const INITIAL_STATE: CopilotSessionState = {
   error: null,
 };
 
-function reducer(state: CopilotSessionState, action: Action): CopilotSessionState {
+/**
+ * Reducer da máquina de estado da sessão do copiloto.
+ *
+ * Exportado para teste pelo MESMO motivo que checkDiffForContradictions:
+ * é uma função pura e o `make web-test` não tem como montar React. Antes da
+ * 31ª onda o reducer não tinha NENHUM teste — a bolha fantasma pós-HITL
+ * (HITL_RESOLVED + BEGIN_STREAMING inserindo dois slots) viveu invisível ao
+ * gate verde. Ver use-copilot-session.test.ts.
+ */
+export function reducer(state: CopilotSessionState, action: Action): CopilotSessionState {
   switch (action.type) {
     case "RESET":
       return { ...INITIAL_STATE };
@@ -216,12 +225,18 @@ function reducer(state: CopilotSessionState, action: Action): CopilotSessionStat
       return { ...state, status: "hitl_rejecting" };
 
     case "HITL_RESOLVED":
+      // NÃO abre slot de mensagem aqui. Quem abre é BEGIN_STREAMING, disparado
+      // por openStream() logo em seguida em approve()/reject().
+      //
+      // FIX (31ª onda, copilot-hitl-resolved-phantom-bubble): esta action
+      // inseria um slot `{role:"assistant", content:"", streaming:true}` e o
+      // BEGIN_STREAMING subsequente inseria OUTRO. Como TOKEN só concatena no
+      // ÚLTIMO slot, o primeiro ficava vazio para sempre — uma bolha fantasma
+      // permanente na conversa após cada aprovação/rejeição HITL.
       return {
         ...state,
         status: "streaming",
         hitl: null,
-        // Abre novo slot para resposta pós-HITL
-        messages: [...state.messages, { role: "assistant", content: "", streaming: true }],
       };
 
     default:
@@ -331,7 +346,20 @@ export async function resolveContradictionWarning(
 export function useCopilotSession() {
   const [state, dispatch] = useReducer(reducer, INITIAL_STATE);
   const esRef = useRef<EventSource | null>(null);
-  const pendingMessageRef = useRef<string>("");
+
+  // FIX (31ª onda, copilot-eventsource-no-unmount-cleanup): o hook abria
+  // EventSource mas NUNCA o fechava no unmount. Sair de /copilot no meio de um
+  // stream deixava a conexão SSE viva — segurando um socket no browser, uma
+  // requisição aberta na rota Next e um turno do grafo no serviço do copiloto,
+  // sem nenhum consumidor. Navegar e voltar várias vezes acumulava conexões
+  // órfãs (cada aba do browser tem limite de conexões HTTP por origem).
+  // reset() já fechava, mas dependia de o usuário clicar — não do ciclo de vida.
+  useEffect(() => {
+    return () => {
+      esRef.current?.close();
+      esRef.current = null;
+    };
+  }, []);
 
   const chatMutation = trpc.copilot.chat.useMutation();
   const approveMutation = trpc.copilot.hitlApprove.useMutation();
@@ -384,36 +412,73 @@ export function useCopilotSession() {
       };
 
       es.addEventListener("token", (e) => {
-        const ev = parseSseEvent(e.data);
+        const ev = parseSseEvent(e.data, "token");
         if (ev?.type === "token") {
           dispatch({ type: "TOKEN", text: ev.text });
         }
       });
 
       es.addEventListener("tool_call", (e) => {
-        const ev = parseSseEvent(e.data);
+        const ev = parseSseEvent(e.data, "tool_call");
         if (ev?.type === "tool_call") {
           dispatch({ type: "TOOL_CALL", event: ev });
         }
       });
 
       es.addEventListener("hitl_required", (e) => {
-        const ev = parseSseEvent(e.data);
-        if (ev?.type === "hitl_required") {
-          // Para o stream — o usuário deve aprovar antes de continuar
+        const ev = parseSseEvent(e.data, "hitl_required");
+
+        // FAIL-CLOSED (31ª onda, hitl-diff-schema-mismatch-drops-event).
+        //
+        // Antes, um `hitl_required` que não passasse no WriteDiffSchema caía
+        // no `if` e era DESCARTADO EM SILÊNCIO: o diálogo de aprovação nunca
+        // aparecia, o stream não era fechado por esta via e o grafo LangGraph
+        // ficava interrompido para sempre esperando uma aprovação impossível.
+        // O usuário via apenas "Falha na conexão" (do listener de error, quando
+        // o upstream encerrava) — diagnóstico que aponta para o lugar errado.
+        //
+        // O caminho é real, não hipotético: services/copilot/app/server.py:285
+        // emite `interrupt_value.get("diff", {})` — o default `{}` não tem
+        // `kind` e portanto NUNCA satisfaz a discriminatedUnion do console.
+        // Além disso o schema aqui é um espelho manual do contrato Python, sem
+        // gate de paridade: qualquer novo `kind` no grafo cai neste ramo.
+        //
+        // Uma escrita pendente de aprovação humana é exatamente o lugar onde
+        // "descartar em silêncio" é inaceitável: preferimos falhar visível.
+        if (ev?.type !== "hitl_required") {
           closeEs();
-          // CA-4: busca as regras existentes do owner e roda a validação
-          // anti-contradição REAL (FIX #17) antes de exibir o diff ao usuário.
-          void resolveContradictionWarning(ev.diff, listExistingRules).then(
-            (warning) => {
-              dispatch({ type: "HITL_REQUIRED", event: ev, warning });
-            }
-          );
+          dispatch({
+            type: "ERROR",
+            message:
+              "O copiloto pediu aprovação humana, mas o formato da alteração " +
+              "não foi reconhecido por esta versão do console. Nada foi " +
+              "aplicado. Recarregue a página e tente novamente; se persistir, " +
+              "avise o suporte (incompatibilidade de contrato copiloto↔console).",
+          });
+          return;
         }
+
+        // Para o stream — o usuário deve aprovar antes de continuar
+        closeEs();
+        // CA-4: busca as regras existentes do owner e roda a validação
+        // anti-contradição REAL (FIX #17) antes de exibir o diff ao usuário.
+        //
+        // O .catch() é obrigatório: sem ele, uma rejeição aqui viraria
+        // unhandled rejection e o diálogo HITL nunca seria montado (mesmo
+        // sintoma de "usuário preso" descrito acima). Em falha, seguimos
+        // conservadores — exibimos o diff SEM o aviso de contradição, nunca
+        // engolimos o pedido de aprovação.
+        void resolveContradictionWarning(ev.diff, listExistingRules)
+          .then((warning) => {
+            dispatch({ type: "HITL_REQUIRED", event: ev, warning });
+          })
+          .catch(() => {
+            dispatch({ type: "HITL_REQUIRED", event: ev, warning: null });
+          });
       });
 
       es.addEventListener("done", (e) => {
-        const ev = parseSseEvent(e.data);
+        const ev = parseSseEvent(e.data, "done");
         if (ev?.type === "done") {
           dispatch({ type: "DONE", event: ev });
         }
@@ -423,7 +488,7 @@ export function useCopilotSession() {
       es.addEventListener("error", (e) => {
         // Dois casos: erro de rede (e.data vazio) ou erro do copiloto (e.data com JSON)
         if (e instanceof MessageEvent && e.data) {
-          const ev = parseSseEvent(e.data);
+          const ev = parseSseEvent(e.data, "error");
           if (ev?.type === "error") {
             dispatch({ type: "ERROR", message: ev.message });
             closeEs();
@@ -443,7 +508,6 @@ export function useCopilotSession() {
   // ---------------------------------------------------------------------------
   const startChat = useCallback(
     async (message: string, sessionId?: string) => {
-      pendingMessageRef.current = message;
       dispatch({ type: "ADD_USER_MESSAGE", content: message });
 
       let result: { sessionId: string; streamUrl: string; threadId: string };

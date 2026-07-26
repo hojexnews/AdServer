@@ -120,27 +120,27 @@ export function HitlDiffPreview({
       aria-modal="true"
       aria-labelledby="hitl-diff-title"
       aria-describedby="hitl-diff-desc"
-      className="rounded-xl border-2 border-brand-300 bg-white p-6 shadow-lg"
+      className="rounded-xl border-2 border-brand-300 bg-card p-6 shadow-lg"
     >
       {/* Header */}
       <div className="flex items-start justify-between gap-4">
         <div>
           <h2
             id="hitl-diff-title"
-            className="text-base font-semibold text-gray-900"
+            className="text-base font-semibold text-foreground"
           >
             Revisao obrigatoria — acao proposta pelo copiloto
           </h2>
           <p
             id="hitl-diff-desc"
-            className="mt-1 text-sm text-gray-600"
+            className="mt-1 text-sm text-muted-foreground"
           >
             {/* Conteúdo do LLM renderizado como texto puro — sem dangerouslySetInnerHTML */}
             {message}
           </p>
         </div>
         <span
-          className="inline-flex shrink-0 items-center rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-medium text-amber-800 ring-1 ring-amber-300"
+          className="inline-flex shrink-0 items-center rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-medium text-amber-800 ring-1 ring-amber-300 dark:bg-amber-500/15 dark:text-amber-200 dark:ring-amber-500/30"
           aria-label="Acao pendente de aprovacao humana"
         >
           Pendente de aprovacao
@@ -152,7 +152,7 @@ export function HitlDiffPreview({
         <div
           role="alert"
           aria-live="assertive"
-          className="mt-4 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-800"
+          className="mt-4 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-800 dark:border-red-500/25 dark:bg-red-500/10 dark:text-red-300"
         >
           <strong>Contradição detectada (CA-4):</strong> {contradictionWarning}
         </div>
@@ -161,7 +161,7 @@ export function HitlDiffPreview({
       {/* Aviso geral: nada foi aplicado ainda */}
       <div
         role="note"
-        className="mt-4 rounded-md border border-blue-200 bg-blue-50 p-3 text-sm text-blue-800"
+        className="mt-4 rounded-md border border-blue-200 bg-blue-50 p-3 text-sm text-blue-800 dark:border-blue-500/25 dark:bg-blue-500/10 dark:text-blue-300"
       >
         <strong>Nada foi aplicado ainda.</strong> Revise o que sera alterado abaixo
         e clique em <strong>Aplicar</strong> para confirmar ou <strong>Cancelar</strong> para descartar.
@@ -181,7 +181,7 @@ export function HitlDiffPreview({
           disabled={busy}
           className={[
             "rounded-md px-4 py-2 text-sm font-medium ring-1",
-            "text-gray-700 ring-gray-300 bg-white hover:bg-gray-50",
+            "text-foreground ring-border bg-card hover:bg-muted",
             "focus-visible:ring-2 focus-visible:ring-brand-500",
             "disabled:opacity-50",
           ].join(" ")}
@@ -231,7 +231,7 @@ export function HitlDiffPreview({
 function DiffBody({ diff }: { diff: WriteDiff }) {
   return (
     <div
-      className="rounded-lg border border-gray-200 bg-gray-50 p-4 text-sm font-mono"
+      className="rounded-lg border border-border bg-muted p-4 text-sm font-mono"
       aria-label="Detalhes da operacao proposta"
     >
       <div className="mb-3 flex items-center gap-2">
@@ -249,9 +249,9 @@ function DiffBody({ diff }: { diff: WriteDiff }) {
 
 function DiffKindBadge({ kind, action }: { kind: string; action: string }) {
   const actionColors: Record<string, string> = {
-    create: "bg-green-100 text-green-800 ring-green-300",
-    update: "bg-blue-100 text-blue-800 ring-blue-300",
-    delete: "bg-red-100 text-red-800 ring-red-300",
+    create: "bg-green-100 text-green-800 ring-green-300 dark:bg-green-500/15 dark:text-green-200 dark:ring-green-500/30",
+    update: "bg-blue-100 text-blue-800 ring-blue-300 dark:bg-blue-500/15 dark:text-blue-200 dark:ring-blue-500/30",
+    delete: "bg-red-100 text-red-800 ring-red-300 dark:bg-red-500/15 dark:text-red-200 dark:ring-red-500/30",
   };
   const kindLabels: Record<string, string> = {
     campaign: "Campanha",
@@ -260,7 +260,7 @@ function DiffKindBadge({ kind, action }: { kind: string; action: string }) {
     cap: "Cap de entrega",
     zone_link: "Vinculo campanha-zona",
   };
-  const color = actionColors[action] ?? "bg-gray-100 text-gray-800 ring-gray-300";
+  const color = actionColors[action] ?? "bg-muted text-foreground ring-border";
   return (
     <span
       className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ring-1 ${color}`}
@@ -279,9 +279,9 @@ function DiffRow({ label, value }: { label: string; value: string | undefined | 
   if (value == null) return null;
   return (
     <div className="flex gap-2">
-      <dt className="w-32 shrink-0 text-gray-500">{label}:</dt>
+      <dt className="w-32 shrink-0 text-muted-foreground">{label}:</dt>
       {/* Conteúdo escapado pelo React — sem dangerouslySetInnerHTML */}
-      <dd className="m-0 text-gray-900">{value}</dd>
+      <dd className="m-0 text-foreground">{value}</dd>
     </div>
   );
 }
@@ -291,8 +291,8 @@ function MoneyRow({ label, money }: { label: string; money: MoneyWire | null | u
   // TX-2: formata a partir de string DECIMAL, nunca de Number
   return (
     <div className="flex gap-2">
-      <dt className="w-32 shrink-0 text-gray-500">{label}:</dt>
-      <dd className="m-0 text-gray-900">{formatMoney(money)}</dd>
+      <dt className="w-32 shrink-0 text-muted-foreground">{label}:</dt>
+      <dd className="m-0 text-foreground">{formatMoney(money)}</dd>
     </div>
   );
 }

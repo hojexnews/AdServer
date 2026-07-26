@@ -1,18 +1,47 @@
 /**
  * Tokens CSS-first (Tailwind v4).
- * White-label: variáveis CSS sobrescrevíveis por tenant em runtime.
+ *
+ * Duas camadas de cor:
+ *   1. Escala de MARCA (--color-brand-*) — white-label, sobrescrita por
+ *      tenant via middleware. Usada em acentos sólidos (botões, ring, spinner).
+ *   2. Tokens SEMÂNTICOS de superfície (--color-background/foreground/card/
+ *      muted/border) — trocam entre claro e escuro. Componentes usam
+ *      `bg-background`, `bg-card`, `text-foreground`, `text-muted-foreground`,
+ *      `border-border` e NUNCA `bg-white`/`bg-gray-*` fixos, para que o tema
+ *      escuro seja automático (sem `dark:` espalhado pela árvore).
+ *
+ * Tema escuro: classe `.dark` no <html> (aplicada antes da hidratação por
+ * THEME_INIT_SCRIPT — ver src/lib/theme.ts). O `@custom-variant dark` abaixo
+ * liga as utilidades `dark:` a essa classe (Tailwind v4 default seria
+ * prefers-color-scheme; queremos toggle manual + preferência do sistema).
  */
 
 @import "tailwindcss";
 
+@custom-variant dark (&:where(.dark, .dark *));
+
 @theme {
-  /* Paleta base — sobrescrita por tenant via middleware */
+  /* ---- Escala de marca (claro) — white-label por tenant --------------- */
   --color-brand-50: oklch(97% 0.02 255);
   --color-brand-100: oklch(93% 0.05 255);
+  --color-brand-200: oklch(88% 0.07 255);
+  --color-brand-300: oklch(80% 0.11 255); /* tom-texto no escuro (dark:text-brand-300) */
+  --color-brand-400: oklch(68% 0.16 255);
   --color-brand-500: oklch(55% 0.18 255);
   --color-brand-600: oklch(48% 0.20 255);
   --color-brand-700: oklch(40% 0.20 255);
+  --color-brand-800: oklch(33% 0.18 255);
   --color-brand-900: oklch(25% 0.15 255);
+
+  /* ---- Tokens semânticos de superfície (claro) ------------------------ */
+  --color-background: oklch(98.5% 0.002 255);
+  --color-foreground: oklch(22% 0.02 264);
+  --color-card: oklch(100% 0 0);
+  --color-card-foreground: oklch(22% 0.02 264);
+  --color-muted: oklch(96.5% 0.004 264);
+  --color-muted-foreground: oklch(45% 0.02 264);
+  --color-border: oklch(92% 0.004 264);
+  --color-ring: var(--color-brand-500);
 
   /* Indicadores de fonte de dados (ADR-0001) */
   --color-source-consolidated: oklch(55% 0.15 155); /* verde */
@@ -26,9 +55,37 @@
   --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
 }
 
+/**
+ * Tema escuro — sobrescreve APENAS os valores das variáveis (não re-registra
+ * utilidades). Especificidade de `.dark` empata com `:root` do @theme e vence
+ * por ordem de fonte.
+ *
+ * Marca: sobrescrevemos só os tons CLAROS (50/100/200), usados como superfície
+ * sutil (hover / track de spinner), para não clarearem no escuro. Os tons
+ * médios/escuros (500/600/700) ficam INTOCADOS — servem de fundo sólido de
+ * botão com texto branco (`bg-brand-600 hover:bg-brand-700 text-white`) e
+ * precisam manter contraste AA em ambos os temas. Marca-como-TEXTO
+ * (`text-brand-700`) recebe `dark:text-brand-300` no ponto de uso, pois o mesmo
+ * 700 é fundo de botão.
+ */
+.dark {
+  --color-background: oklch(20% 0.015 264);
+  --color-foreground: oklch(96% 0.005 264);
+  --color-card: oklch(24% 0.017 264);
+  --color-card-foreground: oklch(96% 0.005 264);
+  --color-muted: oklch(28% 0.017 264);
+  --color-muted-foreground: oklch(74% 0.025 264);
+  --color-border: oklch(33% 0.015 264);
+
+  /* Tons claros da marca → superfícies sutis escuras */
+  --color-brand-50: oklch(30% 0.05 255);
+  --color-brand-100: oklch(35% 0.07 255);
+  --color-brand-200: oklch(42% 0.09 255);
+}
+
 /* Acessibilidade: foco visível em todos os interativos */
 :focus-visible {
-  outline: 2px solid var(--color-brand-500);
+  outline: 2px solid var(--color-ring);
   outline-offset: 2px;
 }
 

@@ -148,16 +148,52 @@ export type SseDoneEvent = z.infer<typeof SseDoneEventSchema>;
 export type SseErrorEvent = z.infer<typeof SseErrorEventSchema>;
 
 /**
- * Parseia um evento SSE bruto (data: <json>) com segurança.
- * Retorna null se o JSON for inválido ou o tipo desconhecido.
- * NUNCA lança — o caller decide o que fazer com null.
+ * Parseia um evento SSE bruto com segurança. NUNCA lança — o caller decide o
+ * que fazer com null.
+ *
+ * @param raw       o corpo do campo `data:` do frame SSE.
+ * @param eventName o nome do evento SSE (campo `event:` do frame), disponível
+ *   em cada `es.addEventListener("<nome>", ...)`. OBRIGATÓRIO desde a 31ª onda.
+ *
+ * ACHADO CRÍTICO (31ª onda, hitl-diff-schema-mismatch-drops-event, ampliado
+ * pela revisão adversarial do próprio diff):
+ *
+ * O contrato do serviço copiloto põe o tipo no CAMPO `event:` do frame SSE, e
+ * o payload de `data:` NÃO tem campo `type` —
+ * `services/copilot/app/server.py:633 _sse(event, data)` monta
+ * `event: <nome>\ndata: <json-sem-type>`. Exemplos reais emitidos:
+ *   token         -> {"text": "..."}
+ *   tool_call     -> {"tool": "...", "status": "...", "result": ...}
+ *   hitl_required -> {"thread_id": "...", "diff": {...}, "message": "..."}
+ *   done          -> {"session_id": "...", "thread_id": "...", "usage": {...}}
+ *
+ * Este parser, porém, validava com uma `discriminatedUnion("type", ...)` sobre
+ * o payload — que EXIGE `type` dentro do data. Ou seja: TODO evento falhava o
+ * parse e devolvia null, sempre, para todos os tipos. Como cada listener em
+ * use-copilot-session.ts fazia `if (ev?.type === "...")`, o efeito era a
+ * interface inteira do copiloto não fazer nada: nenhum token renderizado,
+ * nenhuma ferramenta indicada, nenhum diálogo de aprovação HITL, nenhum
+ * encerramento. Não era um caso de borda — era o caminho normal.
+ *
+ * A correção é reconstruir o tipo a partir do NOME DO EVENTO (a informação
+ * que o SSE de fato carrega) antes de validar, mantendo os schemas Zod como
+ * validação real da FORMA do payload.
  */
-export function parseSseEvent(raw: string): SseEvent | null {
+export function parseSseEvent(
+  raw: string,
+  eventName: string
+): SseEvent | null {
   try {
     const parsed: unknown = JSON.parse(raw);
-    const result = SseEventSchema.safeParse(parsed);
-    if (result.success) return result.data;
-    return null;
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return null;
+    }
+    // O tipo vem do frame SSE, não do corpo. Se o corpo trouxer um `type`
+    // (contrato futuro), o nome do evento continua sendo a autoridade —
+    // é ele que o navegador usou para despachar este listener.
+    const withType = { ...(parsed as Record<string, unknown>), type: eventName };
+    const result = SseEventSchema.safeParse(withType);
+    return result.success ? result.data : null;
   } catch {
     return null;
   }

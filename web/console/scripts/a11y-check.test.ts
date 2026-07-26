@@ -90,13 +90,18 @@ const AXE_TAGS = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"];
 // em CI nenhum.
 //
 // COBERTURA HONESTA (o que este gate PROVA e o que NÃO prova):
-//   Este runner NÃO sobe o BFF (next.config.ts só reescreve /api/trpc/* para
-//   o BFF quando NODE_ENV!=="production"; `next start`, usado aqui, roda em
-//   NODE_ENV=production — sem essa reescrita, e sem uma topologia de
-//   proxy/ingress de produção definida no repo hoje, não há como este teste
-//   fazer /api/trpc/* alcançar um BFF real. Inventar uma rota especial só
-//   para o teste divergiria do binário testado). Consequência mensurável
-//   por página:
+//   Este runner NÃO sobe o BFF. ATENÇÃO — o motivo MUDOU na 31ª onda e este
+//   comentário foi corrigido junto (achado R1-a11y-doclie-rewrite-rationale):
+//   a justificativa anterior dizia que "next.config.ts só reescreve /api/trpc/*
+//   quando NODE_ENV!=='production'". Essa condicional NÃO EXISTE MAIS: o
+//   proxy para o BFF passou a ser um route handler
+//   (src/app/api/trpc/[trpc]/route.ts) que vale em TODO ambiente, porque a
+//   ausência dele em produção deixava o console inteiro sem control-plane.
+//   O motivo real, hoje, é mais simples: este runner não INICIA um processo do
+//   BFF nem um Postgres, então /api/trpc/* alcança o route handler e recebe
+//   502 (upstream inalcançável). Subir a stack inteira aqui transformaria um
+//   gate de acessibilidade em teste de integração — fora do escopo deste alvo.
+//   Consequência mensurável por página:
 //     - /rules e /copilot: NÃO dependem de nenhuma query tRPC para o
 //       primeiro render — o formulário do builder (RHF+Zod, <select> de
 //       vetor, cada campo do form) e o layout do chat renderizam por
