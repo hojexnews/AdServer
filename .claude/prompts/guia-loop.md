@@ -62,7 +62,61 @@ make beta-down
 
 ---
 
-## 3. A árvore de decisão do driver
+## 3. O ciclo completo
+
+Uma volta inteira, do `/ciclo-dev` até o push — e de volta ao começo. O losango
+**6** é onde está o valor: a barreira reentra em si mesma até passar.
+
+```mermaid
+flowchart TD
+    START(["/ciclo-dev"]) --> STATE["<b>1 · Estado de 1ª mão</b><br/>git log · git status · README<br/>sessão concorrente viva?"]
+
+    STATE --> Q1{"onda aberta<br/>na árvore?"}
+    Q1 -->|sim| FECHAR
+    Q1 -->|não| Q2{"guardião bloqueou<br/>e não voltou<br/>à barreira?"}
+    Q2 -->|sim| FECHAR
+    Q2 -->|não| Q3{"residual de código<br/>da última onda?"}
+    Q3 -->|sim| EXEC
+    Q3 -->|não| Q4{"item pendente numa<br/>escada E-n do plano?"}
+    Q4 -->|sim| PASSO
+    Q4 -->|não| Q5{"plano corrente<br/>concluído?"}
+    Q5 -->|sim| VARRE
+    Q5 -->|não| Q6{"doc ↔ código<br/>divergente?"}
+    Q6 -->|sim| COER
+    Q6 -->|não| Q7{"escopo novo sem<br/>âncora normativa?"}
+    Q7 -->|sim| DOC
+    Q7 -->|não| STOP(["<b>PARAR</b><br/>só restam G1…G4 (infra)<br/>ou S1…S8 (gatilho)<br/>pedir aprovação humana"])
+
+    EXEC["/executar"] --> WORK
+    PASSO["/proximo-passo"] --> WORK
+    VARRE["/varredura"] --> WORK
+    COER["/coerencia"] --> WORK
+    DOC["/doc-tecnica → /plano-addon"] --> WORK
+
+    WORK["<b>2 · Trabalho pelo dono do addon</b><br/>bundles em arquivos DISJUNTOS"] --> ANCHOR{"ancorado em<br/>DA-n · TX-n · CA-n · ADR?"}
+    ANCHOR -->|não| DOC
+    ANCHOR -->|sim| MUT["<b>3 · Prova por mutação</b><br/>o gate pega o defeito que<br/>ele promete pegar?"]
+    MUT --> IDX["<b>4 · Visível ao índice</b><br/>git add real — gate por<br/>git ls-files é cego a untracked"]
+    IDX --> REGATE["<b>5 · Re-gate de 1ª mão</b><br/>saída colada<br/>auto-relato NÃO conta"]
+
+    REGATE --> BAR{"<b>6 · Barreira</b><br/>money · security · privacy<br/>parity · tech-lead"}
+    BAR -->|BLOQUEIO| REMED["remediar NA MESMA onda"]
+    REMED --> BAR
+    BAR -->|"PASS · 0 CRITICAL/HIGH"| FECHAR
+
+    FECHAR["<b>7 · /fechar-onda</b><br/>limpar resíduo · registrar no<br/>README e no plano §5<br/>anotar residuais da próxima"] --> COMMIT["commit + push ao origin"]
+    COMMIT --> START
+
+    style BAR stroke-width:3px
+    style STOP stroke-width:2px
+    style MUT stroke-dasharray: 4 3
+```
+
+Duas setas explicam por que o loop não vira esteira: **`6 → remediar → 6`** (a
+remediação volta à barreira, nunca se auto-aprova) e **`ANCHOR → /doc-tecnica`**
+(código sem âncora normativa não é executado, é documentado primeiro).
+
+### A árvore de decisão, em forma exata
 
 Ele para no primeiro que casar:
 
@@ -119,6 +173,22 @@ barreira.**
    entregues).
 2. **Gate verde não é prova de gate real.** Só a mutação que ele *deveria* pegar
    prova. Todo achado carrega `run_verified=true` com comando e saída antes/depois.
+
+   ```mermaid
+   flowchart LR
+       A["gate escrito<br/>e verde"] --> B["cp backup"]
+       B --> C["mutar EXATAMENTE o defeito<br/>que o gate promete pegar"]
+       C --> D{"ficou<br/>VERMELHO?"}
+       D -->|não| E["<b>gate tautológico</b><br/>ele não impõe nada<br/>reescrever"]
+       E --> A
+       D -->|sim| F["mv restaurar<br/><b>nunca git checkout</b>"]
+       F --> G(["gate PROVADO"])
+       style E stroke-width:3px
+   ```
+
+   O ramo da esquerda não é hipotético: foi assim que o `beta-check` desta onda
+   se revelou tautológico — com o `INSERT` revogado, a cadeia respondia e o gate
+   dizia PASS medindo linhas de execuções anteriores.
 3. **Auto-relato de subagente ≠ re-gate.** Rode você mesmo e cole a saída. Um
    agente relatou corretamente que o cap disparava; outro relatou um E2E que só
    passava porque media linhas de execuções anteriores.
