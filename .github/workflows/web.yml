@@ -9,17 +9,25 @@
 # Fixado em 24 (baseline do repo) para não depender do minor exato do 22.x. (G0/E9)
 name: web (Fase 1)
 
+# O filtro inclui bff/** de propósito: o typecheck do console carrega
+# bff/src/** no program (src/types/bff.ts reexporta AppRouter do BFF), logo uma
+# mudança SÓ no BFF pode quebrar `make web-ci`. Sem este path, o PR que quebra
+# passa verde aqui e o vermelho só aparece no próximo PR que tocar o console.
 on:
   pull_request:
     paths:
       - "web/console/**"
+      - "bff/**"
       - "make/web.mk"
+      - "make/bff.mk"
       - ".github/workflows/web.yml"
   push:
     branches: [main]
     paths:
       - "web/console/**"
+      - "bff/**"
       - "make/web.mk"
+      - "make/bff.mk"
       - ".github/workflows/web.yml"
 
 permissions:
@@ -33,7 +41,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
-      - name: install deps
+      - name: install deps (console)
         run: make web-install
+      # Obrigatório: o tsc do console resolve pg/zod/@trpc/server a partir de
+      # bff/node_modules (ver make/web.mk, alvo web-bff-deps). Sem este passo o
+      # job morria com TS2307 em cascata.
+      - name: install deps (bff — exigido pelo typecheck do console)
+        run: make bff-install
       - name: ci (typecheck + lint + test)
         run: make web-ci

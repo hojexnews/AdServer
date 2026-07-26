@@ -80,6 +80,7 @@ func (l *PostgresLoader) Load(ctx context.Context) (*snapshot.Snapshot, error) {
 	if raw.CampaignZones, err = l.loadCampaignZones(queryCtx); err != nil {
 		return nil, err
 	}
+	raw.Delivered = l.loadDelivered(queryCtx)
 
 	version := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
 	snap := Assemble(raw, version, time.Now().UTC())
@@ -111,6 +112,67 @@ func (l *PostgresLoader) loadAssetScales(ctx context.Context) map[string]int32 {
 			continue
 		}
 		out[code] = scale
+	}
+	return out
+}
+
+// loadDelivered aggregates delivered counts per campaign from the perfil
+// BETA Postgres telemetry sink (stats.events_raw — ADR-0005,
+// db/stats/migrations/0001_stats_schema_up.sql; written by
+// internal/telemetry/pgsink). See DeliveredRow's doc for what each column
+// means and how it is matched onto campaigns in Assemble.
+//
+// Cost (DA-4/TX-4): this runs ONCE per snapshot build — i.e. on
+// SNAPSHOT_REFRESH_INTERVAL (default 30s), never per decision request. It
+// is a single aggregate query: one pass over stats.events_raw, filtered to
+// campaign_id IS NOT NULL and grouped by campaign_id.
+// events_raw_tenant_campaign_type_idx (tenant_id, campaign_id, event_type)
+// covers the campaign_id/event_type access; the billable filter on
+// impressions is not covered by that index, so rows still need a heap
+// fetch for that check — acceptable at beta volume (this is explicitly a
+// bridge schema, not the ClickHouse destination — see the migration's
+// header), not a hot-path cost.
+//
+// Degradation (DA-6/DA-9 — silence, never a hot-path failure): the stats
+// schema may not exist at all (a deployment without the Postgres telemetry
+// sink wired, or an older database predating it), or this loader's role
+// (adserver_loader) may not yet hold a GRANT on it. EITHER failure mode
+// degrades to a nil/empty result with a WARN log — exactly the same
+// non-fatal pattern as loadAssetScales above — and NEVER fails Load() or
+// the snapshot build. Every snapshot.Campaign.Delivered* field then simply
+// stays at its zero value, identical to this package's behavior before
+// this method existed. Consequence documented for the caller: DA-4 pacing
+// (computeDeficit) reads a permanent 1.0 deficit for every campaign until
+// this degrades to zero rows, that pacing behavior is UNCHANGED by this
+// method — this method only supplies the input that was previously always
+// absent.
+func (l *PostgresLoader) loadDelivered(ctx context.Context) []DeliveredRow {
+	rows, err := l.pool.Query(ctx, `
+		SELECT campaign_id::text,
+		       COUNT(*) FILTER (WHERE event_type = 'impression' AND billable),
+		       COUNT(*) FILTER (WHERE event_type = 'click'),
+		       COUNT(*) FILTER (WHERE event_type = 'conversion')
+		FROM   stats.events_raw
+		WHERE  campaign_id IS NOT NULL
+		GROUP BY campaign_id`)
+	if err != nil {
+		l.logger.Warn("configload: stats.events_raw unavailable; delivered counts default to 0 "+
+			"(DA-4 pacing degrades to its existing permanent-deficit behavior — non-fatal, "+
+			"snapshot build proceeds)", "err", err)
+		return nil
+	}
+	defer rows.Close()
+	var out []DeliveredRow
+	for rows.Next() {
+		var d DeliveredRow
+		if err := rows.Scan(&d.CampaignID, &d.Impressions, &d.Clicks, &d.Conversions); err != nil {
+			l.logger.Warn("configload: scan delivered row", "err", err)
+			continue
+		}
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		l.logger.Warn("configload: iterate delivered rows", "err", err)
 	}
 	return out
 }

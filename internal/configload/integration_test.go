@@ -2,11 +2,14 @@ package configload
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	commonv1 "github.com/hojex/adserver/gen/go/adserver/common/v1"
 	"github.com/hojex/adserver/internal/cascade"
@@ -98,4 +101,152 @@ func decideAgainst(snap *snapshot.Snapshot, zone *snapshot.Zone, country string)
 		},
 		RequestTime: now,
 	}, snap)
+}
+
+// ---------------------------------------------------------------------------
+// Delivered counts (DA-4 pacing input; perfil BETA / ADR-0005) — real
+// Postgres end-to-end proof.
+// ---------------------------------------------------------------------------
+
+// TestPostgresLoader_Integration_DeliveredCounts proves, against a REAL
+// Postgres, that after impressions/clicks/conversions are recorded in
+// stats.events_raw (the perfil BETA Postgres telemetry sink written by
+// internal/telemetry/pgsink — ADR-0005, db/stats/migrations/
+// 0001_stats_schema_up.sql), the snapshot PostgresLoader.Load builds carries
+// DeliveredImpressions/Clicks/Conversions > 0 for the campaign that received
+// events, and exactly 0 for a sibling campaign that received none — closing
+// the gap the coordinator identified (DA-4 pacing was permanently inert
+// because nothing in production ever populated these fields).
+//
+// Gated by TWO env vars — this is deliberately independent of
+// TestPostgresLoader_Integration's single-DSN gate, because seeding
+// synthetic stats.events_raw rows needs a role that can bypass RLS/tenant
+// scoping, which the read-only adserver_loader role must NOT have:
+//
+//	CONFIGLOAD_TEST_DSN       — same adserver_loader (read-only, BYPASSRLS)
+//	                            DSN as TestPostgresLoader_Integration.
+//	CONFIGLOAD_STATS_SEED_DSN — an ADMIN/superuser DSN used ONLY by this test
+//	                            to seed synthetic stats.events_raw rows
+//	                            directly, mirroring make/dev.mk's
+//	                            DEV_ADMIN_DSN. This is a TEST fixture writer,
+//	                            never internal/telemetry/pgsink's production
+//	                            write path (that role, adserver_stats_writer,
+//	                            is intentionally NOBYPASSRLS/INSERT-only).
+//
+// Both must be set or the test is skipped: this is the "pending infra" case
+// the task explicitly allows for — the CODE is production-ready
+// (loadDelivered, Assemble's matching loop, this test); whether it actually
+// RUNS depends on a given database having db/stats/migrations/0001 applied
+// AND adserver_loader granted USAGE/SELECT on the stats schema (see this
+// package's README / make/dev.mk's adserver_app grant block, which needs
+// the analogous adserver_loader grant added for this path to work outside
+// a developer's ad hoc `GRANT ... TO adserver_loader`).
+func TestPostgresLoader_Integration_DeliveredCounts(t *testing.T) {
+	loaderDSN := os.Getenv("CONFIGLOAD_TEST_DSN")
+	seedDSN := os.Getenv("CONFIGLOAD_STATS_SEED_DSN")
+	if loaderDSN == "" || seedDSN == "" {
+		t.Skip("set CONFIGLOAD_TEST_DSN and CONFIGLOAD_STATS_SEED_DSN to run the delivered-counts integration test " +
+			"(pending infra: requires db/stats/migrations/0001 applied + adserver_loader granted SELECT on stats.*)")
+	}
+
+	ctx := context.Background()
+
+	admin, err := pgxpool.New(ctx, seedDSN)
+	if err != nil {
+		t.Fatalf("connect CONFIGLOAD_STATS_SEED_DSN: %v", err)
+	}
+	// NOTE (real bug caught while verifying this test): t.Cleanup callbacks
+	// run LIFO, AFTER the enclosing function returns — which is AFTER any
+	// plain `defer` in this function body has already fired. A naive
+	// `defer admin.Close()` here would close the pool BEFORE the delete
+	// cleanup below ran against it, so the delete would silently fail
+	// (discarded error) and leave rows behind across runs. Registering
+	// admin.Close as a t.Cleanup FIRST — so it runs LAST, per LIFO — fixes
+	// the ordering: the delete cleanup (registered second, runs first) still
+	// has a live pool to work with.
+	t.Cleanup(func() { admin.Close() })
+
+	// Two real campaigns from the seed (db/seed/dev_seed.sql) — one gets
+	// events, the other stays untouched, proving no cross-campaign leakage.
+	var campaignID, otherCampaignID int64
+	if err := admin.QueryRow(ctx, `SELECT id FROM config.campaigns WHERE name = 'Contract BR'`).Scan(&campaignID); err != nil {
+		t.Fatalf("find seed campaign 'Contract BR' (did you run make dev-db-setup / beta-up?): %v", err)
+	}
+	if err := admin.QueryRow(ctx, `SELECT id FROM config.campaigns WHERE name = 'Remnant House'`).Scan(&otherCampaignID); err != nil {
+		t.Fatalf("find seed campaign 'Remnant House': %v", err)
+	}
+	var tenantID string
+	if err := admin.QueryRow(ctx,
+		`SELECT tenant_id::text FROM config.campaigns WHERE id = $1`, campaignID).Scan(&tenantID); err != nil {
+		t.Fatalf("read tenant_id: %v", err)
+	}
+
+	cleanup := func() {
+		if _, err := admin.Exec(ctx, `DELETE FROM stats.events_raw WHERE campaign_id = $1`, campaignID); err != nil {
+			t.Errorf("cleanup: delete seeded stats.events_raw rows: %v", err)
+		}
+	}
+	cleanup() // clean slate for idempotent re-runs
+	t.Cleanup(cleanup)
+
+	// Seed 3 BILLABLE impressions (must count), 1 BLANK impression (must NOT
+	// count — CA-6), 2 clicks, 1 conversion, all for campaignID.
+	const insertSQL = `INSERT INTO stats.events_raw
+		(event_id, event_type, tenant_id, campaign_id, billable, blank, occurred_at)
+		VALUES ($1, $2, $3::uuid, $4, $5, $6, now())`
+	seedEvents := []struct {
+		id       string
+		evType   string
+		billable bool
+		blank    bool
+	}{
+		{"test-delivered-imp-1", "impression", true, false},
+		{"test-delivered-imp-2", "impression", true, false},
+		{"test-delivered-imp-3", "impression", true, false},
+		{"test-delivered-imp-blank", "impression", false, true}, // CA-6: never billable
+		{"test-delivered-click-1", "click", false, false},
+		{"test-delivered-click-2", "click", false, false},
+		{"test-delivered-conv-1", "conversion", false, false},
+	}
+	for _, e := range seedEvents {
+		if _, err := admin.Exec(ctx, insertSQL, e.id, e.evType, tenantID, campaignID, e.billable, e.blank); err != nil {
+			t.Fatalf("seed event %s: %v", e.id, err)
+		}
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	loader, err := NewPostgresLoader(ctx, loaderDSN, logger)
+	if err != nil {
+		t.Fatalf("NewPostgresLoader: %v", err)
+	}
+	defer loader.Close()
+
+	snap, err := loader.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	camp, ok := snap.Campaigns[fmt.Sprint(campaignID)]
+	if !ok {
+		t.Fatalf("campaign %d not found in snapshot", campaignID)
+	}
+	if camp.DeliveredImpressions != 3 {
+		t.Errorf("DeliveredImpressions = %d, want 3 (the blank impression must NOT count — CA-6)",
+			camp.DeliveredImpressions)
+	}
+	if camp.DeliveredClicks != 2 {
+		t.Errorf("DeliveredClicks = %d, want 2", camp.DeliveredClicks)
+	}
+	if camp.DeliveredConversions != 1 {
+		t.Errorf("DeliveredConversions = %d, want 1", camp.DeliveredConversions)
+	}
+
+	other, ok := snap.Campaigns[fmt.Sprint(otherCampaignID)]
+	if !ok {
+		t.Fatalf("campaign %d not found in snapshot", otherCampaignID)
+	}
+	if other.DeliveredImpressions != 0 || other.DeliveredClicks != 0 || other.DeliveredConversions != 0 {
+		t.Errorf("campaign %d (no seeded events) should show 0 delivered, got impressions=%d clicks=%d conversions=%d",
+			otherCampaignID, other.DeliveredImpressions, other.DeliveredClicks, other.DeliveredConversions)
+	}
 }

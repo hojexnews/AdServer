@@ -21,37 +21,37 @@ help:
 
 ## tools: instala o buf localmente em .bin/ (binario unico)
 tools:
-	@mkdir -p $(BIN)
+	@mkdir -p "$(BIN)"
 	@if ! command -v buf >/dev/null 2>&1; then \
 	  echo "baixando buf $(BUF_VER) -> $(BIN)/buf"; \
-	  curl -fsSL -o $(BIN)/buf "https://github.com/bufbuild/buf/releases/download/v$(BUF_VER)/buf-$$(uname -s)-$$(uname -m)"; \
-	  chmod +x $(BIN)/buf; \
+	  curl -fsSL -o "$(BIN)/buf" "https://github.com/bufbuild/buf/releases/download/v$(BUF_VER)/buf-$$(uname -s)-$$(uname -m)"; \
+	  chmod +x "$(BIN)/buf"; \
 	fi
-	@$(BUF) --version
+	@"$(BUF)" --version
 
 ## proto-lint: buf lint (STANDARD + COMMENTS)
 proto-lint:
-	$(BUF) lint proto
+	"$(BUF)" lint proto
 
 ## proto-format: reescreve os .proto no formato canonico (buf format -w)
 proto-format:
-	$(BUF) format -w proto
+	"$(BUF)" format -w proto
 
 ## proto-format-check: falha se algum .proto nao estiver formatado
 proto-format-check:
-	$(BUF) format --diff --exit-code proto
+	"$(BUF)" format --diff --exit-code proto
 
 ## proto-breaking: compat BACKWARD vs. a branch main (TX-1)
 proto-breaking:
-	$(BUF) breaking proto --against '.git#branch=main,subdir=proto'
+	"$(BUF)" breaking proto --against '.git#branch=main,subdir=proto'
 
 ## proto-build: valida que o modulo compila
 proto-build:
-	$(BUF) build proto
+	"$(BUF)" build proto
 
 ## proto-gen: gera codigo (Go + TS) — requer rede p/ plugins remotos
 proto-gen:
-	cd proto && $(BUF) generate
+	cd proto && "$(BUF)" generate
 
 ## proto-gen-check: verifica que gen/ esta em sync com os .proto atuais (requer rede)
 # Regenera em tmpdir isolado e compara com gen/ via diff -rq.
@@ -70,7 +70,7 @@ proto-gen-check:
 	  "s|out: ../gen/go|out: $$TMPDIR_GEN/go|; s|out: ../gen/ts|out: $$TMPDIR_GEN/ts|" \
 	  "$$REPO_ROOT/proto/buf.gen.yaml" > "$$TEMPLATE"; \
 	echo "proto-gen-check: regenerando ..."; \
-	cd "$$REPO_ROOT/proto" && $(BUF) generate --template "$$TEMPLATE"; \
+	cd "$$REPO_ROOT/proto" && "$(BUF)" generate --template "$$TEMPLATE"; \
 	echo "proto-gen-check: comparando go/ ..."; \
 	DIFF_GO=$$(diff -rq "$$REPO_ROOT/gen/go" "$$TMPDIR_GEN/go" 2>&1 || true); \
 	echo "proto-gen-check: comparando ts/ ..."; \
@@ -106,8 +106,17 @@ no-float:
 	for s in "$${scripts[@]}"; do [ -f "$$s" ] && { echo "== $$s"; bash "$$s" || failed=1; }; done; \
 	exit $$failed
 
-## verify: lint + format-check + build + breaking + no-float (espelha a CI)
-verify: proto-lint proto-format-check proto-build proto-breaking no-float
+## make-quoting-check: reprova variavel de path NUA em recipe de make
+# O repo vive em path COM ESPACO; `$(BIN)` nu vira duas palavras para o shell.
+# A 24a onda consertou a INSTANCIA em make/platform.mk, nao a FORMA — e o alvo
+# `tools` daqui ficou nu por mais 7 ondas (181 MB de binarios orfaos fora do
+# repo como consequencia medida). Este gate deriva as variaveis-de-path das
+# proprias definicoes (sem lista mantida a mao) e varre as recipes.
+make-quoting-check:
+	@python3 scripts/ci/make-quoting-check.py
+
+## verify: lint + format-check + build + breaking + no-float + quoting (espelha a CI)
+verify: proto-lint proto-format-check proto-build proto-breaking no-float make-quoting-check
 	@echo "OK — contratos validados (TX-1/TX-2)."
 
-.PHONY: help tools proto-lint proto-format proto-format-check proto-breaking proto-build proto-gen proto-gen-check no-float verify
+.PHONY: help tools proto-lint proto-format proto-format-check proto-breaking proto-build proto-gen proto-gen-check no-float make-quoting-check verify

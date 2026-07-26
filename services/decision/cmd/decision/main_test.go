@@ -4,18 +4,25 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/maxmind/mmdbwriter"
+	"github.com/maxmind/mmdbwriter/mmdbtype"
 	"google.golang.org/protobuf/proto"
 
 	commonv1 "github.com/hojex/adserver/gen/go/adserver/common/v1"
 	decisionv1 "github.com/hojex/adserver/gen/go/adserver/decision/v1"
 	"github.com/hojex/adserver/internal/cascade"
+	"github.com/hojex/adserver/internal/geo"
 	mlranker "github.com/hojex/adserver/internal/ranker"
 	"github.com/hojex/adserver/internal/rules"
 	"github.com/hojex/adserver/internal/snapshot"
@@ -102,6 +109,17 @@ func withTestABRouter(router *mlranker.ABRouter, banditML *mlranker.MLRanker) te
 	}
 }
 
+// withTestGeoResolver overrides the default geo.EmptyResolver{} wired by
+// newTestDecisionHandler, letting a test exercise the IP-derived geo
+// fallback (see TestServeHTTP_GeoFallback* below) against a real
+// *geo.MaxMindResolver fixture instead of production's boot-time wiring.
+func withTestGeoResolver(resolver geo.Resolver, trustedDepth int) testHandlerOption {
+	return func(h *decisionHandler) {
+		h.geoResolver = resolver
+		h.trustedDepth = trustedDepth
+	}
+}
+
 func newTestDecisionHandler(snap *snapshot.Snapshot, sink DecisionSink, opts ...testHandlerOption) *decisionHandler {
 	store := snapshot.NewStore(snap)
 	rulesEngine := rules.New()
@@ -112,6 +130,13 @@ func newTestDecisionHandler(snap *snapshot.Snapshot, sink DecisionSink, opts ...
 		sink:        sink,
 		logger:      nil,
 		clickSigner: nil, // no click tokens in these unit tests
+		// Default: EmptyResolver{} (production's degraded-safe default when
+		// GEOIP_DB_PATH is unset) — every pre-existing test keeps getting an
+		// empty Geo regardless of RemoteAddr, identical to this handler's
+		// behavior before the IP-derived fallback existed. Tests that need
+		// to exercise real IP→geo derivation use withTestGeoResolver.
+		geoResolver:  geo.EmptyResolver{},
+		trustedDepth: 1,
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -661,5 +686,255 @@ func TestPrivacy_ServeHTTP_RawSiteURLAndUserAgent_NeverLeakToOutputs(t *testing.
 	}
 	if bytes.Contains(raw, []byte(uaMarker)) {
 		t.Error("emitted Decision event leaks the raw user_agent — PRIV-01 violation")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Geo (TX-5/DA-11, DA-9): POST /v1/decide is called directly by the browser,
+// so this handler DOES see a raw client IP. These tests prove: (a) explicit
+// geo_country/geo_city in the body always wins over IP derivation; (b) a
+// private/loopback IP (or any IP absent from the database) degrades to an
+// empty Geo with no error; (c) a real .mmdb fixture resolves a known IP to
+// its country and a Geo-Country delivery rule (§4.6) actually fires on the
+// served path; (d) the raw IP never appears in the emitted Decision event or
+// in this handler's logs (mirrors TestServeHTTP_PRIV01_RawInputsNeverLeak's
+// proto.Marshal-based leak check just above).
+// ---------------------------------------------------------------------------
+
+// testGeoIP is the single address baked into every fixture built by
+// buildGeoFixture below.
+const testGeoIP = "8.8.8.8"
+
+// buildGeoFixture writes a minimal GeoLite2-City-shaped .mmdb file mapping
+// testGeoIP to country, and returns its path. This is a TEST-ONLY fixture
+// builder (github.com/maxmind/mmdbwriter, pure Go, no cgo — never linked
+// into production code); it mirrors the identical technique in
+// internal/geo/maxmind_reload_test.go's unexported buildFixture. That is
+// deliberate, ordinary test-fixture duplication, NOT the production-logic
+// duplication (resolveAndDiscardIP / the reload polling loop) this task
+// eliminated by extracting internal/clientip and internal/geo.RunReloader.
+func buildGeoFixture(t *testing.T, country string) string {
+	t.Helper()
+	dir := t.TempDir()
+
+	tree, err := mmdbwriter.New(mmdbwriter.Options{
+		DatabaseType: "GeoLite2-City",
+		Languages:    []string{"en"},
+	})
+	if err != nil {
+		t.Fatalf("mmdbwriter.New: %v", err)
+	}
+	_, network, err := net.ParseCIDR(testGeoIP + "/32")
+	if err != nil {
+		t.Fatalf("ParseCIDR: %v", err)
+	}
+	record := mmdbtype.Map{
+		"city": mmdbtype.Map{
+			"names": mmdbtype.Map{"en": mmdbtype.String("Test City " + country)},
+		},
+		"country": mmdbtype.Map{"iso_code": mmdbtype.String(country)},
+	}
+	if err := tree.Insert(network, record); err != nil {
+		t.Fatalf("tree.Insert: %v", err)
+	}
+
+	path := filepath.Join(dir, "fixture.mmdb")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("os.Create: %v", err)
+	}
+	defer f.Close()
+	if _, err := tree.WriteTo(f); err != nil {
+		t.Fatalf("tree.WriteTo: %v", err)
+	}
+	return path
+}
+
+// buildGeoGatedSnap mirrors db/seed/dev_seed.sql's demo cascade exactly: a
+// Contract campaign gated by "Geo-Country IS BR" (§4.6) competing with an
+// always-eligible Remnant fallback, both linked to zone "z1" (DA-2/DA-3).
+func buildGeoGatedSnap() *snapshot.Snapshot {
+	s := snapshot.EmptySnapshot()
+	s.Zones["z1"] = &snapshot.Zone{ID: "z1", TenantID: "t1", Active: true}
+
+	rs := &snapshot.RuleSet{
+		ID:       "geo-br",
+		TenantID: "t1",
+		Logic:    snapshot.LogicAND,
+		Conditions: []snapshot.Condition{
+			{Vector: snapshot.VectorGeoCountry, Operator: snapshot.OpIs, Value: "BR"},
+		},
+	}
+	s.RuleSets[rs.ID] = rs
+
+	contract := &snapshot.Campaign{
+		ID: "contract-br", TenantID: "t1", Tier: snapshot.TierContract,
+		Priority: 10, BannerIDs: []string{"ban-contract"}, ZoneIDs: []string{"z1"},
+		Active: true, PricingModel: snapshot.PricingCPM,
+		GoalImpressions: 1000, DeliveredImpressions: 0,
+	}
+	remnant := &snapshot.Campaign{
+		ID: "remnant-house", TenantID: "t1", Tier: snapshot.TierRemnant,
+		Priority: 1, BannerIDs: []string{"ban-remnant"}, ZoneIDs: []string{"z1"},
+		Active: true, PricingModel: snapshot.PricingCPM,
+		ECPM: &moneyv1.Money{AssetCode: "BRL", Amount: 150, Scale: 2},
+	}
+	s.Campaigns[contract.ID] = contract
+	s.Campaigns[remnant.ID] = remnant
+	s.ZoneCampaigns["z1"] = []string{contract.ID, remnant.ID}
+
+	s.Banners["ban-contract"] = &snapshot.Banner{
+		ID: "ban-contract", TenantID: "t1", CampaignID: contract.ID,
+		ImageURL: "https://cdn.example.com/contract.jpg", ClickURL: "https://advertiser.example/landing",
+		Active: true, RuleSetIDs: []string{rs.ID},
+	}
+	s.Banners["ban-remnant"] = &snapshot.Banner{
+		ID: "ban-remnant", TenantID: "t1", CampaignID: remnant.ID,
+		ImageURL: "https://cdn.example.com/house.jpg", ClickURL: "https://pub.example/house",
+		Active: true,
+	}
+	return s
+}
+
+// geoDecideRequest builds a POST /v1/decide request carrying the given
+// (optional) body geo fields and a RemoteAddr, mirroring how the browser's
+// ad tag reaches this handler directly (no proxy → trustedDepth=0 callers
+// use RemoteAddr as-is; these tests use trustedDepth=1 with no XFF header,
+// which also falls back to RemoteAddr — see internal/clientip.Extract).
+func geoDecideRequest(t *testing.T, zoneID, bodyCountry, bodyCity, remoteAddr string) *http.Request {
+	t.Helper()
+	body, err := json.Marshal(DecideRequest{ZoneID: zoneID, GeoCountry: bodyCountry, GeoCity: bodyCity})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	r := httptest.NewRequest(http.MethodPost, "/v1/decide", bytes.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	r.RemoteAddr = remoteAddr
+	return r
+}
+
+// (a) Explicit geo_country in the body ALWAYS wins over IP derivation — even
+// when the IP resolves to a DIFFERENT country via a real .mmdb fixture. This
+// is the precedence deploy/local/smoke.sh and `make beta-check` depend on.
+func TestServeHTTP_Geo_BodyWinsOverIP(t *testing.T) {
+	fixture := buildGeoFixture(t, "US") // testGeoIP resolves to US
+	resolver := geo.NewMaxMindResolver(fixture, nil)
+
+	sink := &captureSink{}
+	h := newTestDecisionHandler(buildGeoGatedSnap(), sink, withTestGeoResolver(resolver, 1))
+
+	// Body says BR (matches the Contract banner's rule); RemoteAddr is the
+	// fixture IP, which resolves to US — if precedence were inverted, the
+	// Contract banner (gated on BR) would NOT fire and Remnant would serve.
+	r := geoDecideRequest(t, "z1", "BR", "", testGeoIP+":4444")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, r)
+
+	var resp DecideResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.ServedTier != "SERVED_TIER_CONTRACT" {
+		t.Fatalf("expected CONTRACT (body geo_country=BR must win over IP-derived US), got %s", resp.ServedTier)
+	}
+}
+
+// (b) No body geo; RemoteAddr is a private/loopback address absent from the
+// fixture database. Must degrade to an empty Geo (Contract's BR rule simply
+// doesn't match, cascade falls through to Remnant) — never an error, never
+// a panic (DA-9: silence, never a hot-path failure).
+func TestServeHTTP_Geo_PrivateIP_NoBody_DegradesToEmpty(t *testing.T) {
+	fixture := buildGeoFixture(t, "BR") // only testGeoIP is in the database
+	resolver := geo.NewMaxMindResolver(fixture, nil)
+
+	sink := &captureSink{}
+	h := newTestDecisionHandler(buildGeoGatedSnap(), sink, withTestGeoResolver(resolver, 1))
+
+	for _, remoteAddr := range []string{"127.0.0.1:1234", "10.0.0.5:80", "192.168.1.20:9999"} {
+		r := geoDecideRequest(t, "z1", "", "", remoteAddr)
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, r)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("remoteAddr=%q: expected 200, got %d: %s", remoteAddr, rr.Code, rr.Body.String())
+		}
+		var resp DecideResponse
+		if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+			t.Fatalf("remoteAddr=%q: decode response: %v", remoteAddr, err)
+		}
+		if resp.ServedTier != "SERVED_TIER_REMNANT" {
+			t.Fatalf("remoteAddr=%q: expected REMNANT (unresolvable IP → empty geo → BR rule doesn't match), got %s",
+				remoteAddr, resp.ServedTier)
+		}
+	}
+}
+
+// (c) No body geo; RemoteAddr is the fixture's known IP, which resolves to
+// BR via a REAL .mmdb file. The Geo-Country delivery rule (§4.6) actually
+// fires on the served path and the Contract banner is selected — this is
+// the capability the task exists to turn on.
+func TestServeHTTP_Geo_IPDerived_RuleFires(t *testing.T) {
+	fixture := buildGeoFixture(t, "BR")
+	resolver := geo.NewMaxMindResolver(fixture, nil)
+
+	sink := &captureSink{}
+	h := newTestDecisionHandler(buildGeoGatedSnap(), sink, withTestGeoResolver(resolver, 1))
+
+	r := geoDecideRequest(t, "z1", "", "", testGeoIP+":4444")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, r)
+
+	var resp DecideResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.ServedTier != "SERVED_TIER_CONTRACT" {
+		t.Fatalf("expected CONTRACT (IP-derived geo=BR must fire the Geo-Country rule), got %s", resp.ServedTier)
+	}
+}
+
+// (d) The raw client IP must never appear in the emitted Decision event or
+// in this handler's logs — the SOLE place it is ever read is inside
+// clientip.ResolveAndDiscard (see that function's doc), and it goes out of
+// scope there.
+func TestServeHTTP_Geo_IPNeverLeaksIntoEventOrLog(t *testing.T) {
+	const canaryIP = "203.0.113.77" // TEST-NET-3 (RFC 5737) — never a real client
+
+	fixture := buildGeoFixture(t, "BR")
+	resolver := geo.NewMaxMindResolver(fixture, nil)
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	sink := &captureSink{}
+	h := newTestDecisionHandler(buildGeoGatedSnap(), sink,
+		withTestGeoResolver(resolver, 1),
+		func(h *decisionHandler) { h.logger = logger },
+	)
+
+	r := geoDecideRequest(t, "z1", "", "", canaryIP+":5555")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, r)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), canaryIP) {
+		t.Error("HTTP response leaks the raw client IP — TX-5/DA-11 violation")
+	}
+
+	d := sink.last()
+	if d == nil {
+		t.Fatal("no Decision emitted to sink")
+	}
+	raw, err := proto.Marshal(d)
+	if err != nil {
+		t.Fatalf("proto.Marshal(Decision): %v", err)
+	}
+	if bytes.Contains(raw, []byte(canaryIP)) {
+		t.Error("emitted Decision event leaks the raw client IP — TX-5/DA-11 violation")
+	}
+	if strings.Contains(logBuf.String(), canaryIP) {
+		t.Errorf("handler log output leaks the raw client IP — TX-5/DA-11 violation; log=%q", logBuf.String())
 	}
 }

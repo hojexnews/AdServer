@@ -35,10 +35,20 @@
 BETA_DB              ?= adserver_beta
 BETA_DIR             := $(CURDIR)/.beta
 
-BETA_DECISION_ADDR   ?= :8080
-BETA_COLLECTOR_ADDR  ?= :8081
-BETA_DECISION_PORT   := $(patsubst :%,%,$(BETA_DECISION_ADDR))
-BETA_COLLECTOR_PORT  := $(patsubst :%,%,$(BETA_COLLECTOR_ADDR))
+# Bind em LOOPBACK por default (ADR-0005, aceite de M-1/M-4 do security-reviewer).
+# ":8080" em Go significa TODAS as interfaces — o perfil beta ficaria exposto na
+# rede local com endpoints nao autenticados (/lg aceita tid/cid crus). Escrever
+# "nao exponha o beta" so no ADR seria a classe do //nolint decorativo da 26a
+# onda: a garantia no comentario e o bind nunca a respeitando. Quem quiser
+# expor sobrescreve conscientemente: make beta-up BETA_DECISION_ADDR=:8080
+BETA_DECISION_ADDR   ?= 127.0.0.1:8080
+BETA_COLLECTOR_ADDR  ?= 127.0.0.1:8081
+# Porta = tudo depois do ULTIMO ':' — funciona tanto para ":8080" quanto para
+# "127.0.0.1:8080". O patsubst ':%' anterior so casava a primeira forma e, ao
+# trocarmos o default para loopback, produzia "http://localhost:127.0.0.1:8080"
+# (pego de 1a mao: beta-up subiu e o healthz nunca respondeu).
+BETA_DECISION_PORT   := $(lastword $(subst :, ,$(BETA_DECISION_ADDR)))
+BETA_COLLECTOR_PORT  := $(lastword $(subst :, ,$(BETA_COLLECTOR_ADDR)))
 BETA_DECISION_URL    := http://localhost:$(BETA_DECISION_PORT)
 BETA_COLLECTOR_URL   := http://localhost:$(BETA_COLLECTOR_PORT)
 
@@ -102,6 +112,7 @@ beta-up:
 	  CAPPING_SALT="$(BETA_CAPPING_SALT)" \
 	  CK_HMAC_SECRET="$(BETA_CK_HMAC_SECRET)" \
 	  CAPPING_BACKEND="memory" \
+	  TRUSTED_PROXY_DEPTH="0" \
 	  DECISION_ADDR="$(BETA_DECISION_ADDR)" \
 	  SNAPSHOT_REFRESH_INTERVAL="$(BETA_SNAPSHOT_REFRESH)" \
 	  nohup "$(BETA_BIN_DECISION)" >"$(BETA_LOG_DECISION)" 2>&1 < /dev/null & \
@@ -124,6 +135,7 @@ beta-up:
 	  COLLECTOR_BASE_URL="$(BETA_COLLECTOR_URL)" \
 	  COLLECTOR_ADDR="$(BETA_COLLECTOR_ADDR)" \
 	  TELEMETRY_PG_DSN="$(BETA_STATS_WRITER_DSN)" \
+	  TRUSTED_PROXY_DEPTH="0" \
 	  nohup "$(BETA_BIN_COLLECTOR)" >"$(BETA_LOG_COLLECTOR)" 2>&1 < /dev/null & \
 	  echo $$! > "$(BETA_PID_COLLECTOR)"; \
 	}
@@ -326,7 +338,27 @@ beta-check:
 	   exit 1; \
 	 fi; \
 	 sleep 1; \
-	 count_out=$$(psql "$(BETA_LOADER_DSN)" -tAc "select count(*) from stats.events_raw" 2>&1); count_rc=$$?; \
+	 : "ANTI-TAUTOLOGIA (achado do tech-lead na barreira da onda 'perfil BETA'):"; \
+	 : "a versao anterior fazia 'select count(*) from stats.events_raw' SEM filtro e"; \
+	 : "passava se o total fosse > 0. Provado tautologico: com REVOKE INSERT na role"; \
+	 : "do writer, /lg e /ck respondiam 200/302, ZERO linhas novas eram gravadas, e o"; \
+	 : "gate ainda dizia PASS(2 linhas) — ele media linhas de execucoes ANTERIORES."; \
+	 : "Agora asserimos o decision_id DESTA execucao. Nenhuma linha antiga satisfaz."; \
+	 : "Alem disso lemos o DSN que o processo NO AR realmente usa (.beta/collector.env),"; \
+	 : "porque o gate antigo, apontado para outro banco, acusava 'collector nao grava'"; \
+	 : "quando o collector gravava perfeitamente — em outro lugar."; \
+	 check_dsn="$(BETA_LOADER_DSN)"; \
+	 if [ -f "$(BETA_ENV_COLLECTOR)" ]; then \
+	   run_dsn=$$(sed -n 's/^TELEMETRY_PG_DSN=//p' "$(BETA_ENV_COLLECTOR)" | head -1); \
+	   run_db=$$(printf '%s' "$$run_dsn" | sed -n 's#.*/\([^/?]*\)?.*#\1#p'); \
+	   if [ -n "$$run_db" ] && [ "$$run_db" != "$(BETA_DB)" ]; then \
+	     echo "FALHOU na etapa: persistencia — o collector NO AR grava em '$$run_db', mas beta-check consulta '$(BETA_DB)'."; \
+	     echo "  Reconcilie: 'make beta-up BETA_DB=$$run_db' ou 'make beta-check BETA_DB=$$run_db'."; \
+	     exit 1; \
+	   fi; \
+	 fi; \
+	 q="select count(*) from stats.events_raw where decision_id = '"$$did"'"; \
+	 count_out=$$(psql "$$check_dsn" -tAc "$$q" 2>&1); count_rc=$$?; \
 	 if [ $$count_rc -ne 0 ]; then \
 	   echo "RESULTADO beta-check: decide=PASS pixel(/lg)=PASS clique(/ck)=PASS evento-em-stats.events_raw=FALHOU(erro de leitura)"; \
 	   echo "FALHOU na etapa: persistencia (stats.events_raw) — erro ao consultar: $$count_out"; \
@@ -334,10 +366,11 @@ beta-check:
 	 fi; \
 	 count=$$(echo "$$count_out" | tr -d '[:space:]'); \
 	 if [ -z "$$count" ] || [ "$$count" = "0" ]; then \
-	   echo "RESULTADO beta-check: decide=PASS pixel(/lg)=PASS clique(/ck)=PASS evento-em-stats.events_raw=FALHOU(0 linhas — collector ainda nao grava via TELEMETRY_PG_DSN)"; \
-	   echo "FALHOU na etapa: persistencia (stats.events_raw) — tabela existe mas 0 linhas apos /lg e /ck."; \
+	   echo "RESULTADO beta-check: decide=PASS pixel(/lg)=PASS clique(/ck)=PASS evento-em-stats.events_raw=FALHOU(0 linhas para decision_id=$$did)"; \
+	   echo "FALHOU na etapa: persistencia — /lg e /ck responderam, mas NENHUM evento desta execucao chegou a stats.events_raw."; \
+	   echo "  Causa provavel: grant/role do writer, DSN divergente, ou fila do pgsink descartando. Veja: make beta-logs"; \
 	   exit 1; \
 	 fi; \
-	 echo "  stats.events_raw: $$count linha(s) — OK"; \
-	 echo "RESULTADO beta-check: decide=PASS pixel(/lg)=PASS clique(/ck)=PASS evento-em-stats.events_raw=PASS($$count linhas)"; \
+	 echo "  stats.events_raw: $$count linha(s) com decision_id=$$did — OK"; \
+	 echo "RESULTADO beta-check: decide=PASS pixel(/lg)=PASS clique(/ck)=PASS evento-em-stats.events_raw=PASS($$count linhas DESTA execucao)"; \
 	 echo "== beta-check: PASS =="

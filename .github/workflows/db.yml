@@ -112,8 +112,8 @@ jobs:
 
       # ------------------------------------------------------------------
       # Roles de aplicação (adserver_loader BYPASSRLS / adserver_app RLS /
-      # adserver_copilot NOBYPASSRLS). Devem existir ANTES das migrations
-      # que criam GRANTs.
+      # adserver_copilot NOBYPASSRLS / adserver_stats_writer NOBYPASSRLS).
+      # Devem existir ANTES das migrations que criam GRANTs.
       #
       # adserver_copilot é criado aqui explicitamente por simetria/
       # auditabilidade do caminho de enforcement (achado do guardião
@@ -126,6 +126,14 @@ jobs:
       # com o de dev_roles.sql (IF NOT EXISTS em ambos); os GRANTs em
       # vector_store para adserver_copilot continuam vindo de
       # db/seed/dev_roles.sql, DEPOIS de "migrations up — vector" abaixo.
+      #
+      # adserver_stats_writer segue o MESMO padrão, pelo MESMO motivo (achado
+      # H-2, security-reviewer): db/stats/migrations/0001_stats_schema_up.sql
+      # costumava criar este role inline com `LOGIN PASSWORD` literal — o que
+      # um `make db-migrate-up` comum rodaria contra QUALQUER DATABASE_URL,
+      # inclusive staging/produção. O role agora só existe via
+      # db/seed/dev_roles.sql (chamado explicitamente aqui por simetria/
+      # auditabilidade, e de novo — idempotente — no step de grants abaixo).
       # ------------------------------------------------------------------
       - name: criar roles de aplicação
         run: |
@@ -142,6 +150,11 @@ jobs:
               -- NOBYPASSRLS explicit (db/seed/dev_roles.sql header): the
               -- copiloto's RAG reads MUST go through RLS.
               CREATE ROLE adserver_copilot LOGIN PASSWORD 'copilot_dev_only' NOBYPASSRLS;
+            END IF;
+            IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'adserver_stats_writer') THEN
+              -- NOBYPASSRLS explicit (achado H-2): the pgsink write path
+              -- depends on stats.events_raw_tenant_isolation's WITH CHECK.
+              CREATE ROLE adserver_stats_writer LOGIN PASSWORD 'stats_writer_dev_only' NOBYPASSRLS;
             END IF;
           END
           $$;
@@ -193,6 +206,29 @@ jobs:
             psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
           done
 
+      # stats (ADR-0005, perfil BETA): tabela-ponte stats.events_raw +
+      # view stats.live_kpis. A ordem segue DB_SCHEMAS em make/db.mk
+      # (asset_registry -> config -> ledger -> stats -> vector -> compliance).
+      #
+      # Este step existe porque db.yml enumera schemas À MÃO, um step por
+      # schema — um schema novo é invisível para a CI até alguém lembrar de
+      # editar aqui. É a 3ª reincidência da classe (29ª onda #10: db.yml nunca
+      # aplicava a migration 0004 do ledger; 30ª onda: os 4 runners paravam em
+      # 0003). Dentro de cada schema a enumeração JÁ é por glob; a lista de
+      # SCHEMAS é que continua manual. Ver a ressalva registrada no §5 do plano.
+      - name: migrations up — stats
+        run: |
+          dir="db/stats/migrations"
+          files=$(ls "$dir"/*_up.sql 2>/dev/null | LC_ALL=C sort)
+          if [ -z "$files" ]; then
+            echo "ERRO: nenhuma migration *_up.sql encontrada em $dir (schema vazio ou mal formado)." >&2
+            exit 1
+          fi
+          for f in $files; do
+            echo "  up: stats/$(basename "$f" _up.sql)"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
+          done
+
       - name: migrations up — vector
         run: |
           dir="db/vector/migrations"
@@ -228,7 +264,7 @@ jobs:
       # vector_store existe). Ver comentário do step "criar roles de
       # aplicação" para o porquê de adserver_copilot já existir antes disso.
       # ------------------------------------------------------------------
-      - name: grants adserver_loader + adserver_app + adserver_copilot
+      - name: grants adserver_loader + adserver_app + adserver_copilot + adserver_stats_writer
         run: |
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f db/seed/dev_roles.sql
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q <<'SQL'
@@ -253,6 +289,23 @@ jobs:
           GRANT USAGE ON SCHEMA compliance TO adserver_loader, adserver_app;
           GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA compliance TO adserver_app;
           GRANT SELECT ON ALL TABLES IN SCHEMA compliance TO adserver_loader;
+          -- stats (ADR-0005): leitura para o BFF (adserver_app) e para o
+          -- construtor de snapshot (adserver_loader, que soma as contagens
+          -- ENTREGUES por campanha — sem este GRANT o pacing DA-4 volta a ser
+          -- inerte, degradando em silêncio).
+          GRANT USAGE ON SCHEMA stats TO adserver_loader, adserver_app;
+          GRANT SELECT ON stats.events_raw, stats.live_kpis TO adserver_loader, adserver_app;
+          GRANT EXECUTE ON FUNCTION stats.current_tenant_id() TO adserver_loader, adserver_app;
+          -- Escrita fica SÓ com a role dedicada adserver_stats_writer
+          -- (achado H-2: criada por db/seed/dev_roles.sql acima — já
+          -- rodou nesta mesma step — NÃO mais pela migration). GRANTs
+          -- comentados em db/stats/migrations/0001_stats_schema_up.sql,
+          -- executados aqui pelo mesmo motivo do bloco de adserver_app logo
+          -- acima: a migration não pode depender de um role que ela mesma
+          -- não cria mais.
+          GRANT USAGE ON SCHEMA stats TO adserver_stats_writer;
+          GRANT SELECT, INSERT ON stats.events_raw TO adserver_stats_writer;
+          GRANT EXECUTE ON FUNCTION stats.current_tenant_id() TO adserver_stats_writer;
           SQL
 
       # ------------------------------------------------------------------
@@ -301,6 +354,54 @@ jobs:
       - name: "go test -tags integration — internal/ledger contra Postgres real (achado HIGH)"
         run: make go-test-integration
 
+      # ------------------------------------------------------------------
+      # DA-4 — contagens ENTREGUES chegam ao snapshot (ADR-0005).
+      #
+      # internal/configload/integration_test.go NÃO tem build tag
+      # `//go:build integration`, portanto `make go-test-integration` (que
+      # deriva o escopo por tag) NÃO o alcança — e sem as duas env vars o
+      # teste faz t.Skip(). Ou seja: sem este step, o único gate que prova
+      # que `snapshot.Campaign.DeliveredImpressions` deixou de ser
+      # constante 0 ficaria ÓRFÃO da CI e o job seguiria verde. É a mesma
+      # forma de defeito que a 29ª onda (#10) e a 30ª acharam.
+      #
+      # A SENTINELA ANTI-SKIP abaixo é o que torna este step não-tautológico:
+      # um SKIP passa a ser FALHA, não silêncio verde.
+      - name: "DA-4 — delivered counts no snapshot (anti-skip: SKIP = FALHA)"
+        env:
+          # Leitor: mesma role que o serviço de decisão usa em produção.
+          CONFIGLOAD_TEST_DSN: "postgres://adserver_loader:loader_dev_only@localhost:15432/adserver_test?sslmode=disable"
+          # Semeador: precisa ler config.campaigns E escrever stats.events_raw;
+          # nenhuma role de aplicação tem as duas (menor privilégio), então o
+          # teste semeia como admin. Isso NÃO afrouxa o que está sob teste —
+          # a leitura verificada continua sendo a do adserver_loader.
+          CONFIGLOAD_STATS_SEED_DSN: "postgres://postgres:postgres_test_only@localhost:15432/adserver_test?sslmode=disable"
+        run: |
+          set -o pipefail
+          go test -count=1 -v -run 'TestPostgresLoader_Integration_DeliveredCounts' \
+            ./internal/configload/ 2>&1 | tee /tmp/delivered.log
+          if grep -qE '^\s*--- SKIP' /tmp/delivered.log; then
+            echo "FALHOU: o teste de delivered-counts foi PULADO — as env vars não chegaram" >&2
+            echo "ao processo, ou o schema stats/os GRANTs não foram aplicados. Um SKIP aqui" >&2
+            echo "significa que o pacing DA-4 está sem gate, não que está correto." >&2
+            exit 1
+          fi
+          if ! grep -qE '^\s*--- PASS: TestPostgresLoader_Integration_DeliveredCounts' /tmp/delivered.log; then
+            echo "FALHOU: o teste não reportou PASS explicitamente (nem SKIP)." >&2
+            exit 1
+          fi
+
+      # Lado USING (leitura) da policy de stats.events_raw (achado M-2,
+      # security-reviewer). O lado WITH CHECK (escrita) já é provado por
+      # internal/telemetry/pgsink/pgsink_integration_test.go
+      # (TestIntegration_RLS_StatsWriterRoleRejectsCrossTenant, step
+      # "go test -tags integration" acima) — nenhum teste do repo exercitava
+      # o lado de leitura antes deste step.
+      - name: "RLS isolation — stats (ADR-0005 / TX-3)"
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+               -f db/stats/tests/rls_isolation_test.sql
+
       - name: "RLS isolation — vector (TX-3)"
         run: |
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
@@ -337,6 +438,36 @@ jobs:
           fi
           for f in $files; do
             echo "  down: vector/$(basename "$f" _down.sql)"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
+          done
+
+      # stats desce ANTES de ledger/config — ordem inversa de DB_SCHEMAS.
+      #
+      # CORRIGIDO (achado M-3, security-reviewer — doc-lie do próprio
+      # comentário que este step carregava): o texto anterior afirmava que
+      # "o step final 'confirmar schema vazio apos reversao' só passa se o
+      # down realmente derrubar schema, view, tabela, função e a role
+      # dedicada adserver_stats_writer" — DUAS afirmações falsas, nenhuma
+      # delas verificada de fato: (1) aquele step nunca incluía 'stats' na
+      # lista de schemas checados (`WHERE schema_name IN (...)`) — passaria
+      # mesmo que o _down não derrubasse NADA; corrigido abaixo, 'stats'
+      # agora está na lista. (2) o role NUNCA é dropado pelo _down (decisão
+      # deliberada da própria migration, ver seu cabeçalho) — e desde o
+      # achado H-2 o role nem é mais CRIADO pelo _up, então a menção nem
+      # fazia sentido de qualquer forma. O que este step _down realmente
+      # garante, provado pelo step seguinte: DROP SCHEMA CASCADE remove
+      # schema, view, tabela e função — não o role (que vive fora do ciclo
+      # de vida do schema, em db/seed/dev_roles.sql).
+      - name: migrations down — stats
+        run: |
+          dir="db/stats/migrations"
+          files=$(ls "$dir"/*_down.sql 2>/dev/null | LC_ALL=C sort -r)
+          if [ -z "$files" ]; then
+            echo "ERRO: nenhuma migration *_down.sql encontrada em $dir (schema vazio ou mal formado)." >&2
+            exit 1
+          fi
+          for f in $files; do
+            echo "  down: stats/$(basename "$f" _down.sql)"
             psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
           done
 
@@ -381,6 +512,14 @@ jobs:
             psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
           done
 
+      # CORRIGIDO (achado M-3, security-reviewer): 'stats' estava AUSENTE
+      # desta lista — a asserção abaixo passaria mesmo que
+      # db/stats/migrations/0001_stats_schema_down.sql não derrubasse nada.
+      # Provado por mutação (1ª mão, fora deste workflow, contra um scratch
+      # DB isolado): comentar `DROP SCHEMA IF EXISTS stats CASCADE;` no
+      # _down e rodar esta mesma query com 'stats' na lista devolve n=1 e
+      # RAISE EXCEPTION — vermelho, como esperado. Sem 'stats' na lista a
+      # mesma mutação passava em silêncio.
       - name: confirmar schema vazio apos reversao
         run: |
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -t <<'SQL'
@@ -390,7 +529,7 @@ jobs:
           BEGIN
             SELECT COUNT(*) INTO n
             FROM information_schema.schemata
-            WHERE schema_name IN ('config','ledger','vector_store','compliance','asset_registry');
+            WHERE schema_name IN ('config','ledger','vector_store','compliance','asset_registry','stats');
             IF n > 0 THEN
               RAISE EXCEPTION 'Reversão incompleta: % schema(s) ainda presentes', n;
             END IF;

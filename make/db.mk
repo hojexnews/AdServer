@@ -75,8 +75,14 @@ MIGRATE := $(shell command -v migrate 2>/dev/null || echo migrate)
 # schema — asset_registry antes de config, compliance por último — e por
 # isso permanece uma lista explícita). A ordem DENTRO de cada schema não
 # vem daqui: vem do glob descrito acima.
-DB_SCHEMAS     := asset_registry config ledger vector compliance
-DB_SCHEMAS_REV := compliance vector ledger config asset_registry
+# stats (novo, onda "perfil BETA" / addon §3.3): persistência do collector
+# via Postgres (internal/telemetry/pgsink), lida pelo BFF via
+# stats.live_kpis. Sem dependência real de config/ledger (nenhuma FK física
+# entre schemas — só FK lógica, mesmo espírito de config/ledger entre si);
+# colocado após ledger só para manter a ordem de aparição no diretório db/
+# legível, não por uma dependência real de aplicação.
+DB_SCHEMAS     := asset_registry config ledger stats vector compliance
+DB_SCHEMAS_REV := compliance vector stats ledger config asset_registry
 
 ## db-check-migration-pairing: sentinela — todo *_up.sql precisa ter o
 ##   *_down.sql correspondente (mesmo schema, mesmo prefixo) e vice-versa.
@@ -157,7 +163,7 @@ db-lint:
 db-migrate-up: _db-check-url
 	@for schema in $(DB_SCHEMAS); do \
 	  echo "-- migrate up: $$schema"; \
-	  $(MIGRATE) -database "$(DATABASE_URL)" -path "db/$$schema/migrations" up || exit 1; \
+	  "$(MIGRATE)" -database "$(DATABASE_URL)" -path "db/$$schema/migrations" up || exit 1; \
 	done
 	@echo "== db-migrate-up: concluído =="
 
@@ -165,7 +171,7 @@ db-migrate-up: _db-check-url
 db-migrate-down: _db-check-url
 	@for schema in $(DB_SCHEMAS_REV); do \
 	  echo "-- migrate down 1: $$schema"; \
-	  $(MIGRATE) -database "$(DATABASE_URL)" -path "db/$$schema/migrations" down 1 || exit 1; \
+	  "$(MIGRATE)" -database "$(DATABASE_URL)" -path "db/$$schema/migrations" down 1 || exit 1; \
 	done
 	@echo "== db-migrate-down: concluído =="
 
@@ -173,7 +179,7 @@ db-migrate-down: _db-check-url
 db-migrate-status: _db-check-url
 	@for schema in $(DB_SCHEMAS); do \
 	  echo "-- status: $$schema"; \
-	  $(MIGRATE) -database "$(DATABASE_URL)" -path "db/$$schema/migrations" version; \
+	  "$(MIGRATE)" -database "$(DATABASE_URL)" -path "db/$$schema/migrations" version; \
 	done
 
 ## db-test: executa o teste de isolamento RLS (TX-3) do schema config contra Postgres externo.
@@ -225,6 +231,25 @@ db-test-vector: _db-check-url
 	      -v ON_ERROR_STOP=1 \
 	      -f db/vector/tests/vector_rls_isolation_test.sql
 	@echo "== db-test-vector: concluído =="
+
+## db-test-stats: executa o teste de isolamento RLS de leitura (USING) do
+##   schema stats — persistência do collector via Postgres (ADR-0005 "perfil
+##   BETA" / TX-3 / achado M-2, security-reviewer). Requer DATABASE_URL, que
+##   db/stats/migrations/0001_stats_schema_up.sql já tenha sido aplicada, e
+##   que adserver_app tenha os GRANTs de leitura em stats (ver
+##   make/dev.mk::dev-db-setup ou .github/workflows/db.yml, step de grants —
+##   comentados na própria migration, achado H-2). O lado WITH CHECK
+##   (escrita) já é provado por
+##   internal/telemetry/pgsink/pgsink_integration_test.go
+##   (//go:build integration); este alvo cobre o lado USING (leitura), que
+##   nenhum outro teste do repo exercitava. O teste roda dentro de
+##   ROLLBACK — não persiste dados.
+db-test-stats: _db-check-url
+	@echo "== db-test-stats: isolamento RLS stats.events_raw / live_kpis (ADR-0005 / TX-3) =="
+	@psql "$(DATABASE_URL)" \
+	      -v ON_ERROR_STOP=1 \
+	      -f db/stats/tests/rls_isolation_test.sql
+	@echo "== db-test-stats: concluído =="
 
 ## db-test-all: sobe Postgres efêmero (Docker), aplica TODAS as migrations,
 ##   roda TODOS os rls_isolation_test.sql (config, ledger, vector, compliance)
@@ -301,7 +326,10 @@ db-test-all: db-check-schema-list db-check-migration-pairing
 	 fi
 	@# --------------------------------------------------------------------------
 	@# FASE 3: aplicar grants sobre os schemas criados pelas migrations.
-	@# dev_roles.sql cobre config + asset_registry; adicionar ledger/vector/compliance.
+	@# dev_roles.sql cobre config + asset_registry + adserver_stats_writer
+	@# (achado H-2: o role de escrita do schema stats agora é criado AQUI, não
+	@# mais pela migration 0001_stats_schema_up.sql); adicionar
+	@# ledger/vector/compliance/stats abaixo.
 	@# Least-privilege (achado HIGH #6): adserver_app nunca faz UPDATE/DELETE em
 	@# ledger.postings (internal/ledger/posting.go só faz INSERT/SELECT) — o REVOKE
 	@# abaixo estreita o grant amplo de ALL TABLES para esta tabela especificamente.
@@ -323,7 +351,13 @@ db-test-all: db-check-schema-list db-check-migration-pairing
 	  -c "GRANT SELECT ON ALL TABLES IN SCHEMA vector_store TO adserver_loader;" \
 	  -c "GRANT USAGE ON SCHEMA compliance TO adserver_loader, adserver_app;" \
 	  -c "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA compliance TO adserver_app;" \
-	  -c "GRANT SELECT ON ALL TABLES IN SCHEMA compliance TO adserver_loader;"
+	  -c "GRANT SELECT ON ALL TABLES IN SCHEMA compliance TO adserver_loader;" \
+	  -c "GRANT USAGE ON SCHEMA stats TO adserver_loader, adserver_app;" \
+	  -c "GRANT SELECT ON stats.events_raw, stats.live_kpis TO adserver_loader, adserver_app;" \
+	  -c "GRANT EXECUTE ON FUNCTION stats.current_tenant_id() TO adserver_loader, adserver_app;" \
+	  -c "GRANT USAGE ON SCHEMA stats TO adserver_stats_writer;" \
+	  -c "GRANT SELECT, INSERT ON stats.events_raw TO adserver_stats_writer;" \
+	  -c "GRANT EXECUTE ON FUNCTION stats.current_tenant_id() TO adserver_stats_writer;"
 	@# --------------------------------------------------------------------------
 	@# FASE 4: rodar todos os testes de isolamento RLS
 	@# --------------------------------------------------------------------------
@@ -333,6 +367,7 @@ db-test-all: db-check-schema-list db-check-migration-pairing
 	   "config:db/config/tests/rls_isolation_test.sql" \
 	   "ledger:db/ledger/tests/rls_isolation_test.sql" \
 	   "ledger-immutability:db/ledger/tests/postings_immutability_test.sql" \
+	   "stats:db/stats/tests/rls_isolation_test.sql" \
 	   "vector:db/vector/tests/vector_rls_isolation_test.sql" \
 	   "compliance:db/compliance/tests/rls_isolation_test.sql"; do \
 	   schema=$$(echo "$$schema_test" | cut -d: -f1); \
@@ -391,6 +426,6 @@ _db-check-url:
 
 .PHONY: db-lint db-migrate-up db-migrate-down db-migrate-status \
         db-test db-test-compliance db-test-ledger db-test-ledger-immutability \
-        db-test-vector db-test-all \
+        db-test-vector db-test-stats db-test-all \
         db-check-migration-pairing db-check-schema-list \
         _db-check-url

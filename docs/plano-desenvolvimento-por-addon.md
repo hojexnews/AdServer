@@ -1032,7 +1032,22 @@ Garantir que os alvos `make bff-ci` (typecheck+lint+jest) e `make web-ci` (tsc s
 - .github/workflows/bff.yml e .github/workflows/web.yml criados e disparando em PR/push sobre bff/** e web/console/**
 - bff-ci cobre a suíte Jest do BFF (config-adapter + payments-adapter + in-memory fixtures + os testes-guarda de ACL/HITL/IDOR das 27ª–30ª ondas). **Sem contagem fixa aqui de propósito:** nenhuma automação assere número de testes, então um número em prosa só envelhece e mente (ver `docs/ops/go-live-runbook.md` §5, "Nota sobre contagens de teste"). O gate é o exit code de `make bff-ci`.
 
-**Subagente:** `frontend-bff-engineer` · **Doc:** `§2.5` · `ADR-0002` · **Gate:** tech-lead-architect — triagem confirmou gate órfão fechado (README sweep item 6, 15ª onda) · **Depende de:** —
+> **Correção da 31ª onda — este item esteve MENTINDO desde que foi escrito.**
+> "Acionado por workflow" não é o mesmo que "passa". `web.yml` e `a11y.yml`
+> rodavam apenas `make web-install`, mas o typecheck do console carrega
+> `bff/src/**` no program (`web/console/src/types/bff.ts` reexporta `AppRouter`
+> do BFF) e resolve `pg`/`zod`/`@trpc/server` a partir de **`bff/node_modules`**.
+> Em checkout limpo de runner os dois jobs morriam com `TS2307` em cascata —
+> ou seja, `make web-ci` nunca passou em CI e o gate de acessibilidade
+> **nunca chegou a executar o axe**. O verde local mascarava o vermelho de CI,
+> porque `bff/node_modules` existe por acaso na máquina de quem desenvolve.
+> Fechado com: passo explícito `make bff-install` nos dois workflows, alvo
+> `web-bff-deps` em `make/web.mk` (torna a dependência oculta explícita e
+> auto-instalável), `bff/**` nos path-filters de ambos, e `npm ci` no lugar de
+> `npm install`. Provado por mutação: com `bff/node_modules` removido,
+> `make web-typecheck` agora se auto-corrige e sai 0.
+
+**Subagente:** `frontend-bff-engineer` · **Doc:** `§2.5` · `ADR-0002` · **Gate:** tech-lead-architect — triagem confirmou gate órfão fechado (README sweep item 6, 15ª onda); **31ª onda reabriu e fechou o gate que era órfão de DEPENDÊNCIA, não de trigger** · **Depende de:** —
 
 ##### E8 · PostgresConfigAdapter real — fecha o laço console→decisão (14ª onda) — ✅ concluída
 

@@ -17,17 +17,23 @@
 # bloquear feedback rápido de PR.
 name: a11y (WCAG 2.2 AA)
 
+# bff/** entra no filtro pelo mesmo motivo de web.yml: `make web-a11y` roda
+# `next build`, que typecheca o console e portanto carrega bff/src/**.
 on:
   pull_request:
     paths:
       - "web/console/**"
+      - "bff/**"
       - "make/web.mk"
+      - "make/bff.mk"
       - ".github/workflows/a11y.yml"
   push:
     branches: [main]
     paths:
       - "web/console/**"
+      - "bff/**"
       - "make/web.mk"
+      - "make/bff.mk"
       - ".github/workflows/a11y.yml"
 
 permissions:
@@ -41,8 +47,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
-      - name: install deps
+      - name: install deps (console)
         run: make web-install
+      # Obrigatório: `make web-a11y` roda `next build`, que typecheca o console
+      # e resolve pg/zod/@trpc/server de bff/node_modules. Sem este passo o job
+      # morria no build — o axe NUNCA chegou a executar neste workflow.
+      - name: install deps (bff — exigido pelo build do console)
+        run: make bff-install
       - name: resolve chrome do runner (sem download de browser)
         run: |
           CHROME_BIN="$(command -v google-chrome-stable || command -v google-chrome || command -v chromium-browser || command -v chromium || true)"

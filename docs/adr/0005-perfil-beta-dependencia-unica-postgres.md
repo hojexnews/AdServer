@@ -41,6 +41,42 @@ Nenhuma arquitetura nova. Cada peça é uma implementação de um contrato já d
 | Stats "ao vivo" do Postgres no console | `StatsAdapter` (BFF) | `BFF_PG_DSN` |
 | Um comando para subir e um para verificar | `make/beta.mk` | — |
 
+**EMENDA (mesma sessão, antes do commit — o ADR ainda não era história arquivada).**
+A barreira de guardiões mostrou que a tabela acima descrevia **4 peças** enquanto a
+onda embarcou **8 mudanças**, e que as três não declaradas foram exatamente as três
+que produziram achado de guardião. O que não cabe na declaração de escopo não recebe
+revisão dirigida. As mudanças omitidas, agora declaradas:
+
+| Peça omitida | Natureza | Por que importa |
+|---|---|---|
+| Geo derivado do IP em `POST /v1/decide` | **sempre-ligada**, não opt-in | Muda **qual anúncio é servido** quando há `.mmdb` (§4.6). Antes, `geo.NewMaxMindResolver` era construído e nunca consultado |
+| Contagens ENTREGUES no `computeDeficit` | **sempre-ligada** onde o schema `stats` existir | Muda a ordenação intra-estrato Contract; destrava DA-4, que era inerte |
+| `Promise.all` → `Promise.allSettled` no BFF | sempre-ligada | Impede que a recusa da fonte faturável derrube a série "ao vivo" |
+
+**Correção de uma afirmação falsa deste ADR:** a versão original dizia "não muda nenhum
+default de produção; todos os ramos são opt-in por env". Isso vale para o sink, o capper
+e o adapter de stats — **não** para as três acima. Elas são incondicionais, e a primeira
+só parecia inerte porque `GEOIP_DB_PATH` costuma estar ausente.
+
+**Limitação de autenticidade que este ADR precisa declarar (invocar CA-1/TX-3 sem ela
+induz o leitor ao erro):** `/lg` é **não autenticado** e lê `tid`/`cid` de query string
+(só `/ck` tem HMAC). A policy `WITH CHECK` de `stats.events_raw` compara a linha contra
+uma GUC preenchida **com o mesmo valor que o cliente forneceu** — ela garante
+**autoconsistência, nunca autenticidade**. Protege contra bug de código, não contra
+terceiro. Enquanto o sinal de impressão não for assinado, nenhum consumidor desses
+números pode ter poder de **remover** entrega (ver §Gatilho).
+
+**Consequência de processo (regra nova, derivada desta onda):** uma onda cruza a linha
+*"muda qual anúncio é servido"* **somente** quando isso é o assunto declarado no título,
+e nesse caso o `parity-golden-test-guardian` é gate de **entrada**, não de saída.
+
+**Exposição de rede — aceite explícito de M-1/M-4 (`security-reviewer`):** o perfil beta
+**não pode ser exposto à internet pública**. Escrever só a frase seria a mesma classe do
+`//nolint` decorativo da 26ª onda, então ela vem com a propriedade que a sustenta:
+`make/beta.mk` faz bind em **loopback** por default e exporta `TRUSTED_PROXY_DEPTH=0`
+(sem proxy à frente, honrar `X-Forwarded-For` tornaria a segmentação por país
+falsificável pelo próprio navegador). Quem quiser expor sobrescreve conscientemente.
+
 **Fora do escopo desta decisão — o que o perfil BETA explicitamente NÃO é:**
 
 1. **Não é fonte de faturamento.** DA-7 permanece intacto: faturável reconcilia contra

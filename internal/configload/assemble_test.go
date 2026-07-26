@@ -291,3 +291,60 @@ func TestAssemble_HTMLCreativeFromBlob(t *testing.T) {
 		t.Errorf("html5 blob not mapped to HTML: %q", snap.Banners["30"].HTML)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Delivered counts (DA-4 pacing input; perfil BETA / ADR-0005) — see
+// DeliveredRow's doc.
+// ---------------------------------------------------------------------------
+
+// TestAssemble_DeliveredCounts_MatchedByCampaignID proves the exact defect
+// the coordinator flagged: before this test existed, NOTHING in production
+// ever set snapshot.Campaign.Delivered*, so DA-4's computeDeficit always saw
+// a permanent 1.0 deficit. This drives Assemble (the real production
+// assembly function, not a reimplementation) with a populated raw.Delivered
+// and asserts the counts land on the right campaign — and stay at zero for
+// a campaign absent from the stats result (the documented degrade path).
+func TestAssemble_DeliveredCounts_MatchedByCampaignID(t *testing.T) {
+	raw := demoRaw()
+	// A second campaign that will have NO matching DeliveredRow — proves
+	// unmatched campaigns are left at their zero value, not accidentally
+	// populated from another campaign's row (no cross-campaign leakage).
+	raw.Campaigns = append(raw.Campaigns, CampaignRow{
+		ID: "21", TenantID: tenantA, Type: "remnant", Priority: 5, PricingModel: "cpm",
+		Currency: "BRL", RateMinor: 1250, Scale: 2, Active: true,
+	})
+	raw.Delivered = []DeliveredRow{
+		{CampaignID: "20", Impressions: 4200, Clicks: 137, Conversions: 9},
+	}
+
+	snap := Assemble(raw, "v1", time.Now().UTC())
+
+	camp20 := snap.Campaigns["20"]
+	if camp20.DeliveredImpressions != 4200 || camp20.DeliveredClicks != 137 || camp20.DeliveredConversions != 9 {
+		t.Fatalf("campaign 20 delivered counts wrong: impressions=%d clicks=%d conversions=%d, want 4200/137/9",
+			camp20.DeliveredImpressions, camp20.DeliveredClicks, camp20.DeliveredConversions)
+	}
+
+	camp21 := snap.Campaigns["21"]
+	if camp21.DeliveredImpressions != 0 || camp21.DeliveredClicks != 0 || camp21.DeliveredConversions != 0 {
+		t.Fatalf("campaign 21 (no matching DeliveredRow) should stay at zero, got impressions=%d clicks=%d conversions=%d",
+			camp21.DeliveredImpressions, camp21.DeliveredClicks, camp21.DeliveredConversions)
+	}
+}
+
+// TestAssemble_DeliveredCounts_EmptyDegradesToZero proves the degrade path:
+// raw.Delivered == nil (the stats store unavailable — see loadDelivered's
+// doc) must NOT panic and must leave every campaign's Delivered* at zero,
+// bit-identical to this package's behavior before DeliveredRow existed.
+func TestAssemble_DeliveredCounts_EmptyDegradesToZero(t *testing.T) {
+	raw := demoRaw()
+	raw.Delivered = nil // explicit: the degrade-path value
+
+	snap := Assemble(raw, "v1", time.Now().UTC())
+
+	camp := snap.Campaigns["20"]
+	if camp.DeliveredImpressions != 0 || camp.DeliveredClicks != 0 || camp.DeliveredConversions != 0 {
+		t.Fatalf("expected zero delivered counts with raw.Delivered=nil, got impressions=%d clicks=%d conversions=%d",
+			camp.DeliveredImpressions, camp.DeliveredClicks, camp.DeliveredConversions)
+	}
+}

@@ -23,6 +23,28 @@
 --                        is already Postgres' default when omitted, but it is
 --                        spelled out here so the invariant is auditable at a
 --                        glance instead of relying on an implicit default.
+--   adserver_stats_writer — INSERT/SELECT-only, NOBYPASSRLS EXPLICIT.  Used
+--                        by internal/telemetry/pgsink (the collector's
+--                        Postgres telemetry sink, ADR-0005 "perfil BETA") to
+--                        write stats.events_raw. MOVED HERE (achado H-2,
+--                        security-reviewer): the first version of
+--                        db/stats/migrations/0001_stats_schema_up.sql created
+--                        this role INLINE with a literal `LOGIN PASSWORD`,
+--                        which meant a plain `make db-migrate-up` against
+--                        ANY DATABASE_URL — including staging/production —
+--                        would silently mint a login role with a known dev
+--                        password in the real database (and the migration's
+--                        _down deliberately never drops roles, so the
+--                        credential would survive a rollback). Centralizing
+--                        role creation here matches every other role in this
+--                        file and keeps schema migrations free of
+--                        `CREATE ROLE ... LOGIN PASSWORD` literals. The
+--                        GRANTs themselves stay in
+--                        db/stats/migrations/0001_stats_schema_up.sql
+--                        (commented out, same convention as its
+--                        adserver_app block) — run explicitly by
+--                        make/dev.mk::dev-db-setup and
+--                        .github/workflows/db.yml AFTER this file.
 --
 -- Passwords here are DEV defaults — NEVER use these in staging/production
 -- (production secrets come from OpenBao; see platform/secrets/openbao).
@@ -42,6 +64,13 @@ BEGIN
         -- NOBYPASSRLS explicit (see header): the copiloto's RAG reads MUST
         -- go through RLS — this role may never be granted BYPASSRLS.
         CREATE ROLE adserver_copilot LOGIN PASSWORD 'copilot_dev_only' NOBYPASSRLS;
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'adserver_stats_writer') THEN
+        -- NOBYPASSRLS explicit (see header, achado H-2): the pgsink write
+        -- path depends on stats.events_raw_tenant_isolation's WITH CHECK to
+        -- keep the session GUC and the row's tenant_id consistent — a
+        -- BYPASSRLS role would silently skip that check.
+        CREATE ROLE adserver_stats_writer LOGIN PASSWORD 'stats_writer_dev_only' NOBYPASSRLS;
     END IF;
 END
 $$;
