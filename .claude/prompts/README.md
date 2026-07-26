@@ -3,6 +3,10 @@
 Os 8 prompts do ciclo de desenvolvimento, materializados como **slash commands
 project-local**, mais um driver que escolhe o estágio pelo estado do repo.
 
+> **Começando?** Leia o **[guia prático](guia-loop.md)** — como rodar, o que
+> esperar de cada volta, as dez regras, a barreira de guardiões, calibragem de
+> custo e o checklist de fecho.
+
 Todos compartilham o mesmo contexto-âncora: **[`contexto-ancora.md`](contexto-ancora.md)**
 — estado do projeto, roster de subagentes, gates `make` reais, protocolos de mutação e
 regras de ancoragem documental. Editar um invariante lá vale para os 9 comandos.
