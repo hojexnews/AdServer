@@ -7,6 +7,7 @@
  */
 
 import { z } from "zod";
+import { TRPCError } from "@trpc/server";
 import { MoneySchema } from "./money.js";
 
 // ---------------------------------------------------------------------------
@@ -451,6 +452,41 @@ export const UpdateCapInputSchema = z.object({
   resetInterval: z.number().int().positive().nullable().optional(),
   active: z.boolean().optional(),
 });
+
+/**
+ * Invariante de escopo do cap: `scope=clock` EXIGE resetInterval; qualquer
+ * outro escopo exige resetInterval nulo.
+ *
+ * FIX (31ª onda, bff-cap-update-missing-scope-invariant): o
+ * CreateCapInputSchema impõe isso via `.refine`, mas o UpdateCapInputSchema
+ * NÃO — e nem poderia sozinho, porque `scope` não faz parte do input de
+ * update. Resultado: `cap.update` conseguia levar uma linha JÁ VÁLIDA para um
+ * estado que o create teria rejeitado — por exemplo zerar o resetInterval de
+ * um cap `scope=clock` (capping por janela de tempo sem janela definida) ou
+ * pôr resetInterval num cap `scope=total`. O motor de decisão lê esses caps no
+ * snapshot de configuração; um cap incoerente é comportamento de ENTREGA
+ * indefinido, não um erro cosmético de formulário.
+ *
+ * Fica aqui (e não em cada adapter) para ser a MESMA regra nos dois caminhos —
+ * in-memory e Postgres — sem cópia para dessincronizar. Lançar dentro do
+ * withTenant do Postgres desfaz a transação (ROLLBACK), então a linha inválida
+ * nunca chega a ser persistida.
+ */
+export function assertCapScopeInvariant(
+  scope: string,
+  resetInterval: number | null
+): void {
+  const ok = scope === "clock" ? resetInterval !== null : resetInterval === null;
+  if (!ok) {
+    throw new TRPCError({
+      code: "BAD_REQUEST",
+      message:
+        scope === "clock"
+          ? "Cap com scope=clock exige resetInterval (janela de tempo em segundos)."
+          : `Cap com scope=${scope} não aceita resetInterval — deixe nulo.`,
+    });
+  }
+}
 
 export type Cap = z.infer<typeof CapSchema>;
 export type CreateCapInput = z.infer<typeof CreateCapInputSchema>;

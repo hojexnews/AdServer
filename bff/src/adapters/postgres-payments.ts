@@ -34,6 +34,7 @@
  * DSN via env BFF_PG_DSN (nunca do cliente, nunca no payload).
  */
 
+import { TRPCError } from "@trpc/server";
 import pg from "pg";
 import type { Pool } from "pg";
 import type { PaymentsAdapter } from "./payments-adapter.js";
@@ -164,11 +165,46 @@ function minorUnitsToDecimalStr(pgNumericStr: string, scale: number | null | und
  * Retorna undefined se o prefixo não for reconhecido (entry de outro tipo).
  */
 function railFromIdempotencyKey(key: string): PaymentRail | undefined {
-  if (key.startsWith("stripe:")) return "fiat_stripe";
-  if (key.startsWith("asaas:")) return "fiat_asaas";
-  if (key.startsWith("mp:")) return "fiat_mp";
-  if (key.startsWith("deposit:")) return "crypto_safe";
+  for (const prefix of RAIL_PREFIXES) {
+    if (key.startsWith(prefix)) return RAIL_BY_PREFIX[prefix];
+  }
   return undefined;
+}
+
+/**
+ * FONTE ÚNICA dos prefixos de idempotency_key ↔ rail de pagamento.
+ *
+ * `railFromIdempotencyKey` (acima), `railToPrefix` (abaixo) e o SQL de seleção
+ * (`railPrefixSql`, em listPaymentStatus) derivam TODOS daqui.
+ *
+ * FIX (31ª onda, M1-rail-prefix-single-source-of-truth-drift): a correção do
+ * COUNT de paginação, nesta mesma onda, introduziu uma QUARTA cópia da lista —
+ * um literal SQL escrito à mão, "mantido em sincronia" apenas por comentário.
+ * Um rail novo adicionado ao TS e esquecido no SQL faria os pagamentos desse
+ * rail sumirem da listagem, silenciosamente e sem teste que pegasse. Derivar
+ * mata a classe inteira: acrescentar uma entrada aqui atualiza os três usos, e
+ * o `satisfies` garante que nenhum rail do union fique sem prefixo (erro de tsc).
+ */
+const RAIL_BY_PREFIX = {
+  "stripe:": "fiat_stripe",
+  "asaas:": "fiat_asaas",
+  "mp:": "fiat_mp",
+  "deposit:": "crypto_safe",
+} as const satisfies Record<string, PaymentRail>;
+
+const RAIL_PREFIXES = Object.keys(RAIL_BY_PREFIX) as Array<
+  keyof typeof RAIL_BY_PREFIX
+>;
+
+/**
+ * Predicado SQL "a idempotency_key começa com algum prefixo de rail conhecido".
+ * Gerado a partir de RAIL_BY_PREFIX — os prefixos são literais de código, nunca
+ * entrada do cliente, então não há superfície de injeção.
+ */
+function railPrefixPredicate(): string {
+  return `(${RAIL_PREFIXES.map(
+    (p) => `je.idempotency_key LIKE '${p}%'`
+  ).join(" OR ")})`;
 }
 
 // ---------------------------------------------------------------------------
@@ -343,17 +379,50 @@ export class PostgresPaymentsAdapter implements PaymentsAdapter {
       // Fix-2: SET LOCAL DENTRO de transação ativa a RLS (migração 0003).
       // Filtro explícito de tenant_id na WHERE é defense-in-depth (CA-1/TX-3).
       // NUNCA varra página sem tenant — ambos os filtros devem coincidir.
+      // Prefixos de idempotency_key que railFromIdempotencyKey() sabe mapear.
+      // Uma entry cujo prefixo NÃO está aqui é descartada pelo laço em JS
+      // (o `continue` mais abaixo) — precisa portanto sair também das duas
+      // queries, senão o total conta linha que nenhuma página exibirá.
+      // Caso real: internal/ledger/crypto.go (RecordPayout) grava
+      // ref_type='payment_event' com idempotency_key 'payout:<id>', que casa o
+      // baseWhere mas não é um pagamento RECEBIDO — não pertence a esta listagem.
+      // Derivado de RAIL_BY_PREFIX — nunca uma cópia manual da lista.
+      const railPrefixSql = railPrefixPredicate();
+
       const baseWhere = `
         (je.ref_type = 'payment_event' OR je.idempotency_key LIKE 'deposit:%')
+        AND ${railPrefixSql}
         AND je.tenant_id = NULLIF(current_setting('adserver.tenant_id', true), '')::uuid
         ${extraSql}
       `;
 
       // Conta total para paginação (sem OFFSET/LIMIT).
+      //
+      // FIX (31ª onda, bff-payments-total-count-mismatch): esta contagem rodava
+      // só sobre `baseWhere`, enquanto a query de dados abaixo acrescenta
+      // `JOIN ledger.postings`, `AND p.debit_amount > 0` e
+      // `HAVING COUNT(*) FILTER (WHERE p.debit_amount > 0) = 1`. O universo
+      // contado era estritamente MAIOR que o universo servível, então `total`
+      // sempre superestimava. Propagava para
+      // `hasMore: page * pageSize < total` (routers/payments.ts) e para
+      // "Exibindo X–Y de Z" no console: o botão "Próxima" ficava habilitado
+      // levando a páginas VAZIAS que o usuário nunca conseguia alcançar.
+      // Verificado contra Postgres 16 real: COUNT devolvia 4 onde a query de
+      // dados devolvia 3.
+      //
+      // A contagem passa a rodar sobre EXATAMENTE o mesmo conjunto elegível,
+      // via subquery que replica JOIN + filtro + GROUP BY + HAVING.
       const countResult = await client.query<{ total: string }>(
         `SELECT COUNT(*)::text AS total
-         FROM ledger.journal_entries je
-         WHERE ${baseWhere}`,
+         FROM (
+           SELECT je.id
+           FROM ledger.journal_entries je
+           JOIN ledger.postings p ON p.journal_entry_id = je.id
+           WHERE ${baseWhere}
+             AND p.debit_amount > 0
+           GROUP BY je.id
+           HAVING COUNT(*) FILTER (WHERE p.debit_amount > 0) = 1
+         ) AS eligible`,
         params
       );
       const total = parseInt(countResult.rows[0]?.total ?? "0", 10);
@@ -601,12 +670,20 @@ export class PostgresPaymentsAdapter implements PaymentsAdapter {
  * DA-10: sem conversão automática — apenas seleção de padrão.
  */
 function railToPrefix(rail: PaymentRail): string {
-  switch (rail) {
-    case "fiat_stripe":  return "stripe:%";
-    case "fiat_asaas":   return "asaas:%";
-    case "fiat_mp":      return "mp:%";
-    case "crypto_safe":  return "deposit:%";
+  // Derivado de RAIL_BY_PREFIX (fonte única) — antes era um switch com a lista
+  // repetida, terceira cópia dos mesmos prefixos (31ª onda).
+  const entry = RAIL_PREFIXES.find((p) => RAIL_BY_PREFIX[p] === rail);
+  // O `satisfies Record<string, PaymentRail>` em RAIL_BY_PREFIX garante que
+  // todo rail mapeado tem prefixo; um rail NOVO no union sem entrada no mapa
+  // cairia aqui, então falhamos alto em vez de devolver um LIKE que não casa
+  // com nada (que viraria "nenhum pagamento encontrado", silencioso).
+  if (entry === undefined) {
+    throw new TRPCError({
+      code: "INTERNAL_SERVER_ERROR",
+      message: `Rail sem prefixo de idempotency_key mapeado: ${rail}`,
+    });
   }
+  return `${entry}%`;
 }
 
 /**

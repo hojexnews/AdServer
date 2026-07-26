@@ -44,6 +44,7 @@ import type {
   CreateCapInput,
   UpdateCapInput,
 } from "../schemas/config.js";
+import { assertCapScopeInvariant } from "../schemas/config.js";
 
 let seq = 1;
 const nextId = (): string => String(seq++);
@@ -598,6 +599,10 @@ export class InMemoryConfigAdapter implements ConfigAdapter {
       ...(input.active !== undefined && { active: input.active }),
       updatedAt: now(),
     };
+    // O update não carrega `scope`, então a validação usa o scope PERSISTIDO
+    // contra o resetInterval resultante do merge (31ª onda). Valida ANTES de
+    // gravar — o store in-memory não tem transação para desfazer.
+    assertCapScopeInvariant(updated.scope, updated.resetInterval);
     store.caps[idx] = updated;
     return updated;
   }

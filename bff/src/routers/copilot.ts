@@ -233,12 +233,24 @@ export function createCopilotRouter() {
         );
 
         if (!resp.ok) {
-          const body = await resp.text().catch(() => "");
+          // Drena o corpo sem usá-lo: o undici mantém a conexão presa até o
+          // body ser consumido ou cancelado. Ao parar de logar o corpo (fix de
+          // privacidade desta onda) a leitura sumiu junto e vazava socket a
+          // cada erro upstream — regressão pega pela revisão do próprio diff
+          // (COPILOT-BODY-NOT-DRAINED).
+          await resp.body?.cancel().catch(() => undefined);
           const corrId = crypto.randomUUID();
+          // FIX (31ª onda, bff-hitl-upstream-body-log-unredacted): o corpo cru
+          // do upstream era logado inteiro. Numa falha do copiloto esse corpo
+          // pode ecoar o WriteDiff (nomes de campanha, valores monetários) e a
+          // mensagem do anunciante — dado de tenant indo parar em log
+          // centralizado sem redação nem retenção controlada (TX-5/DA-11).
+          // Logamos só o que é acionável para diagnóstico: status e correlação.
+          // O corpo, quando necessário, sai do log do próprio serviço copiloto,
+          // que já aplica a redação dele.
           console.error("hitlApprove.upstream_error", {
             corrId,
             status: resp.status,
-            body,
           });
           throw new TRPCError({
             code: "INTERNAL_SERVER_ERROR",

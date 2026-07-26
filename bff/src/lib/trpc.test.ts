@@ -25,7 +25,9 @@
  * teste automaticamente.
  */
 
-import { router } from "./trpc.js";
+import { z } from "zod";
+import { TRPCError } from "@trpc/server";
+import { router, publicProcedure } from "./trpc.js";
 import { createConfigRouter } from "../routers/config.js";
 import { createStatsRouter } from "../routers/stats.js";
 import { createCopilotRouter } from "../routers/copilot.js";
@@ -211,4 +213,123 @@ describe("ACL default-deny — TODO procedimento de dados do appRouter exige ten
       await expect(fn(undefined)).rejects.toMatchObject({ code: "UNAUTHORIZED" });
     }
   );
+});
+
+// ---------------------------------------------------------------------------
+// errorFormatter — redação fail-closed de erros internos (31ª onda, TX-5/DA-11)
+//
+// Achado bff-trpc-error-shape-leak: `initTRPC...create()` era chamado SEM
+// errorFormatter. Um erro que não é TRPCError (ex.: driver `pg`) é embrulhado
+// pelo tRPC em INTERNAL_SERVER_ERROR PRESERVANDO a mensagem original, que
+// chegava ao browser — publicando nomes de tabela/constraint e fragmentos de
+// valor citados pelo Postgres.
+//
+// Estes testes são de MUTAÇÃO: remover o errorFormatter de lib/trpc.ts faz o
+// primeiro teste FALHAR (a mensagem crua volta a vazar).
+// ---------------------------------------------------------------------------
+describe("errorFormatter — nenhum detalhe interno chega ao cliente", () => {
+  const SEGREDO = 'relation "config.campaigns" does not exist';
+
+  /** Router mínimo que lança um erro NÃO-TRPCError (simula falha do driver pg). */
+  const leakyRouter = router({
+    boom: publicProcedure.query(() => {
+      throw new Error(SEGREDO);
+    }),
+    /** TRPCError deliberado: mensagem escrita para o usuário, deve passar. */
+    denied: publicProcedure.query(() => {
+      throw new TRPCError({
+        code: "FORBIDDEN",
+        message: "Acesso negado a esta campanha.",
+      });
+    }),
+    /** Validação Zod: BAD_REQUEST com cause=ZodError (NÃO pode ser redigido). */
+    validated: publicProcedure
+      .input(z.object({ dia: z.number().int() }))
+      .query(() => "ok"),
+    /** TRPCError deliberado COM código interno (padrão de routers/copilot.ts). */
+    upstream: publicProcedure.query(() => {
+      throw new TRPCError({
+        code: "INTERNAL_SERVER_ERROR",
+        message: "Falha ao processar aprovação HITL. ID: abc-123",
+      });
+    }),
+  });
+
+  /** Extrai a shape serializada que o cliente REALMENTE receberia. */
+  async function shapeOf(
+    path: "boom" | "denied" | "upstream" | "validated",
+    input?: unknown,
+  ) {
+    const caller = leakyRouter.createCaller({ tenantId: "t", userId: "u" });
+    try {
+      await (caller[path] as (i?: unknown) => Promise<unknown>)(input);
+      throw new Error("esperava rejeição");
+    } catch (err) {
+      const e = err as TRPCError;
+      return leakyRouter._def._config.errorFormatter({
+        error: e,
+        type: "query",
+        path,
+        input: undefined,
+        ctx: undefined,
+        shape: {
+          message: e.message,
+          code: -32603,
+          data: { code: e.code, httpStatus: 500, path, stack: e.stack },
+        },
+      } as never) as { message: string; data?: Record<string, unknown> };
+    }
+  }
+
+  test("erro NÃO-TRPCError (driver pg) -> mensagem crua NUNCA chega ao cliente", async () => {
+    const shape = await shapeOf("boom");
+
+    expect(shape.message).not.toContain(SEGREDO);
+    expect(shape.message).not.toContain("config.campaigns");
+    expect(JSON.stringify(shape)).not.toContain("config.campaigns");
+    expect(shape.message).toMatch(/Erro interno\. ID de correlação: /);
+  });
+
+  test("erro NÃO-TRPCError -> stack nunca é serializada para o cliente", async () => {
+    const shape = await shapeOf("boom");
+    expect(shape.data?.["stack"]).toBeUndefined();
+  });
+
+  test("erro NÃO-TRPCError -> correlationId presente para rastreio no log do servidor", async () => {
+    const shape = await shapeOf("boom");
+    expect(typeof shape.data?.["correlationId"]).toBe("string");
+    expect(shape.message).toContain(String(shape.data?.["correlationId"]));
+  });
+
+  test("TRPCError deliberado (FORBIDDEN) -> mensagem para o usuário é PRESERVADA", async () => {
+    const shape = await shapeOf("denied");
+    expect(shape.message).toBe("Acesso negado a esta campanha.");
+  });
+
+  test("TRPCError deliberado com código INTERNAL_SERVER_ERROR -> mensagem própria preservada (padrão do copiloto)", async () => {
+    const shape = await shapeOf("upstream");
+    expect(shape.message).toBe("Falha ao processar aprovação HITL. ID: abc-123");
+  });
+
+  // -------------------------------------------------------------------------
+  // REGRESSÃO pega pela revisão adversarial do próprio diff da 31ª onda.
+  //
+  // A primeira versão do errorFormatter discriminava por `cause === undefined`.
+  // Erro de validação Zod chega como BAD_REQUEST *com* cause=ZodError
+  // (verificado contra @trpc/server 11.0.0), então era REDIGIDO: o anunciante
+  // digitava uma data inválida e recebia "Erro interno. ID de correlação: ..."
+  // em vez da mensagem de campo. O discriminador passou a exigir
+  // code === INTERNAL_SERVER_ERROR **E** cause !== undefined.
+  //
+  // MUTAÇÃO: voltar o discriminador para `error.cause === undefined` faz este
+  // teste FALHAR.
+  // -------------------------------------------------------------------------
+  test("erro de validação Zod (BAD_REQUEST com cause) -> mensagem de campo PRESERVADA, nunca redigida", async () => {
+    const shape = await shapeOf("validated", { dia: "nao-e-numero" });
+
+    expect(shape.message).not.toMatch(/Erro interno\. ID de correlação/);
+    expect(shape.data?.["correlationId"]).toBeUndefined();
+    // A mensagem do Zod tem de sobreviver para o formulário mapear no campo.
+    expect(shape.message).toContain("dia");
+  });
 });
