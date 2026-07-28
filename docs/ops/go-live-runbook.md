@@ -64,21 +64,30 @@ psql "$PGURL" -f db/ledger/migrations/0003_ledger_rls_up.sql
 psql "$PGURL" -f db/ledger/migrations/0004_ledger_postings_immutable_up.sql
 ```
 
-**Atencao:** `deploy/local/postgres/10-init.sh` (hook do Docker local) aplica APENAS a
-`0001_ledger_schema_up.sql`. As migracoes `0002` (reconciliation_exceptions), `0003`
-(RLS por tenant) e `0004` (imutabilidade append-only) **precisam ser aplicadas
-explicitamente** em producao. Omiti-las resulta em falha do smoke-payments (trilho c + d),
-ausencia de RLS no ledger e — no caso da `0004` — um ledger em que `UPDATE`/`DELETE` de
-postings ja lancados sao ACEITOS pelo banco.
+**Atencao:** producao NAO roda nenhum dos provisionadores de dev — nem
+`make dev-db-setup` nem o hook de initdb `deploy/local/postgres/10-init.sh`. Os dois
+aplicam hoje TODAS as migrations de TODOS os schemas (derivadas por glob + sort, na ordem
+de `db/schema-order.txt`), mas isso vale para o banco LOCAL; aqui a aplicacao e explicita
+e e sua responsabilidade. Derive a lista do diretorio em vez de confiar nesta prosa:
+`ls db/ledger/migrations/*_up.sql`. Omitir qualquer uma resulta em falha do smoke-payments
+(trilho c + d), ausencia de RLS no ledger e — no caso da `0004` — um ledger em que
+`UPDATE`/`DELETE` de postings ja lancados sao ACEITOS pelo banco.
+
+> Ate a 32a onda este paragrafo dizia que o `10-init.sh` aplicava "APENAS a
+> `0001_ledger_schema_up.sql`". Era verdade quando foi escrito e deixou de ser no mesmo
+> diff que reescreveu o hook — o tipo de doc-lie que so aparece quando alguem le o runbook
+> as 3h da manha. Regra que ficou: quem muda um provisionador roda
+> `git grep -n "10-init.sh" docs/` antes de fechar a onda.
 
 #### 2.3.1 Least-privilege de `ledger.postings` (passo manual — NAO esta na migration)
 
 A `0004` instala os triggers `postings_immutable_trg` e `journal_entries_immutable_trg`
 (garantia **primaria**, vale ate para superusuario e para acesso direto a uma particao).
 A metade **least-privilege** do controle **nao esta dentro de nenhum arquivo de migration**
-— hoje ela so existe em `make/db.mk` (Postgres efemero de `db-test-all`) e no SQL inline
-de `.github/workflows/db.yml`. Em producao ela precisa ser executada a mao, **depois** dos
-GRANTs de schema:
+— hoje ela existe nos quatro provisionadores de teste/dev (`make/db.mk` do Postgres efemero
+de `db-test-all`, `make/dev.mk`, `deploy/local/postgres/10-init.sh` e o SQL inline de
+`.github/workflows/db.yml`), em nenhuma migration. Em producao ela precisa ser executada a
+mao, **depois** dos GRANTs de schema:
 
 ```bash
 psql "$PGURL" -v ON_ERROR_STOP=1 \
@@ -381,8 +390,8 @@ Confirma:
 ### money-ledger-guardian
 
 Confirma:
-- [ ] Migracoes 0001+0002+0003+0004 do ledger aplicadas (inclusive 0002 recon + 0003 RLS + 0004 imutabilidade — NAO apenas 0001 como no Docker local).
-- [ ] `REVOKE UPDATE, DELETE ON ledger.postings FROM adserver_app;` executado em producao (§2.3.1 — **nao** vem em nenhuma migration; so existe em `make/db.mk` e `db.yml`, ambos ambientes de teste).
+- [ ] TODAS as migrations do ledger aplicadas (`ls db/ledger/migrations/*_up.sql` — hoje 0001 schema + 0002 recon + 0003 RLS + 0004 imutabilidade). Nao enumere a mao ao conferir: derive do diretorio, que e o que todo provisionador faz desde a 32a onda.
+- [ ] `REVOKE UPDATE, DELETE ON ledger.postings FROM adserver_app;` executado em producao (§2.3.1 — **nao** vem em nenhuma migration; hoje so existe nos provisionadores de teste/dev: `make/db.mk`, `make/dev.mk`, `deploy/local/postgres/10-init.sh` e `.github/workflows/db.yml`). A garantia primaria de append-only NAO depende dele: e o trigger `postings_immutable_trg` da migration 0004, que vale inclusive para superusuario.
 - [ ] `psql "$PGURL" -f db/ledger/tests/postings_immutability_test.sql` VERDE contra o banco de PRODUCAO ja migrado (imprime `== LEDGER POSTINGS IMMUTABILITY: ALL TESTS PASSED ==`). Este e o unico check que prova que a 0004 pegou de fato.
 - [ ] Migration `0004_campaign_zones_with_check_up.sql` do schema config aplicada (§2.2 — `WITH CHECK` explicito no catalogo).
 - [ ] `smoke-payments.sh` VERDE: todos os 4 invariantes (a)(b)(c)(d).

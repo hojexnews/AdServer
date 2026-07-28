@@ -71,18 +71,37 @@
 
 MIGRATE := $(shell command -v migrate 2>/dev/null || echo migrate)
 
-# Schemas e ORDEM ENTRE schemas (esta, sim, é uma dependência real de
-# schema — asset_registry antes de config, compliance por último — e por
-# isso permanece uma lista explícita). A ordem DENTRO de cada schema não
-# vem daqui: vem do glob descrito acima.
-# stats (novo, onda "perfil BETA" / addon §3.3): persistência do collector
-# via Postgres (internal/telemetry/pgsink), lida pelo BFF via
-# stats.live_kpis. Sem dependência real de config/ledger (nenhuma FK física
-# entre schemas — só FK lógica, mesmo espírito de config/ledger entre si);
-# colocado após ledger só para manter a ordem de aparição no diretório db/
-# legível, não por uma dependência real de aplicação.
-DB_SCHEMAS     := asset_registry config ledger stats vector compliance
-DB_SCHEMAS_REV := compliance vector stats ledger config asset_registry
+# Schemas e ORDEM ENTRE schemas. Esta, sim, é uma dependência real de schema
+# (asset_registry antes de config, compliance por último) e por isso precisa
+# ser DECLARADA — mas declarada UMA vez, em db/schema-order.txt, e derivada
+# aqui. A ordem DENTRO de cada schema não vem daqui: vem do glob descrito
+# acima.
+#
+# Antes da 32ª onda esta lista era um literal, e havia mais três cópias
+# independentes dela (make/dev.mk::dev-db-setup, deploy/local/postgres/
+# 10-init.sh e .github/workflows/db.yml). As cópias divergiram: os dois
+# provisionadores locais enumeravam as migrations À MÃO e pararam em
+# config/0003 — deixando config.campaign_zones_tenant_isolation sem WITH
+# CHECK no catálogo — e o initdb do Docker aplicava só ledger/0001, sem RLS
+# (0003) nem imutabilidade append-only (0004). É a 4ª reincidência da classe
+# "enumeração mantida à mão"; a correção é da FORMA (derivação + gate
+# default-deny em scripts/ci/db-provisioner-check.py), não da instância.
+# `override` e deliberado: sem ele, `make DB_SCHEMAS="asset_registry" db-migrate-up`
+# venceria a atribuicao do arquivo (definicao de linha de comando tem precedencia
+# maxima no GNU Make) e pularia config/ledger/stats/vector/compliance em silencio —
+# a sentinela abaixo so pega lista VAZIA, nao subconjunto arbitrario. Achado do
+# parity-golden-test-guardian na barreira da 32a onda.
+DB_SCHEMA_ORDER_FILE := db/schema-order.txt
+override DB_SCHEMAS     := $(shell sed -e 's/#.*//' -e '/^[[:space:]]*$$/d' $(DB_SCHEMA_ORDER_FILE) 2>/dev/null)
+override DB_SCHEMAS_REV := $(shell sed -e 's/#.*//' -e '/^[[:space:]]*$$/d' $(DB_SCHEMA_ORDER_FILE) 2>/dev/null | tac)
+
+# Sentinela anti-vazio: se o arquivo de ordem sumir ou ficar ilegível, TODO
+# runner de banco viraria um no-op verde (loop sobre lista vazia = zero
+# migrations aplicadas, zero testes rodados, exit 0). Falhar aqui, no parse
+# do Makefile, é ruidoso de propósito — a alternativa é falso-verde.
+ifeq ($(strip $(DB_SCHEMAS)),)
+$(error db/schema-order.txt vazio ou ausente — sem ele DB_SCHEMAS fica vazio e todo alvo de banco vira no-op verde. Restaure o arquivo antes de rodar qualquer coisa.)
+endif
 
 ## db-check-migration-pairing: sentinela — todo *_up.sql precisa ter o
 ##   *_down.sql correspondente (mesmo schema, mesmo prefixo) e vice-versa.
@@ -144,6 +163,18 @@ db-check-schema-list:
 	   exit 1; \
 	 fi
 	@echo "== db-check-schema-list: ok =="
+
+## db-check-provisioners: sentinela — nenhum provisionador (make/dev.mk,
+##   deploy/local/postgres/10-init.sh, .github/workflows/db.yml, este arquivo)
+##   pode enumerar migration à mão, e nenhuma instrução operacional pode
+##   enumerar uma lista PARCIAL. É a irmã comportamental das duas sentinelas
+##   acima: elas garantem que a lista derivada esteja bem-formada; esta
+##   garante que ninguém contorne a derivação. Ver o cabeçalho de
+##   scripts/ci/db-provisioner-check.py para as 4 reincidências que a
+##   motivaram. Roda também em .github/workflows/repo-gates.yml (sem filtro
+##   de path — a superfície é espalhada por construção).
+db-check-provisioners:
+	@python3 scripts/ci/db-provisioner-check.py
 
 # Container efêmero para db-test-all.
 _DB_TEST_CONTAINER := adserver-db-test-ephemeral
@@ -260,7 +291,7 @@ db-test-stats: _db-check-url
 ##   Imagem: pgvector/pgvector:pg16 (postgres:16 + extensão pgvector — a
 ##   stock postgres:16 não traz a extensão que db/vector/0001 exige via
 ##   `CREATE EXTENSION vector`; alinhado com .github/workflows/db.yml).
-db-test-all: db-check-schema-list db-check-migration-pairing
+db-test-all: db-check-schema-list db-check-migration-pairing db-check-provisioners
 	@echo "== db-test-all: iniciando Postgres efêmero =="
 	@if ! command -v docker >/dev/null 2>&1; then \
 	  echo "ERRO: docker não encontrado no PATH. db-test-all requer Docker."; \
@@ -427,5 +458,5 @@ _db-check-url:
 .PHONY: db-lint db-migrate-up db-migrate-down db-migrate-status \
         db-test db-test-compliance db-test-ledger db-test-ledger-immutability \
         db-test-vector db-test-stats db-test-all \
-        db-check-migration-pairing db-check-schema-list \
+        db-check-migration-pairing db-check-schema-list db-check-provisioners \
         _db-check-url

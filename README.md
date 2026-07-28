@@ -1167,10 +1167,167 @@ Fecha o **G0** (Onda de Ativação de Go-Live). Dois itens em 3 commits + o focu
 > `parity-golden-short`, `ml-test`, `data-validate`, `db-lint`, `platform-validate`, `copilot-test` — **todos
 > PASS**.
 >
-> ⚠️ **Colisão de numeração a reconciliar:** há trabalho **não-commitado** de outra sessão que também se
-> intitula "31ª onda" no plano (o conserto do gate `web-ci`/`a11y`, que dependia ocultamente de
-> `bff/node_modules`). Como esta onda foi commitada sobre a 30ª, aquela deve ser renumerada para **32ª** ao
-> ser commitada. Esta onda **não tocou** `bff/` nem `web/`.
+> ⚠️ **Colisão de numeração — RECONCILIADA na 32ª onda.** O trabalho de outra sessão que também se
+> intitulava "31ª onda" (metade BFF da 31ª + perfil BETA/ADR-0005 + console) foi commitado em
+> `f952ae5`/`73cd2e4`/`0caeb84` e está registrado como parte da **32ª** abaixo. Esta onda (a 31ª)
+> **não tocou** `bff/` nem `web/`.
+
+### ✅ Entregue na Fase 3 — 32ª onda: **o provisionamento local divergiu do disco — `dev-db-setup` montava um banco sem `WITH CHECK`** (sob TX-3/DA-11, sem ADR novo; gates verdes)
+
+> **O achado, medido antes de ser descrito.** No banco que `make dev-db-setup` monta — o **Caminho A**,
+> que o próprio README chama de "VERIFICADO" —, `config.campaign_zones_tenant_isolation` era a **única**
+> policy do schema `config` com `pg_policy.polwithcheck IS NULL`, e `make db-test` **reprovava contra o
+> banco que aquele mesmo alvo acabara de montar**. Causa: `make/dev.mk` enumerava as migrations de
+> `config` numa lista escrita à mão que **parava em `0003`**, então
+> `db/config/migrations/0004_campaign_zones_with_check_up.sql` nunca era aplicada.
+>
+> A `0004` não é cosmética: seu `WITH CHECK` é **estritamente mais forte** que o `USING` herdado por
+> fallback — além do lado `campaign_id`, exige que o `zone_id` pertença ao tenant da sessão. Sem ela, um
+> advertiser do tenant A podia vincular a **sua** campanha a uma zona de **outro** tenant, veiculando
+> criativo em inventário alheio e corrompendo faturamento.
+>
+> **O caminho Docker estava pior.** `deploy/local/postgres/10-init.sh` aplicava do ledger **apenas a
+> `0001`** — sem `0003_ledger_rls` (FORCE RLS e `ledger.current_tenant_id()`) e sem
+> `0004_ledger_postings_immutable` (append-only + `REVOKE`). Dinheiro mutável e legível cross-tenant no
+> perfil local. E o cabeçalho do arquivo afirmava: *"The same migration order is used by make
+> dev-db-setup"* — doc-lie. Ele também não criava `stats`, `vector` nem `compliance`, porque o compose
+> pinava `postgres:16` (sem `pgvector`), a **última instância viva** de um bug que o README já registra
+> como corrigido em `db.yml` numa onda anterior ("[MED-ci] `db.yml` usava `postgres:16` sem pgvector →
+> o gate RLS inteiro nunca rodava").
+>
+> **4ª reincidência da mesma classe** (28ª → 29ª #10 → 30ª → esta): *enumeração mantida à mão que
+> diverge do disco*. A 30ª corrigiu a **instância** nos 4 runners de teste (glob derivado + sentinela);
+> os dois provisionadores locais ficaram de fora e apodreceram. Por isso a correção desta onda é da
+> **FORMA**:
+>
+> - **`db/schema-order.txt`** (novo) — fonte única da ordem **entre** schemas, com a justificativa de
+>   cada dependência. `make/db.mk` deriva `DB_SCHEMAS`/`DB_SCHEMAS_REV` dela, com `$(error)` se vier
+>   vazia (lista vazia = todo alvo de banco vira no-op verde).
+> - **`dev-db-setup` e `10-init.sh`** passam a derivar por **glob + sort** com sentinela anti-vazio por
+>   schema, exatamente como `db-test-all` e `db.yml`; ganham os GRANTs de `vector_store` e `compliance`
+>   que faltavam (sem eles, `db-test-vector` e `db-test-compliance` morriam com *permission denied*
+>   contra o banco local enquanto passavam na CI). Compose local → `pgvector/pgvector:pg16`.
+> - **`make db-check-provisioners`** (gate novo, default-deny) — (A) nenhuma linha **executável** aplica
+>   migration por enumeração à mão; (B) enumeração em **prosa** dentro de uma janela de 12 linhas tem de
+>   estar **completa**. A checagem B se auto-atualiza: criar uma `0005` deixa vermelha toda lista velha.
+>
+> **Resultado medido:** contra Postgres 16 nativo, num banco montado do zero por `make dev-db-setup`,
+> `db-test` · `db-test-compliance` · `db-test-ledger` · `db-test-ledger-immutability` · `db-test-vector`
+> · `db-test-stats` = **6/6 PASS**. Antes da onda: **3/6 FAIL**.
+>
+> **A varredura adversarial do diff não-mergeado** (5 donos-por-família → cético *default-refute*)
+> devolveu 3 confirmados / 1 refutado, e os dois HIGH eram da mesma família de "gate que não alcança o
+> que guarda":
+>
+> - **`make-quoting-check` órfão de novo, um nível acima.** A onda "perfil BETA" detectou que ele estava
+>   só em `make verify` (que **nenhum** workflow roda) e o cabeou em `buf.yml` — cujo gatilho é
+>   `paths: proto/**`. Ou seja: o conserto do órfão nasceu órfão. Editar `make/dev.mk` nunca acionou o
+>   gate que existe para validar recipe de make. → novo **`.github/workflows/repo-gates.yml`**, **sem
+>   `paths:`**, casa de gates de superfície ampla (com critério de admissão escrito no cabeçalho);
+>   `make-quoting-check`, `db-check-provisioners` e o mirror-check moram lá.
+> - **`push.paths` não espelhava `pull_request.paths` em `db.yml`.** O merge canônico deste repo é
+>   **push FF direto**, então `push.paths` é a *única* reavaliação que acontece — e faltavam lá
+>   `make/db.mk` e o próprio `db.yml`. Dava para neutralizar as sentinelas de schema editando
+>   `make/db.mk` e empurrar para a `main` sem o job `db` rodar uma vez. `go.yml` escrevera a regra por
+>   extenso ("espelha VERBATIM") no mesmo diff em que `db.yml` a violava. → novo
+>   **`scripts/ci/workflow-paths-mirror-check.py`**, que reprovou **2 workflows** — `db.yml`
+>   (2 paths) e `buf.yml` (1 path) —, não só o que a varredura apontara. GitHub Actions não
+>   suporta âncora YAML, então a regra vira gate ou não existe.
+> - **LOW, mas a mesma doença:** o commit do console encurtou o rótulo `Custo total (primeira hora —
+>   stub)` para `Custo total` mantendo `rows[0]` — um número rotulado como total mostrando 1 de N
+>   períodos. Rótulo honesto restaurado (`Custo do 1º período`). **Não** foi somado no cliente:
+>   `stack §2.5` e `ADR-0004 K7` proíbem aritmética monetária no front, e o `DashboardResponseSchema`
+>   do BFF não expõe agregado. O cético derrubou a correção que o auditor propunha, por violar a norma.
+>
+> **Este sweep também gerou os seus próprios falsos-positivos, e eles foram pegos antes do fecho**
+> (protocolo #5, 3ª onda seguida): a 1ª versão do `db-provisioner-check` tratava *âncora* como *lista* e
+> reprovava comentários que citam uma migration no ponto de uso — afiado para **janela de proximidade**;
+> e a 1ª versão do `workflow-paths-mirror-check` reprovava `supply-chain.yml`, cujo `push` é por **tag**
+> (gatilho de release, não caminho de merge) — passou a ignorar `push.tags` sem `push.branches`.
+>
+> **Prova por mutação (protocolo `cp` → mutar → rodar → `mv`):** (A) reintroduzir
+> `for f in 0001_config_schema 0002_config_rls 0003_campaign_zones_rls` em linha executável de
+> `make/dev.mk` → **VERMELHO** nomeando arquivo:linha; (B) criar um par `0005_probe_{up,down}.sql` →
+> **VERMELHO** em `smoke-payments.sh` ("4 das 5"). Ambas restauradas; `git status` limpo.
+>
+> **Gates de 1ª mão (saída colada acima, não auto-relato):** `verify` (buf 4 + no-float 6 +
+> make-quoting-check) · `go-build`/`go-vet`/`go-test`/`go-lint` · `parity-golden` · `bff-ci` ·
+> `web-ci` 79/79 · `web-a11y` 0 violações · `copilot-test` · `ml-test` · `data-validate` · `db-lint` ·
+> `platform-validate` · `db-check-{schema-list,migration-pairing,provisioners}` ·
+> `workflow-paths-mirror-check` (9 workflows) · **6/6 db-test-\* + `go-test-integration` contra PG16
+> nativo**.
+>
+> **A barreira de guardiões BLOQUEOU esta onda, e o bloqueio era da mesma família que a onda estava
+> fechando.** 4 PASS (`money`, `security`, `privacy`, `tech-lead`) e **1 BLOQUEIO** do
+> `parity-golden-test-guardian`, que executou o bypass num clone descartável: o `db-provisioner-check`
+> varria **linha física**, então um `for f in \` quebrado em continuações — um nome por linha, caminho
+> montado por `${f}_up.sql` em vez de literal — nunca tinha 2 nomes na mesma linha nem um nome ao lado
+> de `migrations/`, e **passava verde aplicando 3 das 4 migrations de `config`**. Pior: a checagem B
+> media completude no **arquivo inteiro**, então uma citação distante (um comentário histórico a 100
+> linhas — inclusive o do próprio cabeçalho do gate) *absolvia* a lista incompleta. É o
+> `no-float-multiline-split` da 30ª onda de novo: lá a conjunção era avaliada por linha física e
+> qualquer quebra do Prettier sumia com a violação; a correção lá foi "janela trocada para linha
+> lógica", e é a mesma aqui. Gate reescrito em Python (`scripts/ci/db-provisioner-check.py`) com junção
+> de continuações e completude medida num **raio local**.
+>
+> **Na re-guarda o `parity` bloqueou de novo, com um bypass diferente** — montar o id da migration por
+> concatenação (`f="${num}_${name}"`) faz o identificador **nunca aparecer literal** em linha alguma, e
+> uma detecção por substring não tem o que casar. Em paralelo o `tech-lead` demonstrou um terceiro:
+> uma migration por linha, diretório escondido numa variável de make, espaçadas por mais de
+> `B_WINDOW`. A checagem A virou **dois predicados**: **A1** — nomear *qualquer* migration em linha
+> executável reprova (medido: **zero** linhas assim no repo, logo default-deny a custo zero de
+> falso-positivo); **A2** — referenciar `migrations/<nome>_up.sql` onde `<nome>` não é o glob `*`
+> reprova por construção.
+>
+> **E o guardião bloqueou uma TERCEIRA vez**, com o bypass mais inocente dos quatro: strings
+> **adjacentes** — `"db/config/migrations/0001_config""_schema_up.sql"`, que o shell colapsa numa
+> palavra só, **sem variável nenhuma**. Ele quebrava a busca por substring de A1 e o `migrations/` de
+> A2 ao mesmo tempo, e não caía no resíduo declarado (que exigia variável). É a forma que aparece
+> sozinha num refatoro de quebra de linha longa, sem intenção de burlar nada. Fechado normalizando a
+> linha lógica (aspas nunca fazem parte de nome de migration nem do glob) antes de qualquer busca — em
+> A1, A2 **e** B. Os **quatro** bypasses conhecidos saem vermelhos; a árvore limpa segue verde, zero
+> falso-positivo.
+>
+> **Limite declarado, em vez de rótulo confortável:** nenhum gate textual vence ofuscação total — quem
+> esconder *ao mesmo tempo* o diretório numa variável e montar o id por concatenação não deixa
+> assinatura nenhuma. O que fecha a classe não é texto, é **comportamento**: os seis `make db-test-*` e
+> o `go-test-integration` rodam contra um banco montado pelo provisionador, e foi exatamente assim que
+> o defeito original apareceu. O gate textual é o alarme barato e imediato; a prova é a segunda linha.
+> Está escrito assim no cabeçalho do script, e não como "default-deny" sem ressalva.
+>
+> **Os guardiões também pegaram 4 doc-lies que esta própria onda escreveu:** a norma "nunca aritmética
+> monetária no cliente" está em `stack §2.5`, não `§2.2` (citação errada em 3 lugares); a justificativa
+> do `B_WINDOW=12` alegava âncoras a "100+ linhas" quando a medição dá 1–26 (é a *exclusão por tipo de
+> arquivo* que as protege, não a folga da janela); o número "3 divergências" do mirror-check não era
+> reproduzível contra a base da onda; e o comentário do compose atribuía à imagem `postgres:16` uma
+> causalidade que é da lista escrita à mão (que atingiu igualmente o `dev-db-setup`, onde imagem nenhuma
+> está envolvida). Todos corrigidos. Mais: `override DB_SCHEMAS` (sem ele,
+> `make DB_SCHEMAS="asset_registry" <alvo>` vencia o arquivo e pulava 5 schemas em silêncio — a
+> sentinela só pegava lista *vazia*); `repo-gates.yml` passou a usar `setup-python` e o cabeçalho parou
+> de alegar "sem dependência de rede"; e duas linhas do `go-live-runbook.md` que o próprio diff tornou
+> falsas no mesmo commit (o `REVOKE` agora vive em 4 provisionadores, não 2; o Docker local não aplica
+> mais "apenas 0001").
+>
+> **Residuais não-bloqueantes p/ a 33ª:** (1) **nada compara os steps de `db.yml` com
+> `db/schema-order.txt` — nem ordem nem CONJUNTO**; um schema declarado lá e esquecido no YAML nunca é
+> migrado nem tem RLS exercitada na CI (TX-3). O gate cabe em ~10 linhas e já tem casa em
+> `repo-gates.yml`. (2) `bff/src/routers/stats.ts` devolve `consolidatedUnavailable` com a mensagem
+> **crua** da rejeição dentro de uma resposta de *sucesso*, contornando o `errorFormatter` que este
+> mesmo diff criou — hoje inalcançável (nenhum adapter servido lança erro de driver ali), mas é uma
+> segunda porta para a classe que a primeira acabou de fechar. (3) `workflow-paths-mirror-check` não
+> enxerga `on.pull_request_target` (nenhum workflow usa hoje — verificado). (4) `repo-gates.yml` instala
+> PyYAML sem pin/hash, como já fazem `ml.yml`/`data.yml`/`go.yml`; uniformizar é decisão do
+> `platform-infra-engineer`. (5) `make/db.mk` e `.github/workflows/db.yml` continuam declarando a ordem
+> entre schemas em dois lugares (exceção declarada no cabeçalho de `db/schema-order.txt`).
+>
+> **LIÇÕES novas: (1) corrigir a instância nos runners de *teste* e deixar os provisionadores de
+> *desenvolvimento* enumerando à mão é meia-correção — e a metade que fica para trás é justamente a que
+> monta o banco em que a pessoa acredita. (2) Um gate de superfície ampla dentro de um workflow com
+> `paths:` é um órfão com aparência de gate; a casa dele é um workflow sem filtro. (3) Quando o merge é
+> push FF direto, `push.paths` — e não `pull_request.paths` — é a última palavra sobre o que é
+> revalidado. (4) Um gate novo herda o modo de falha da FAMÍLIA a que pertence: este nasceu com o mesmo
+> defeito linha-física-vs-linha-lógica que a 30ª já havia pago no `no-float`. Antes de escrever um gate,
+> releia as lições do gate irmão — elas são o teste que ele ainda vai falhar.**
 
 > **G0 segue código-completo; próximo movimento real = G1 (cutover de infra, gated).**
 

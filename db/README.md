@@ -35,44 +35,57 @@ em ambiente de desenvolvimento local com Postgres 16 disponível.
 
 ## Estrutura de diretórios
 
+Cada schema é um diretório com `migrations/` (pares `NNNN_nome_{up,down}.sql`, prefixo
+de 4 dígitos zero-padded) e, quando tem RLS, `tests/`.
+
+**Esta seção não lista as migrations.** Ela listava, e a lista apodreceu: até a 32ª onda
+o bloco aqui parava em `config/0003` e em `ledger/0001`, sem mencionar `stats`, `vector`
+nem `compliance` — os mesmos números que os provisionadores enumeravam à mão e pelos
+quais `config/0004` (o `WITH CHECK` de `campaign_zones`) e `ledger/0004` (imutabilidade
+append-only) ficaram de fora do banco local. Uma listagem de diretório escrita à mão é
+uma cópia do disco que ninguém revalida; a fonte é o disco:
+
+```bash
+ls db/*/migrations/*_up.sql          # o que existe, sempre atual
+make db-check-migration-pairing      # todo _up tem seu _down
+make db-check-schema-list            # todo diretório de schema está declarado
+make db-check-provisioners           # ninguém enumera migration à mão
 ```
-db/
-  asset_registry/
-    migrations/
-      0001_asset_registry_up.sql    — schema + tabela + seed completo
-      0001_asset_registry_down.sql
-  config/
-    migrations/
-      0001_config_schema_up.sql     — schema config (advertiser, campaign, banner, site, zone,
-                                      campaign_zone, delivery_rule_set, delivery_rule, cap)
-      0001_config_schema_down.sql
-      0002_config_rls_up.sql        — Row-Level Security por tenant_id
-      0002_config_rls_down.sql
-      0003_campaign_zones_rls_up.sql  — Defesa-em-profundidade: RLS para campaign_zones
-      0003_campaign_zones_rls_down.sql
-    tests/
-      rls_isolation_test.sql          — Teste de isolamento cross-tenant (TX-3)
-  ledger/
-    migrations/
-      0001_ledger_schema_up.sql     — accounts, journal_entries, postings (particionado),
-                                      constraint trigger de balanço, view account_balances
-      0001_ledger_schema_down.sql
-    BILLING.md                      — modelo de postings CPM/CPC/CPA/Tenancy
-  README.md                         — este arquivo
-```
+
+O que **é** editorial e fica aqui: o propósito de cada schema.
+
+| Schema | Propósito |
+|---|---|
+| `asset_registry` | Registro de ativos monetários (moeda, `scale`, classificação). Fonte da escala de todo `Money`. |
+| `config` | Entidades de veiculação (advertiser, campaign, banner, site, zone, campaign_zone, delivery_rule_set, delivery_rule, cap) + RLS por `tenant_id`. |
+| `ledger` | Double-entry: `accounts`, `journal_entries`, `postings` (particionado), trigger de balanço, view `account_balances`, append-only. Ver [ledger/BILLING.md](ledger/BILLING.md). |
+| `stats` | Persistência de telemetria do collector no perfil BETA (ADR-0005) — `events_raw`, view `live_kpis`. **Nunca** é a fonte faturável (DA-7). |
+| `vector` | Embeddings do RAG do copiloto (`creative_embeddings`, `help_doc_embeddings`). Exige a extensão `pgvector`. |
+| `compliance` | Cofre KYC/KYB (`kyc_subjects`) com RLS e envelope de PII. |
 
 ---
 
 ## Ordem de aplicação
 
-As migrations são independentes por banco (`asset_registry`, `config`, `ledger` podem ser
-schemas no mesmo banco ou bancos separados). Se no mesmo banco, aplicar nesta ordem:
+A ordem **entre** schemas é uma dependência real de negócio e está declarada em
+**[schema-order.txt](schema-order.txt)** — fonte única, da qual `make/db.mk` (`DB_SCHEMAS`),
+`make/dev.mk` (`dev-db-setup`) e `deploy/local/postgres/10-init.sh` derivam. A ordem
+**dentro** de cada schema vem de glob + sort sobre `*_up.sql` (é por isso que o prefixo é
+zero-padded). A reversão é a mesma lista de trás para frente, com os `*_down.sql` em ordem
+decrescente.
 
-1. `asset_registry` — sem dependências externas.
-2. `config` — sem dependência de `ledger` ou `asset_registry` (FK lógica, não física).
-3. `ledger` — sem dependência de `config` (FK lógica para `asset_registry.code`).
+Não reproduza a ordem aqui: `schema-order.txt` a documenta com a justificativa de cada
+dependência (`config` depende de `asset_registry`; `compliance` depende de
+`config.current_tenant_id()` e por isso é sempre a última).
 
-Comandos (substituir `{schema}` pelo nome do diretório):
+Provisionar um banco local:
+```bash
+make dev-db-setup            # Postgres local, sem Docker (Caminho A)
+make dev-up                  # stack Docker Compose (Caminho B)
+make db-test-all             # Postgres efêmero: aplica tudo, roda RLS, reverte tudo
+```
+
+Aplicação avulsa de um schema (`{schema}` = nome do diretório):
 ```bash
 migrate -database "$DATABASE_URL" -path db/{schema}/migrations up
 migrate -database "$DATABASE_URL" -path db/{schema}/migrations down

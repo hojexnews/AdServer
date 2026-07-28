@@ -13,8 +13,13 @@ on:
       - ".github/workflows/buf.yml"
   push:
     branches: [main]
+    # Espelha pull_request.paths VERBATIM — merge para a main aqui é push FF
+    # direto, então este bloco é a última (e única) reavaliação. Imposto por
+    # scripts/ci/workflow-paths-mirror-check.py; antes da 32ª onda faltava
+    # aqui o próprio arquivo do workflow.
     paths:
       - "proto/**"
+      - ".github/workflows/buf.yml"
 
 permissions:
   contents: read
@@ -65,16 +70,14 @@ jobs:
         run: make proto-gen-check
 
       # ------------------------------------------------------------------
-      # make-quoting-check — variavel de path NUA em recipe de make (TX-DX).
+      # make-quoting-check MUDOU-SE DAQUI na 32a onda -> repo-gates.yml.
       #
-      # ORFAO ATE AQUI (achado B4 do tech-lead na barreira da onda "perfil
-      # BETA"): o alvo entrou em `make verify`, mas NENHUM workflow roda
-      # `make verify` — buf.yml roda os alvos proto um a um e no-float.yml
-      # chama os scripts direto. Um gate que so existe no Makefile local nao
-      # e um gate; e a mesma classe do //nolint decorativo (26a onda) e das
-      # migrations orfas (29a/30a).
+      # Historico, porque a licao e o valor: a onda "perfil BETA" detectou que
+      # o alvo era orfao (estava so em `make verify`, e NENHUM workflow roda
+      # `make verify`) e o cabeou aqui. Mas a superficie que ele guarda e
+      # `Makefile` + `make/*.mk`, e o gatilho DESTE workflow e `paths:
+      # proto/**` — entao o conserto do orfao nasceu orfao de novo, um nivel
+      # acima: editar make/dev.mk nunca acionou o gate. Um gate de superficie
+      # ampla so para de ser orfao num workflow SEM filtro de path.
       #
-      # Roda aqui (workflow de contratos/DX, sem dependencia de rede alem do
-      # checkout) e e barato: python puro, sem toolchain extra.
-      - name: make-quoting-check (path com espaco quebra recipes)
-        run: python3 scripts/ci/make-quoting-check.py
+      # Ver .github/workflows/repo-gates.yml (criterio de admissao no cabecalho).

@@ -235,8 +235,27 @@ function KpiSection({ rows }: { rows: KpiRow[] }) {
       ? formatCtr(String(totals.clicks / totals.impressions))
       : "0,00%";
 
-  // Custo total da primeira row (stub — em produção somamos strings via decimal.js no BFF)
-  const firstRow = rows[0];
+  // Custo do PRIMEIRO período da série, não a soma do recorte.
+  //
+  // O rótulo tem de dizer isso, e por um bom tempo não disse: até a 32ª onda o
+  // texto era "Custo total (primeira hora — stub)" e a onda do console o
+  // encurtou para "Custo total", mantendo `rows[0]`. Um número rotulado como
+  // total que mostra 1 de N períodos é a mesma classe de meia-verdade que o
+  // resto desta onda combateu em `unconfigured-stats.ts` e em `schemas/stats.ts`
+  // (null nunca significa zero) — só que virada para dentro.
+  //
+  // A correção NÃO é somar aqui: `docs/stack-tecnologico.md` §2.5 é explícito —
+  // "Nunca `Number`, **nunca aritmética monetária no cliente**, nunca conversão
+  // automática" — e `ADR-0004` K7 repete ("TX-2: sem aritmética monetária no
+  // cliente"). Somar `rows.map(r => r.totalCost)` no console violaria a norma
+  // ainda que usasse decimal.js, e ainda precisaria decidir o que fazer com
+  // moedas diferentes na mesma série (DA-10 proíbe conversão automática).
+  //
+  // O agregado do recorte é responsabilidade do BFF, e o contrato de hoje
+  // (`bff/src/schemas/stats.ts`, DashboardResponseSchema) não expõe nenhum
+  // campo agregado — só `consolidated: KpiRow[]` e `live: KpiRow[]`. Enquanto
+  // ele não expuser, o honesto é rotular o que de fato está na tela.
+  const firstPeriodRow = rows[0];
 
   const chartData = rows.map((r) => ({
     period: new Date(r.periodStart).toLocaleTimeString("pt-BR", {
@@ -292,18 +311,28 @@ function KpiSection({ rows }: { rows: KpiRow[] }) {
           <dt className="text-sm text-muted-foreground">CTR médio</dt>
           <dd className="font-semibold text-foreground">{avgCtr}</dd>
         </div>
-        {firstRow && (
+        {firstPeriodRow && (
           <div>
-            <dt className="text-sm text-muted-foreground">Custo total</dt>
+            <dt className="text-sm text-muted-foreground">
+              Custo do 1º período
+            </dt>
             <dd className="font-semibold text-foreground">
-              {firstRow.totalCost === null ? (
+              {firstPeriodRow.totalCost === null ? (
                 <span
                   aria-description="Custo não rastreado nesta fonte: a série ao vivo não tem ligação com o ledger"
                 >
                   —
                 </span>
               ) : (
-                <MoneyDisplay money={firstRow.totalCost} />
+                // Sem aria-* extra aqui: MoneyDisplay renderiza um <span> nu,
+                // cujo role implícito é `generic` — atributo ARIA de nome é
+                // proibido ali e descartado pelo leitor de tela. Foi
+                // exatamente a violação que a 31ª onda removeu deste
+                // componente; readicioná-la em nome de um esclarecimento seria
+                // reintroduzir o defeito. O rótulo do <dt> ("Custo do 1º
+                // período") já é o texto acessível, igual para quem enxerga e
+                // para quem ouve.
+                <MoneyDisplay money={firstPeriodRow.totalCost} />
               )}
             </dd>
           </div>

@@ -61,12 +61,21 @@ go-test:
 
 ## go-test-integration: testes tagged //go:build integration (infra viva).
 ## Escopo DERIVADO por pacote (nao $(GOPKGS) inteiro sob a tag — ver comentario
-## de topo do arquivo). Hoje: internal/ledger, que exige DATABASE_URL apontando
-## para um Postgres 16 com db/ledger/migrations/0001..0004 JA aplicadas (as
-## QUATRO — dev-db-setup em make/dev.mk hoje aplica so a 0001; use
-## .github/workflows/db.yml como referencia de provisionamento completo, ou
-## aplique 0001..0004 manualmente). Falha explicitamente se NENHUM pacote
-## tiver teste tagged (evita um no-op verde mascarando validacao real).
+## de topo do arquivo). Exige DATABASE_URL apontando para um Postgres 16 com o
+## schema JA migrado por inteiro:
+##
+##   make dev-db-setup DEV_DB=<nome>
+##   export DATABASE_URL="postgres://$(shell id -un)@/<nome>?host=/var/run/postgresql&sslmode=disable"
+##
+## `dev-db-setup` aplica TODAS as migrations de todos os schemas, derivadas do
+## diretorio (32a onda). Ate la ele enumerava a mao e parava no meio — e este
+## comentario dizia "dev-db-setup hoje aplica so a 0001" do ledger, o que ja
+## era falso desde a onda "perfil BETA": um doc-lie que mandava o leitor
+## desconfiar de um alvo correto e aplicar migration na mao. Se voltar a
+## enumerar, `make db-check-provisioners` reprova.
+##
+## Falha explicitamente se NENHUM pacote tiver teste tagged (evita um no-op
+## verde mascarando validacao real).
 go-test-integration:
 	@_PKGS="$$(grep -rl '//go:build integration' ./internal ./services ./tests 2>/dev/null \
 	            | xargs -r -n1 dirname | LC_ALL=C sort -u | sed 's#$$#/...#')"; \

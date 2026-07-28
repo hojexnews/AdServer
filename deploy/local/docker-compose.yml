@@ -30,7 +30,20 @@ services:
   # Postgres — config + ledger schema. Init applies migrations + roles + seed.
   # ---------------------------------------------------------------------------
   postgres:
-    image: postgres:16
+    # pgvector/pgvector:pg16 = postgres:16 + extensão pgvector. NÃO é uma
+    # dependência nova: é a mesma imagem que .github/workflows/db.yml e
+    # make/db.mk::db-test-all já usam, e pelo mesmo motivo —
+    # db/vector/migrations/0001_vector_schema_up.sql faz
+    # `CREATE EXTENSION IF NOT EXISTS vector`, que a stock postgres:16 não
+    # tem. A imagem stock era um BLOQUEIO para a correção, não a causa da
+    # omissão: com ela, o laço por glob do initdb abortaria em
+    # `CREATE EXTENSION vector`. A causa das migrations faltantes foi a lista
+    # escrita à mão — a mesma que atingiu `make dev-db-setup`, que roda contra
+    # Postgres nativo, onde imagem nenhuma está envolvida. O README já
+    # registrava este MESMO bug corrigido em db.yml numa onda anterior
+    # ("[MED-ci] db.yml usava postgres:16 sem pgvector → o gate RLS inteiro
+    # nunca rodava"); este compose era a última instância viva dele.
+    image: pgvector/pgvector:pg16
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres

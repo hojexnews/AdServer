@@ -58,8 +58,13 @@ BETA_COLLECTOR_URL   := http://localhost:$(BETA_COLLECTOR_PORT)
 BETA_LOADER_DSN := postgres://adserver_loader:loader_dev_only@localhost:5432/$(BETA_DB)?sslmode=disable
 
 # DSN do ESCRITOR de telemetria (pgsink do collector). Papel dedicado
-# adserver_stats_writer, criado pela propria migration db/stats/0001:
-# INSERT/SELECT so em stats.events_raw e NOBYPASSRLS — menor privilegio.
+# adserver_stats_writer, criado por db/seed/dev_roles.sql (DEV/LOCAL ONLY;
+# producao usa OpenBao): INSERT/SELECT so em stats.events_raw e NOBYPASSRLS
+# — menor privilegio. NAO e criado pela migration db/stats/0001: ela fazia
+# isso ate o achado H-2 (security-reviewer), porque um `make db-migrate-up`
+# comum rodaria aquele `CREATE ROLE ... LOGIN PASSWORD` contra QUALQUER
+# DATABASE_URL, inclusive staging/producao. Ver o bloco H-2 no cabecalho de
+# db/stats/migrations/0001_stats_schema_up.sql.
 #
 # NAO reuse BETA_LOADER_DSN aqui: alem de ser privilegio a mais (o loader e
 # BYPASSRLS e enxerga todos os tenants), o loader nao tem GRANT de escrita em

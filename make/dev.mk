@@ -42,49 +42,60 @@ dev-db-setup:
 	@echo "== dev-db-setup: (re)criando $(DEV_DB) =="
 	@psql "$(DEV_SUPER_DSN)" -v ON_ERROR_STOP=1 -q -c "DROP DATABASE IF EXISTS $(DEV_DB);"
 	@psql "$(DEV_SUPER_DSN)" -v ON_ERROR_STOP=1 -q -c "CREATE DATABASE $(DEV_DB);"
-	@psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q -f db/asset_registry/migrations/0001_asset_registry_up.sql
-	@for f in 0001_config_schema 0002_config_rls 0003_campaign_zones_rls; do \
-	  psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q -f db/config/migrations/$$f\_up.sql; \
-	done
-	@# Ledger: TODAS as 4 migrations, não só a 0001 (achado C-1,
-	@# security-reviewer). Antes desta correção, dev-db-setup aplicava
-	@# SÓ 0001_ledger_schema_up.sql — schema+tabelas, sem RLS (0003) e sem o
-	@# trigger de imutabilidade append-only (0004). Consequência prática:
-	@# ledger.current_tenant_id() nem existia neste banco (0003 é quem a
-	@# cria) e a FORCE ROW LEVEL SECURITY do ledger nunca chegava a ser
-	@# habilitada no beta local — conceder acesso a adserver_app sem isto
-	@# seria PIOR que continuar usando adserver_loader (acesso total, sem
-	@# nenhuma barreira). Ordem numérica é uma dependência real aqui: 0003
-	@# referencia as tabelas da 0001, 0004 referencia o trigger da 0001.
-	@for f in 0001_ledger_schema 0002_reconciliation_exceptions 0003_ledger_rls 0004_ledger_postings_immutable; do \
-	  psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q -f db/ledger/migrations/$$f\_up.sql; \
-	done
-	@# stats (onda "perfil BETA" / addon §3.3): persistência do collector via
-	@# Postgres — internal/telemetry/pgsink. A migration cria só o schema,
-	@# tabela, view, função e policy — NÃO cria mais nenhum role (achado H-2,
-	@# security-reviewer: a versão anterior fazia `CREATE ROLE ... LOGIN
-	@# PASSWORD` inline dentro da migration, o que um `make db-migrate-up`
-	@# comum rodaria contra QUALQUER DATABASE_URL, inclusive staging/produção).
-	@# adserver_stats_writer agora é criada por db/seed/dev_roles.sql, junto
-	@# com adserver_app/adserver_loader/adserver_copilot — logo este passo
-	@# pode rodar em qualquer ponto ANTES de dev_roles.sql (só precisa que o
-	@# schema `stats` exista antes dos GRANTs comentados dela, aplicados
-	@# abaixo). Ordem canônica com DB_SCHEMAS/DB_SCHEMAS_REV em make/db.mk:
-	@# ledger -> stats -> vector.
-	@psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q -f db/stats/migrations/0001_stats_schema_up.sql
-	@# vector precisa existir ANTES de db/seed/dev_roles.sql (que faz GRANT ... ON
-	@# SCHEMA vector_store TO adserver_copilot) — mesma ordem canonica de
-	@# DB_SCHEMAS em make/db.mk e do workflow .github/workflows/db.yml
-	@# (asset_registry -> config -> ledger -> vector -> compliance). Faltar este
-	@# passo faz dev_roles.sql abortar com "schema vector_store does not exist"
-	@# (achado HIGH / bundle F).
-	@for f in 0001_vector_schema 0002_vector_rls; do \
-	  psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q -f db/vector/migrations/$$f\_up.sql; \
-	done
+	@# Migrations: NADA é enumerado à mão aqui. A ordem ENTRE schemas vem de
+	@# db/schema-order.txt (fonte única, derivada em DB_SCHEMAS por make/db.mk);
+	@# a ordem DENTRO de cada schema vem de glob + sort sobre *_up.sql, exatamente
+	@# como db-test-all (make/db.mk) e .github/workflows/db.yml. Sentinela
+	@# anti-vazio por schema: diretório sem *_up.sql FALHA em vez de ser pulado
+	@# em silêncio.
+	@#
+	@# 32ª onda — por que isto deixou de ser uma lista: as três listas escritas à
+	@# mão que viviam aqui (config parando em 0003, ledger, vector) divergiram do
+	@# disco. `db/config/migrations/0004_campaign_zones_with_check_up.sql` nunca
+	@# era aplicada, então neste banco config.campaign_zones_tenant_isolation
+	@# ficava com pg_policy.polwithcheck IS NULL — a policy caía no fallback
+	@# implícito USING→WITH CHECK, que valida só o lado `campaign_id`. O lado
+	@# `zone_id` ficava sem validação: um advertiser do tenant A podia vincular a
+	@# SUA campanha a uma zona de OUTRO tenant, veiculando criativo em inventário
+	@# alheio. `make db-test` reprovava contra o banco que este próprio alvo monta.
+	@# É a 4ª reincidência da classe "enumeração à mão"; o gate que impede a 5ª é
+	@# `make db-check-provisioners`.
+	@FAIL=0; \
+	 for schema in $(DB_SCHEMAS); do \
+	   dir="db/$$schema/migrations"; \
+	   files=$$(ls "$$dir"/*_up.sql 2>/dev/null | LC_ALL=C sort); \
+	   if [ -z "$$files" ]; then \
+	     echo "ERRO: nenhuma migration *_up.sql em $$dir (schema '$$schema' vazio ou mal formado) — sentinela anti-vazio."; \
+	     FAIL=1; break; \
+	   fi; \
+	   for fpath in $$files; do \
+	     echo "  up: $$schema/$$(basename "$$fpath" _up.sql)"; \
+	     psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q -f "$$fpath" || { FAIL=1; break; }; \
+	   done; \
+	   [ "$$FAIL" = "1" ] && break; \
+	 done; \
+	 [ "$$FAIL" = "0" ] || { echo "ERRO: migrations _up falharam."; exit 1; }
 	@# db/seed/dev_roles.sql cria adserver_loader/adserver_app/adserver_copilot
 	@# E (achado H-2) adserver_stats_writer. TUDO que segue abaixo depende
-	@# desses quatro roles já existirem.
+	@# desses quatro roles já existirem. Roda DEPOIS das migrations porque faz
+	@# GRANT em schemas que elas criam (inclusive vector_store — faltar isso
+	@# fazia o arquivo abortar com "schema vector_store does not exist",
+	@# achado HIGH / bundle F da 31ª).
 	@psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q -f db/seed/dev_roles.sql
+	@# Grants de vector_store e compliance para adserver_app/adserver_loader.
+	@# dev_roles.sql só concede vector_store a adserver_copilot (SELECT-only, o
+	@# papel de RAG) e não toca compliance — então, antes da 32ª onda,
+	@# `make db-test-vector` e `make db-test-compliance` morriam com "permission
+	@# denied for schema" contra o banco montado por este alvo, enquanto passavam
+	@# na CI. Mesmo bloco da FASE 3 de make/db.mk::db-test-all e do step "grants"
+	@# de .github/workflows/db.yml — replicado, não inventado.
+	@psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q \
+	  -c "GRANT USAGE ON SCHEMA vector_store TO adserver_loader, adserver_app;" \
+	  -c "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA vector_store TO adserver_app;" \
+	  -c "GRANT SELECT ON ALL TABLES IN SCHEMA vector_store TO adserver_loader;" \
+	  -c "GRANT USAGE ON SCHEMA compliance TO adserver_loader, adserver_app;" \
+	  -c "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA compliance TO adserver_app;" \
+	  -c "GRANT SELECT ON ALL TABLES IN SCHEMA compliance TO adserver_loader;"
 	@# Grants de leitura em stats para adserver_app (BFF), executados AQUI —
 	@# depois de dev_roles.sql garantir que adserver_app existe. Descomentados
 	@# a partir do bloco de exemplo deixado em

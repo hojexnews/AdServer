@@ -44,13 +44,30 @@ on:
       # go-test-integration precisa reavaliar este workflow, não só go.yml.
       - "internal/ledger/**"
       - "make/go.mk"
+      # Provisionadores (32ª onda): dev-db-setup e o initdb do Docker aplicam
+      # as mesmas migrations que este job. Quando eles enumeravam à mão,
+      # divergiram do disco em silêncio — e nenhum workflow disparava para
+      # eles. Ver make/dev.mk::dev-db-setup e scripts/ci/db-provisioner-check.py.
+      - "make/dev.mk"
+      - "deploy/local/**"
+      - "scripts/ci/db-provisioner-check.py"
   push:
     branches: [main]
+    # Espelha pull_request.paths VERBATIM — o merge para a main é push FF
+    # direto, então este bloco é a última reavaliação que acontece. Até a 32ª
+    # onda faltavam aqui `make/db.mk` e o próprio `.github/workflows/db.yml`:
+    # dava para neutralizar as sentinelas de schema editando make/db.mk e
+    # empurrar para a main sem que este job rodasse uma vez sequer.
+    # Imposto por scripts/ci/workflow-paths-mirror-check.py.
     paths:
       - "db/**"
-      # Mesma justificativa do bloco pull_request acima.
+      - "make/db.mk"
+      - ".github/workflows/db.yml"
       - "internal/ledger/**"
       - "make/go.mk"
+      - "make/dev.mk"
+      - "deploy/local/**"
+      - "scripts/ci/db-provisioner-check.py"
 
 permissions:
   contents: read
@@ -107,8 +124,13 @@ jobs:
       # diretórios reais de db/ vs. DB_SCHEMAS. Fail-fast antes de tocar
       # o Postgres — mesmos alvos que db-test-all roda localmente.
       # ------------------------------------------------------------------
-      - name: sentinelas de schema/migration (db-check-schema-list + db-check-migration-pairing)
-        run: make db-check-schema-list db-check-migration-pairing
+      - name: sentinelas de schema/migration (schema-list + migration-pairing + provisioners)
+        # db-check-provisioners (32ª onda): nenhum provisionador enumera
+        # migration à mão. Roda aqui E em repo-gates.yml — aqui porque uma
+        # mudança em db/ ou make/dev.mk tem de reprovar no job de banco, e lá
+        # porque a superfície do gate é mais larga do que o `paths:` deste
+        # workflow (a duplicação é deliberada, não descuido).
+        run: make db-check-schema-list db-check-migration-pairing db-check-provisioners
 
       # ------------------------------------------------------------------
       # Roles de aplicação (adserver_loader BYPASSRLS / adserver_app RLS /

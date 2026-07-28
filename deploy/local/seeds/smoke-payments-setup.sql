@@ -3,15 +3,19 @@
 -- Grants de desenvolvimento para o smoke-payments.sh.
 --
 -- Este script e IDEMPOTENTE (usa IF NOT EXISTS / DO NOTHING).
--- Deve ser aplicado APOS:
---   1. db/ledger/migrations/0001_ledger_schema_up.sql
---   2. db/ledger/migrations/0002_reconciliation_exceptions_up.sql
---   3. db/ledger/migrations/0003_ledger_rls_up.sql
---   4. db/seed/dev_roles.sql   (cria adserver_app e adserver_loader)
+-- Deve ser aplicado APOS o provisionamento do banco (make dev-db-setup ou
+-- make dev-up), que aplica TODAS as migrations de db/, derivadas do diretorio
+-- e na ordem de db/schema-order.txt, e APOS db/seed/dev_roles.sql (que cria
+-- adserver_app e adserver_loader).
 --
--- O 10-init.sh do Docker Compose nao aplica as migrations 0002/0003 do ledger
--- nem os grants de ledger para adserver_app — este seed preenche essa lacuna
--- para o ambiente de smoke local.
+-- 32a onda: ate aqui este cabecalho dizia que "o 10-init.sh do Docker Compose
+-- nao aplica as migrations 0002/0003 do ledger" e que este seed "preenchia
+-- essa lacuna". As duas metades eram falsas de formas diferentes: o 10-init.sh
+-- de fato nao as aplicava (aplicava so a 0001 — corrigido nesta onda, agora
+-- deriva por glob), e este arquivo NUNCA as aplicou — ele apenas verifica a
+-- presenca e aborta. Um seed que "preenche a lacuna" e um seed que so falha
+-- ruidosamente sao coisas diferentes, e a diferenca importa para quem le isto
+-- as 3h da manha. O que este bloco faz, de fato, e PREFLIGHT.
 --
 -- SENHAS: apenas valores de DEV. Nunca use em staging/producao.
 -- Segredos de producao chegam do OpenBao (platform/secrets/openbao).
@@ -19,10 +23,11 @@
 -- Referencia: db/ledger/tests/rls_isolation_test.sql:18-29 (dependencias do teste RLS).
 -- =============================================================================
 
--- Migrations 0002 e 0003 do ledger (idempotentes via IF NOT EXISTS / OR REPLACE).
--- Aplicadas aqui caso o stack Docker nao tenha rodado 10-init.sh completo.
+-- PREFLIGHT do schema ledger: verifica (nao aplica) que o banco tem o que o
+-- smoke exercita. Cobre as tres migrations que criam estrutura observavel
+-- alem da 0001 (schema base, cuja ausencia o smoke-payments.sh ja checa).
 
-\echo '[smoke-payments-setup] aplicando migrations 0002 e 0003 do ledger se ausentes...'
+\echo '[smoke-payments-setup] preflight: migrations do ledger presentes?'
 
 DO $$
 BEGIN
@@ -31,8 +36,8 @@ BEGIN
         SELECT 1 FROM information_schema.tables
         WHERE table_schema = 'ledger' AND table_name = 'reconciliation_exceptions'
     ) THEN
-        RAISE NOTICE 'migration 0002 nao encontrada — aplicar manualmente:';
-        RAISE NOTICE '  psql $PGURL -f db/ledger/migrations/0002_reconciliation_exceptions_up.sql';
+        RAISE NOTICE 'ledger.reconciliation_exceptions ausente — provisione pelo caminho canonico:';
+        RAISE NOTICE '  make dev-db-setup   (ou make dev-up), que aplica todas as migrations do diretorio';
         RAISE EXCEPTION 'migration ledger 0002 ausente — smoke nao pode prosseguir';
     END IF;
 
@@ -42,9 +47,26 @@ BEGIN
         WHERE schemaname = 'ledger' AND tablename = 'accounts'
           AND policyname = 'accounts_tenant_isolation'
     ) THEN
-        RAISE NOTICE 'migration 0003 nao encontrada — aplicar manualmente:';
-        RAISE NOTICE '  psql $PGURL -f db/ledger/migrations/0003_ledger_rls_up.sql';
+        RAISE NOTICE 'RLS de ledger.accounts ausente — provisione pelo caminho canonico:';
+        RAISE NOTICE '  make dev-db-setup   (ou make dev-up), que aplica todas as migrations do diretorio';
         RAISE EXCEPTION 'migration ledger 0003 (RLS) ausente — smoke nao pode prosseguir';
+    END IF;
+
+    -- 0004: append-only (triggers de imutabilidade de postings e journal_entries).
+    -- Ausente deste preflight ate a 32a onda. O smoke exercita RecordEntry /
+    -- RecordDeposit / RecordReversal, e a semantica de estorno ("nunca edita a
+    -- entry original, sempre cria uma nova") so e IMPOSTA por estes triggers —
+    -- sem eles o smoke passava verde contra um ledger mutavel, provando menos
+    -- do que dizia provar. Os dois triggers vem da MESMA migration; checar os
+    -- dois evita que meia aplicacao passe.
+    IF (
+        SELECT COUNT(*) FROM pg_trigger
+        WHERE NOT tgisinternal
+          AND tgname IN ('postings_immutable_trg', 'journal_entries_immutable_trg')
+    ) <> 2 THEN
+        RAISE NOTICE 'triggers append-only do ledger ausentes — provisione pelo caminho canonico:';
+        RAISE NOTICE '  make dev-db-setup   (ou make dev-up), que aplica todas as migrations do diretorio';
+        RAISE EXCEPTION 'migration ledger 0004 (append-only) ausente — smoke nao pode prosseguir';
     END IF;
 END;
 $$;
