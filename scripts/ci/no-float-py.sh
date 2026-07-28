@@ -99,6 +99,55 @@ def line_has_monetary_float(line: str) -> bool:
     ))
     return has_float_call or has_float_lit
 
+
+# -----------------------------------------------------------------------
+# JANELA DE ANALISE: co-ocorrencia por LINHA LOGICA Python, nao por linha
+# fisica isolada (achado no-float-multiline-split-defeats-cooccurrence,
+# CRITICAL). O match por-linha-fisica original era derrotado por
+# QUALQUER quebra de linha do Black numa atribuicao/expressao longa:
+#   payout_amount = (
+#       12.50
+#   )
+# ("payout_amount" cai numa linha, "12.50" cai na proxima — nenhuma das
+# duas isoladas satisfaz a conjuncao E, e a violacao passava
+# despercebida).
+#
+# FIX: usa o proprio tokenizer da stdlib CPython para achar os limites
+# de LINHA LOGICA (nao linha fisica) — o tokenizer ja sabe, sem
+# heuristica textual nenhuma, que uma expressao entre parenteses/
+# colchetes/chaves abertos, ou uma linha com continuacao '\\', NAO fecha
+# a linha logica (emite token NL, nao NEWLINE). Agrupamos por essas
+# fronteiras REAIS da gramatica Python — muito mais preciso que um
+# heuristico de "linha termina com operador" (que seria necessario em
+# uma linguagem sem esse tokenizer, ex. TS).
+# -----------------------------------------------------------------------
+def build_logical_line_ranges(tokens):
+    """Retorna lista de (start_lineno, end_lineno) por linha logica."""
+    ranges = []
+    seg_start = None
+    seg_end = None
+    for ttype, tstring, tstart, tend, _line in tokens:
+        if ttype in (tok_mod.ENCODING, tok_mod.ENDMARKER, tok_mod.INDENT, tok_mod.DEDENT):
+            continue
+        if ttype == tok_mod.NL and seg_start is None:
+            continue
+        if seg_start is None:
+            seg_start = tstart[0]
+        seg_end = tend[0] if seg_end is None else max(seg_end, tend[0])
+        if ttype == tok_mod.NEWLINE:
+            ranges.append((seg_start, seg_end))
+            seg_start = None
+            seg_end = None
+    if seg_start is not None:
+        ranges.append((seg_start, seg_end))
+    return ranges
+
+
+FLOAT_CALL_RE = re.compile(r'\bfloat\s*\(')
+FLOAT_LIT_RE = re.compile(
+    r'(?<![A-Za-z0-9_])([0-9]+\.[0-9]+|\.[0-9]+|[0-9]+[eE][+-]?[0-9]+)'
+)
+
 found = []      # lista de strings "path:lineno:text"
 seen  = set()   # conjunto (path, lineno) para deduplicar multiplos hits na mesma linha
 
@@ -153,14 +202,25 @@ for path in sys.argv[1:]:
             for c in range(0, min(ecol, len(line_code.get(row, [])))):
                 line_code[row][c] = ' '
 
-    for lineno, chars in line_code.items():
-        code_line = ''.join(chars)
-        if line_has_monetary_float(code_line):
-            key = (path, lineno)
-            if key not in seen:
-                seen.add(key)
-                orig = lines[lineno-1].rstrip() if lineno <= len(lines) else code_line
-                found.append(f"{path}:{lineno}:{orig}")
+    for seg_start, seg_end in build_logical_line_ranges(tokens):
+        joined = '\n'.join(
+            ''.join(line_code.get(ln, [])) for ln in range(seg_start, seg_end + 1)
+        )
+        if not line_has_monetary_float(joined):
+            continue
+        # Reporta na linha real onde o padrao de float ocorre (mais
+        # acionavel que a 1a linha da linha logica); fallback = inicio.
+        report_lineno = seg_start
+        for ln in range(seg_start, seg_end + 1):
+            frag = ''.join(line_code.get(ln, []))
+            if FLOAT_CALL_RE.search(frag) or FLOAT_LIT_RE.search(frag):
+                report_lineno = ln
+                break
+        key = (path, report_lineno)
+        if key not in seen:
+            seen.add(key)
+            orig = lines[report_lineno-1].rstrip() if report_lineno <= len(lines) else joined
+            found.append(f"{path}:{report_lineno}:{orig}")
 
 if found:
     for hit in found:

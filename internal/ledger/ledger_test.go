@@ -14,6 +14,38 @@
 //   8. Scale mismatch rejeitado.
 //   9. Asset nao encontrado rejeitado.
 //  10. Payout desbalanceado rejeitado.
+//
+// ATENCAO — ESCOPO REAL DESTE ARQUIVO (achado HIGH, Bundle A):
+//
+//	Os testes prefixados `TestStub*` abaixo NAO exercitam ledger.RecordEntry /
+//	ledger.FinalizeEntry / ledger.RecordPayout (posting.go / crypto.go) — as
+//	UNICAS funcoes que gravam journal_entries/postings em producao (chamadas
+//	por services/payments/internal/{stripe,asaas,mercadopago} e
+//	services/payments/internal/crypto). Eles batem no tipo `store` logo
+//	abaixo, que REIMPLEMENTA idempotencia/balance/validacao de asset num map
+//	em memoria — uma segunda copia da logica de negocio, nao o codigo real.
+//	Prova: remover o `ON CONFLICT ... DO NOTHING` de insertJournalEntry,
+//	remover a guarda `AND status='pending'` de FinalizeEntry, tirar a
+//	validacao de asset de dentro de RecordEntry, ou inverter Debit<->Credit
+//	em RecordPayout — nenhuma dessas mutacoes move um unico `TestStub*` para
+//	vermelho.
+//
+//	Os unicos testes deste arquivo que tocam codigo de PRODUCAO sao:
+//	  - TestCheckBalance_* (chamam ledger.CheckBalanceForTest, wrapper fino
+//	    sobre a checkBalance real de posting.go).
+//	  - TestReconciliation_* (chamam ledger.Reconciler.Run real; `store`/
+//	    fontes injetadas ali sao fakes de I/O — ReconStore/ExpectedValueSource
+//	    sao interfaces exportadas explicitamente para isso — nao reimplementam
+//	    o algoritmo de reconciliacao).
+//	  - TestAccountCodes_CanonicalFormat (chama ledger.AccountCodes real).
+//
+//	A cobertura REAL de RecordEntry/FinalizeEntry/RecordPayout contra um
+//	Postgres 16 de verdade (idempotencia via ON CONFLICT, transicao
+//	pending->posted guardada por status, ordem de validacao de asset ANTES
+//	do INSERT, direcao dos postings de RecordPayout) esta em
+//	posting_integration_test.go — arquivo com build constraint "integration"
+//	(ver o cabecalho desse arquivo); `make go-test-integration` ou
+//	.github/workflows/db.yml.
 package ledger_test
 
 import (
@@ -28,7 +60,15 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// storeStub — ledger in-memory para testes sem Postgres
+// store — REIMPLEMENTACAO em memoria de RecordEntry/FinalizeEntry, usada
+// apenas pelos testes TestStub* abaixo.
+//
+// NAO e a implementacao de producao. ledger.RecordEntry / ledger.FinalizeEntry
+// (posting.go) sao as unicas funcoes que gravam no Postgres real; este `store`
+// duplica idempotencia (map em vez de UNIQUE + ON CONFLICT), balance (mesmo
+// algoritmo copiado, nao chamado) e validacao de asset num map em memoria,
+// sem tocar banco algum. Ver o comentario de topo do arquivo e
+// posting_integration_test.go para a cobertura contra Postgres real.
 // ---------------------------------------------------------------------------
 
 type storeEntry struct {
@@ -167,7 +207,7 @@ func balancedPostings(assetCode string, scale int32, amount, debitAcc, creditAcc
 // 1. Idempotencia
 // ---------------------------------------------------------------------------
 
-func TestIdempotency_SameKeyDoesNotDuplicate(t *testing.T) {
+func TestStubIdempotency_SameKeyDoesNotDuplicate(t *testing.T) {
 	t.Parallel()
 	s := newStore()
 	loader := enabledAssets()
@@ -198,7 +238,7 @@ func TestIdempotency_SameKeyDoesNotDuplicate(t *testing.T) {
 	}
 }
 
-func TestIdempotency_DifferentKeyCreatesSeparateEntry(t *testing.T) {
+func TestStubIdempotency_DifferentKeyCreatesSeparateEntry(t *testing.T) {
 	t.Parallel()
 	s := newStore()
 	loader := enabledAssets()
@@ -216,7 +256,7 @@ func TestIdempotency_DifferentKeyCreatesSeparateEntry(t *testing.T) {
 // 2. Balanco: par desbalanceado e rejeitado
 // ---------------------------------------------------------------------------
 
-func TestBalance_UnbalancedPostingsRejected(t *testing.T) {
+func TestStubBalance_UnbalancedPostingsRejected(t *testing.T) {
 	t.Parallel()
 	s := newStore()
 	loader := enabledAssets()
@@ -232,7 +272,7 @@ func TestBalance_UnbalancedPostingsRejected(t *testing.T) {
 	}
 }
 
-func TestBalance_BalancedPostingsAccepted(t *testing.T) {
+func TestStubBalance_BalancedPostingsAccepted(t *testing.T) {
 	t.Parallel()
 	s := newStore()
 	loader := enabledAssets()
@@ -244,7 +284,7 @@ func TestBalance_BalancedPostingsAccepted(t *testing.T) {
 	}
 }
 
-func TestBalance_EmptyPostingsRejected(t *testing.T) {
+func TestStubBalance_EmptyPostingsRejected(t *testing.T) {
 	t.Parallel()
 	s := newStore()
 	loader := enabledAssets()
@@ -317,7 +357,7 @@ func TestCheckBalance_PerAssetImbalanceDetected(t *testing.T) {
 // 3. pending -> posted na finalidade
 // ---------------------------------------------------------------------------
 
-func TestPendingToPosted_DepositLifecycle(t *testing.T) {
+func TestStubPendingToPosted_DepositLifecycle(t *testing.T) {
 	t.Parallel()
 	s := newStore()
 	loader := enabledAssets()
@@ -347,7 +387,7 @@ func TestPendingToPosted_DepositLifecycle(t *testing.T) {
 	}
 }
 
-func TestPendingToPosted_FinalizeIdempotent(t *testing.T) {
+func TestStubPendingToPosted_FinalizeIdempotent(t *testing.T) {
 	t.Parallel()
 	s := newStore()
 	loader := enabledAssets()
@@ -373,7 +413,7 @@ func TestPendingToPosted_FinalizeIdempotent(t *testing.T) {
 // 4. Recusa de posting em ativo disabled (AEV/BND)
 // ---------------------------------------------------------------------------
 
-func TestDisabledAsset_AEVRejected(t *testing.T) {
+func TestStubDisabledAsset_AEVRejected(t *testing.T) {
 	t.Parallel()
 	s := newStore()
 	loader := enabledAssets()
@@ -385,7 +425,7 @@ func TestDisabledAsset_AEVRejected(t *testing.T) {
 	}
 }
 
-func TestDisabledAsset_BNDRejected(t *testing.T) {
+func TestStubDisabledAsset_BNDRejected(t *testing.T) {
 	t.Parallel()
 	s := newStore()
 	loader := enabledAssets()
@@ -397,7 +437,7 @@ func TestDisabledAsset_BNDRejected(t *testing.T) {
 	}
 }
 
-func TestDisabledAsset_EnabledAfterStubUpdate(t *testing.T) {
+func TestStubDisabledAsset_EnabledAfterLoaderUpdate(t *testing.T) {
 	t.Parallel()
 	s := newStore()
 	loader := enabledAssets()
@@ -423,7 +463,7 @@ func TestDisabledAsset_EnabledAfterStubUpdate(t *testing.T) {
 // 5. Cambio como dois pares isolados por asset_code (DA-10)
 // ---------------------------------------------------------------------------
 
-func TestFXExchange_TwoPairsIsolated(t *testing.T) {
+func TestStubFXExchange_TwoPairsIsolated(t *testing.T) {
 	t.Parallel()
 	s := newStore()
 	loader := enabledAssets()
@@ -471,7 +511,7 @@ func TestFXExchange_TwoPairsIsolated(t *testing.T) {
 	}
 }
 
-func TestFXExchange_CrossAssetAmountsNeedNotMatch(t *testing.T) {
+func TestStubFXExchange_CrossAssetAmountsNeedNotMatch(t *testing.T) {
 	t.Parallel()
 	// DA-10: BRL e USDC sao ledgers isolados. Igualar os valores seria cambio
 	// implicito, proibido. Apenas o balance POR ativo e exigido.
@@ -494,7 +534,7 @@ func TestFXExchange_CrossAssetAmountsNeedNotMatch(t *testing.T) {
 // 6. Estorno como novo par de postings (nunca edicao/DELETE do original)
 // ---------------------------------------------------------------------------
 
-func TestReversal_NewPairDoesNotEditOriginal(t *testing.T) {
+func TestStubReversal_NewPairDoesNotEditOriginal(t *testing.T) {
 	t.Parallel()
 	s := newStore()
 	loader := enabledAssets()
@@ -535,7 +575,7 @@ func TestReversal_NewPairDoesNotEditOriginal(t *testing.T) {
 	}
 }
 
-func TestReversal_VoidKeyIdempotent(t *testing.T) {
+func TestStubReversal_VoidKeyIdempotent(t *testing.T) {
 	t.Parallel()
 	s := newStore()
 	loader := enabledAssets()
@@ -705,7 +745,7 @@ func TestReconciliation_RerunIdempotent(t *testing.T) {
 // 8. Scale mismatch rejeitado
 // ---------------------------------------------------------------------------
 
-func TestScaleMismatch_Rejected(t *testing.T) {
+func TestStubScaleMismatch_Rejected(t *testing.T) {
 	t.Parallel()
 	s := newStore()
 	loader := enabledAssets()
@@ -722,7 +762,7 @@ func TestScaleMismatch_Rejected(t *testing.T) {
 // 9. Asset nao encontrado rejeitado
 // ---------------------------------------------------------------------------
 
-func TestAssetNotFound_Rejected(t *testing.T) {
+func TestStubAssetNotFound_Rejected(t *testing.T) {
 	t.Parallel()
 	s := newStore()
 	loader := enabledAssets()
@@ -738,7 +778,7 @@ func TestAssetNotFound_Rejected(t *testing.T) {
 // 10. Payout desbalanceado rejeitado
 // ---------------------------------------------------------------------------
 
-func TestPayout_UnbalancedRejected(t *testing.T) {
+func TestStubPayout_UnbalancedRejected(t *testing.T) {
 	t.Parallel()
 	s := newStore()
 	loader := enabledAssets()

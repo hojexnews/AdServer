@@ -238,60 +238,109 @@ Campo `currency` é rótulo; **sem conversão automática** (DA-10).
 
 > Formato verificável (checklist + Given/When/Then). Cada CA referencia a decisão/seção correspondente.
 
+### 5.0 Adjudicação de canonicidade e legenda (tech-lead, 2026-07-19)
+
+**Este §5 é canônico** — é a única fonte normativa do que os `CA-n` exigem **e** do status
+de cada um. O `README.md` descreve o estado de implementação por incremento; ele **não** é
+fonte de verdade sobre `CA-n`. Onde os dois divergirem, prevalece este §5.
+
+**Regra de marcação (inviolável):** um item só é marcado como provado se puder ser amarrado
+a um **gate executável hoje**, citado nominalmente no próprio item. Golden verde em suíte
+vizinha, "está implementado" ou inspeção visual **não** contam. Itens sem gate permanecem
+desmarcados — subrepresentar é aceitável, superrepresentar não é.
+
+| Marca | Significado |
+|---|---|
+| `[x]` | Provado por gate executável, citado no item. |
+| `[~]` | **Parcialmente** provado — o gate cobre parte do critério; a parte descoberta está declarada no item. |
+| `[ ]` | **Não** provado por gate executável (pode estar implementado — mas não há gate que o assine). |
+| `N/A-legado` | Critério herdado do **Revive legado** (PHP/MySQL) que a reescrita Go **não satisfará por construção**. Não é dívida; é escopo revogado. |
+
+**Sobre `N/A-legado`:** este documento foi derivado do Revive 6.x, e alguns critérios
+descrevem a *plataforma de execução do Revive*, não o comportamento do produto. O alvo desta
+reescrita é Go + Postgres + Redis + Redpanda + ClickHouse (ver `docs/stack-tecnologico.md`).
+Um critério que exija PHP/MySQL ou layout de plugins do Revive é **inaplicável por decisão
+arquitetural**, não uma pendência a cumprir. Ele fica registrado, marcado e justificado —
+nunca silenciosamente apagado.
+
+Gates citados abaixo (todos executados de 1a mão em 2026-07-19, verdes salvo nota):
+`make parity-golden` (`tests/parity/**`, goldens em `tests/parity/golden/*.json`),
+`make verify` (buf TX-1 + 6 guards no-float TX-2), `make go-test`, `make data-billing-test`,
+`make data-validate`, `make platform-validate`, `make bff-ci`, `make web-ci`, e os testes SQL
+`db/*/tests/*.sql` aplicados contra Postgres 16 nativo.
+
 ### CA-1 — Taxonomia e multi-tenancy (DA-1, DA-2, §4.10)
-- [ ] É possível cadastrar número ilimitado de anunciantes e sites sem teto artificial.
-- [ ] **Dado** um anunciante com credencial própria, **quando** autentica no painel, **então** vê apenas as estatísticas das suas campanhas (isolamento verificado).
-- [ ] Um vínculo campanha↔zona N:N é persistido e avaliado por requisição.
+- [ ] É possível cadastrar número ilimitado de anunciantes e sites sem teto artificial. — *sem gate: é uma afirmação de ausência de limite, não asserida por nenhum teste. Não há teto no schema, mas isso não está provado.*
+- [x] **Dado** um anunciante com credencial própria, **quando** autentica no painel, **então** vê apenas as estatísticas das suas campanhas (isolamento verificado). — **Gate:** `db/config/tests/rls_isolation_test.sql` (RLS por tenant, incl. BLOCO 5.5 de introspecção `pg_policy.polwithcheck` default-deny) + `bff/src/lib/trpc.test.ts` (ACL `tenantProcedure` server-side, via `make bff-ci`). ACL é server-side, nunca no cliente.
+- [x] Um vínculo campanha↔zona N:N é persistido e avaliado por requisição. — **Gate:** `db/config/migrations/0003+0004` (`config.campaign_zones` + policy com `WITH CHECK` explícito) e `internal/configload/` (loader→snapshot) via `make go-test`.
 
 ### CA-2 — Motor de decisão / cascata (DA-3, DA-4, §4.2)
-- [ ] **Dado** Override elegível, **quando** chega o request, **então** Override é servido, ignorando Contract/Remnant.
-- [ ] **Dado** nenhum Override e Contract com déficit de pacing, **então** Contract é priorizado sobre Remnant.
-- [ ] **Dado** Contract adiantado ou sem segmentação correspondente, **então** Remnant preenche.
-- [ ] **Dado** nenhum criativo elegível em qualquer estrato, **então** a página **não quebra** e uma **impressão em branco** é registrada.
+> **Gate desta seção:** `make parity-golden` → `tests/parity/ca2_cascade_golden_test.go` sobre `tests/parity/golden/ca2_cascade.json`.
+
+- [x] **Dado** Override elegível, **quando** chega o request, **então** Override é servido, ignorando Contract/Remnant. — **Gate:** caso golden `CA2-001` + `TestCA2_Override_Priority_TieBreak`.
+- [x] **Dado** nenhum Override e Contract com déficit de pacing, **então** Contract é priorizado sobre Remnant. — **Gate:** casos golden `CA2-002`/`CA2-003` (`ct-low`/`ct-high`).
+- [x] **Dado** Contract adiantado ou sem segmentação correspondente, **então** Remnant preenche. — **Gate:** casos golden `CA2-002`/`CA2-003` (`rm1`).
+- [x] **Dado** nenhum criativo elegível em qualquer estrato, **então** a página **não quebra** e uma **impressão em branco** é registrada. — **Gate:** `TestCA2_AllCampaignsCapped_FallsToBlank` + `TestCA4_RuleBlocksBanner_FallsToBlank` + caso `CA6-005` (`blank=true`, `billable=false`). Este é o piso da autoridade da cascata (DA-3).
 
 ### CA-3 — Criativos (§4.3)
-- [ ] Upload de imagem exige `dest_url`; rejeita criativo sem destino.
-- [ ] Pacote HTML5 renderiza responsivamente em desktop e mobile.
-- [ ] Third-party tag é servido e dispara contagem de impressão própria (dupla verificação).
-- [ ] Vídeo aceita URL remota + `dest_url`.
+> **Gate desta seção:** `make parity-golden` → `tests/parity/ca3_creatives_golden_test.go` sobre `tests/parity/golden/ca3_creatives.json` (7 casos). **Este é o CA menos coberto** — o golden cobre o *mapeamento* de criativo→banner (plumbing) e a ligação server-side de `dest_url`, mas **não** cobre renderização, upload nem VAST. `make parity-status` já reporta CA-3 como PARCIAL; este §5 concorda.
+
+- [ ] Upload de imagem exige `dest_url`; rejeita criativo sem destino. — **NÃO satisfeito, e o golden documenta isso explicitamente:** o caso `CA3-002` (`image-without-dest-still-selected-no-rejection`) registra que um criativo de imagem **sem `dest_url` NÃO é rejeitado** na camada Go — o loader o seleciona normalmente. A validação de upload é responsabilidade do console/BFF e ainda não existe como gate. **Não marcar sem um teste que reprove o criativo sem destino.**
+- [ ] Pacote HTML5 renderiza responsivamente em desktop e mobile. — *sem gate: o golden `CA3-003`/`CA3-006` cobre apenas o plumbing (blob inline → `Banner.HTML`, com fallback para `AssetURL`). Renderização responsiva exige navegador real; nenhum teste a exerce.*
+- [~] Third-party tag é servido e dispara contagem de impressão própria (dupla verificação). — **Gate parcial:** `CA3-004` prova que a tag de terceiro é servida pelo mesmo caminho de HTML. A **dupla verificação** (contagem própria do terceiro conferida contra a nossa) **não** tem gate.
+- [x] Vídeo aceita URL remota + `dest_url`. — **Gate:** caso golden `CA3-005` (`video-remote-url-plus-dest`). Nota: `TestCA6_VAST_NoVPAID` cobre a ausência de VPAID no wrapper VAST, não o playback.
 
 ### CA-4 — Regras de entrega (DA-9, §4.6)
-- [ ] Regra `Time - Day of Week = Mon..Fri` suprime entrega no fim de semana.
-- [ ] Regra `Site - URL contains "/business/"` veicula só na seção alvo.
-- [ ] Regra `Geo - Country = Canada` não vaza inventário para IPs fora do país.
-- [ ] Regra `Client - Useragent contains "chrome"` restringe a navegadores Chromium.
-- [ ] Custom var `&gender=male` injetada via `document.write` casa a regra `Site - Variable`.
-- [ ] **Dado** `AND` com condições mutuamente exclusivas, **então** a UI **alerta** (anti-contradição) antes de salvar.
-- [ ] Um Rule Set criado em Preferences é reaplicável em ≥ 2 banners sem redigitar condições.
+> **Gate desta seção:** `make parity-golden` → `tests/parity/ca4_rules_golden_test.go` sobre `tests/parity/golden/ca4_rules.json` (23 casos). Os valores concretos do golden diferem dos exemplos deste §5 (ex.: `Country IS 'BR'` em vez de `Canada`, `DayOfWeek IS '3'` em vez de `Mon..Fri`) — o que está provado é o **operador/mecanismo**, que é o que o critério exige; os literais são ilustrativos.
+
+- [x] Regra `Time - Day of Week = Mon..Fri` suprime entrega no fim de semana. — **Gate:** casos `CA4-010`/`CA4-011` (`Time-DayOfWeek` IS / IS-NOT, match e no-match).
+- [x] Regra `Site - URL contains "/business/"` veicula só na seção alvo. — **Gate:** casos `CA4-006`/`CA4-007` (`Site-URL CONTAINS`, incl. o literal `/business/` no caso de no-match).
+- [x] Regra `Geo - Country = Canada` não vaza inventário para IPs fora do país. — **Gate:** casos `CA4-001`…`CA4-004` (`Geo-Country` IS / IS-NOT, match e no-match) + `CA4-005` (`Geo-City CONTAINS`). Complementar: `TestCA6_GeoResolver_IPNotLeaked` prova que o IP bruto não vaza para o evento (TX-5/DA-11).
+- [x] Regra `Client - Useragent contains "chrome"` restringe a navegadores Chromium. — **Gate:** casos `CA4-008`/`CA4-009` (`Client-UserAgent CONTAINS`, com o literal `chrome` no caso de no-match).
+- [~] Custom var `&gender=male` injetada via `document.write` casa a regra `Site - Variable`. — **Gate parcial:** casos `CA4-012`/`CA4-013` provam o casamento de `Site-Variable` no motor. A **injeção via `document.write`** no ad tag (caminho JS do browser) **não** tem gate.
+- [x] **Dado** `AND` com condições mutuamente exclusivas, **então** a UI **alerta** (anti-contradição) antes de salvar. — **Gate:** motor — casos `CA4-019`…`CA4-021` (dois `IS` no mesmo vetor; `IS 'BR'` + `IS-NOT 'BR'`; 7 dias excluídos) + `CA4-023` e `TestCA4_AntiContradiction_SilencesBanner`; `CA4-022` prova que `OR` **não** é marcado como impossível (não-tautologia). UI/BFF — `web/console/src/lib/contradiction.test.ts` (`make web-ci`) e `bff/src/lib/contradiction.test.ts` (`make bff-ci`).
+- [x] Um Rule Set criado em Preferences é reaplicável em ≥ 2 banners sem redigitar condições. — **Gate:** `TestCA4_RuleSet_Reusable_AcrossBanners`. Casos `CA4-016`…`CA4-018` cobrem ruleset vazio (open), ausência de ruleset e ID desconhecido (**fail-closed**).
 
 ### CA-5 — Frequency capping (DA-6, §4.8)
-- [ ] Cap `campaign_total` limita exibições por usuário ao teto durante a campanha.
-- [ ] Cap `session` zera ao fechar o navegador.
-- [ ] Cap `clock` reseta no `reset_interval` configurado, independente do usuário.
-- [ ] Cap no banner sobrescreve cap divergente na campanha.
-- [ ] **Dado** navegador sem cookies, **quando** há cap ativo, **então** a entrega capeada é **abortada** (fail-safe), não estourada.
+> **Gate desta seção:** `make parity-golden` → `tests/parity/ca5_capping_golden_test.go` sobre `tests/parity/golden/ca5_capping.json` (11 casos). É o CA mais bem coberto.
+
+- [x] Cap `campaign_total` limita exibições por usuário ao teto durante a campanha. — **Gate:** caso `CA5-001` (cap=2: permite 2, bloqueia a 3ª) + `CA5-008` (usuários distintos não compartilham estado).
+- [~] Cap `session` zera ao fechar o navegador. — **Gate parcial:** o caso `CA5-002` prova a semântica do cap de escopo *sessão* (cap=1: permite 1, bloqueia a 2ª na mesma sessão). A **expiração ao fechar o navegador** depende do ciclo de vida do cookie de sessão no cliente e **não** tem gate server-side.
+- [x] Cap `clock` reseta no `reset_interval` configurado, independente do usuário. — **Gate:** caso `CA5-003` (cap=2/hora: permite 2, bloqueia a 3ª na janela) + `CA5-009` (rotação de salt abre nova janela).
+- [x] Cap no banner sobrescreve cap divergente na campanha. — **Gate:** caso `CA5-004` (`banner-overrides-campaign`).
+- [x] **Dado** navegador sem cookies, **quando** há cap ativo, **então** a entrega capeada é **abortada** (fail-safe), não estourada. — **Gate:** caso `CA5-005` (sem `user_id` + campanha capeada → aborta) com o par de não-tautologia `CA5-005b` (sem `user_id` + campanha **sem** cap → serve; o fail-safe não é um "nega tudo"). `CA5-006`/`CA5-007` estendem o mesmo fail-safe ao Redis indisponível (DA-6), e `CA5-010` prova `panic` fail-closed com salt vazio.
 
 ### CA-6 — Telemetria (DA-7, DA-8, §4.7)
-- [ ] Impressão só é contabilizada após carga do pixel 1×1 (não no disparo do request).
-- [ ] Clique passa pelo servidor (contabiliza) e então emite `302` para `dest_url`.
-- [ ] Conversão é atribuída quando o pixel terminal dispara.
-- [ ] Painéis consolidam estatísticas em batch **horário** (defasagem ≤ 1h); sem atualização milissegundo a milissegundo.
-- [ ] Diferença Request − Impression é exposta como indicador de perda/escassez de inventário.
+> **Gate desta seção:** `make parity-golden` → `tests/parity/ca6_telemetry_golden_test.go` sobre `tests/parity/golden/ca6_telemetry.json` (10 casos), mais `make data-validate` (`scripts/ci/data-schema-invariants.py`) para o contrato de agregação.
+
+- [x] Impressão só é contabilizada após carga do pixel 1×1 (não no disparo do request). — **Gate:** casos `CA6-001` (contabiliza em `/lg`, não em `/asyncjs`) e `CA6-002` (`/asyncjs` apenas enfileira `AdRequest`) + `TestCA6_ImpressionOnlyAtPixelLoad`.
+- [x] Clique passa pelo servidor (contabiliza) e então emite `302` para `dest_url`. — **Gate:** caso `CA6-003` (token HMAC válido → `302` + evento), com os pares de não-tautologia `CA6-006` (token inválido → `400`, sem evento) e `CA6-007` (sem `CK_HMAC_SECRET` → `503` fail-closed) + `TestCA6_ClickToken_ValidThenExpired` / `TestCA6_ClickToken_TamperedRejected`.
+- [x] Conversão é atribuída quando o pixel terminal dispara. — **Gate:** caso `CA6-004` (`/ct` → `200` + evento). Idempotência sob reentrega: caso `CA6-008` + `TestCA6_Dedupe_IdempotentByEventID`.
+- [~] Painéis consolidam estatísticas em batch **horário** (defasagem ≤ 1h); sem atualização milissegundo a milissegundo. — **Gate parcial (lado dados):** `scripts/ci/data-schema-invariants.py` (via `make data-validate`) exige o statement real `CREATE VIEW adserver.stats_hourly` com as colunas do contrato StatsHourly, `stats_hourly_state` com `ENGINE = AggregatingMergeTree` (DA-7), e `COMMENT ON TABLE` marcando **cada** view "ao vivo" como `NAO-FATURAVEL` (ADR-0001) — escopado por statement, não por substring no corpus. **Sem gate (lado UI):** a exigência de que o console **rotule** "≤1h" vs "ao vivo" e **nunca some** as duas fontes não é asserida por nenhum teste de front hoje.
+- [x] Diferença Request − Impression é exposta como indicador de perda/escassez de inventário. — **Gate:** `TestCA6_RequestMinusImpression_Metric`.
 
 ### CA-7 — Precificação e moeda (DA-10, §4.9)
-- [ ] CPM fatura a cada 1.000 impressões; CPC por clique; CPA por conversão; Tenancy por período fixo.
-- [ ] Valores monetários usam tipo decimal de ponto fixo (`NUMERIC`); **nenhum** uso de `float`.
-- [ ] O sistema aceita múltiplas moedas como rótulo, **sem** conversão cambial automática.
+- [~] CPM fatura a cada 1.000 impressões; CPC por clique; CPA por conversão; Tenancy por período fixo. — **Gate parcial:** `make data-billing-test` (`data/iceberg/jobs/test_billing_batch_hourly.py`) cobre **apenas CPM** — 3 testes: semântica de FLOOR, ausência de cobrança de milhar parcial, e USDC `scale=6`. **CPC, CPA e Tenancy não têm teste executável** no motor canônico de faturamento. Não marcar como completo até existirem.
+- [x] Valores monetários usam tipo decimal de ponto fixo (`NUMERIC`); **nenhum** uso de `float`. — **Gate:** `make verify` → 6 guards `scripts/ci/no-float-{proto,go,ts,py,sql,data-sql}.sh` com sentinela anti-skip `NO_FLOAT_SCRIPTS_EXPECTED := 6`, mais `make go-lint` (`.golangci.yml`/`forbidigo`) e o ESLint de dinheiro do BFF/console. Escopo **default-deny com allowlist explícita** — ver `contracts/lint/no-float.md` §Escopo. Complemento no banco: `db/ledger/tests/postings_immutability_test.sql` (append-only) e a dupla-entrada `sum(debit)=sum(credit)` em `internal/ledger` (`TestCheckBalance_PerAssetImbalanceDetected`, via `CheckBalanceForTest` — a função de produção, não uma reimplementação).
+- [x] O sistema aceita múltiplas moedas como rótulo, **sem** conversão cambial automática. — **Gate:** `internal/ledger` — `TestFXExchange_TwoPairsIsolated` e `TestFXExchange_CrossAssetAmountsNeedNotMatch` (câmbio só como **par de postings explícito**, DA-10), `TestCompare_CrossCurrencyError` e `TestCompare_DifferentScale` (comparação entre moedas/escalas distintas é **erro**, nunca conversão implícita), `TestScaleMismatch_Rejected` e `TestAssetNotFound_Rejected`.
 
 ### CA-8 — Privacidade e conformidade (DA-11)
-- [ ] Nenhum PII é persistido em perfil central; first-party data trafega só na requisição.
-- [ ] Inspeção do fluxo confirma ausência de transmissão inter-regional opaca de dados pessoais.
+- [x] Nenhum PII é persistido em perfil central; first-party data trafega só na requisição. — **Gate:** `TestCA6_GeoResolver_IPNotLeaked` (IP bruto nunca chega ao evento), casos `CA6-009` (UA reduzido a classe grossa antes de emitir) e `CA6-010` (referer sanitizado — query string e fragment removidos), mais `make platform-validate` → `platform-otel-validate`, que exige `transform/redact-pii` + `redaction/allowlist-<tipo>` em **todos** os pipelines de `service.pipelines` e `allow_all_keys: false` em default-deny **case-insensitive** (TX-5). Capping usa identificador efêmero com salt rotativo (`CA5-009`), não perfil persistente.
+- [ ] Inspeção do fluxo confirma ausência de transmissão inter-regional opaca de dados pessoais. — *sem gate: exige inspeção de tráfego em infra viva (multi-região) que não existe neste ambiente. A separação de instância da célula AML/KYC e as Cilium egress policies são a mitigação de projeto, mas nenhuma delas é asserida comportamentalmente offline (ver `docs/ops/go-live-runbook.md` §9 L-1).*
 
 ### CA-9 — Plataforma e operação (DA-12, §4.10)
-- [ ] Aplicação instala em stack LAMP/LEMP (PHP + MySQL/MariaDB).
-- [ ] Plugins residem em `/etc/plugins`; ausência deles não deve esvaziar silenciosamente o menu de Rule Sets sem diagnóstico.
-- [ ] MaxMind: chave de licença aceita e arquivos GeoLite2 auto-atualizam sem intervenção manual.
-- [ ] Mailer/SMTP entrega relatórios batch sem cair em blacklist (sem uso do mail PHP nativo).
+
+> **Adjudicação (tech-lead, 2026-07-19):** este CA é o mais contaminado pela herança do
+> Revive. Dois dos quatro itens descrevem a *plataforma de execução do Revive legado*
+> (PHP/MySQL, layout de plugins) e são **inaplicáveis por construção** ao alvo desta
+> reescrita — não são dívida técnica nem pendência de roadmap; são escopo **revogado** por
+> decisão arquitetural. Ficam registrados e marcados `N/A-legado`, com o critério sucessor
+> apontado quando existe. Os outros dois itens continuam válidos e são avaliados normalmente.
+
+- **N/A-legado** — ~~Aplicação instala em stack LAMP/LEMP (PHP + MySQL/MariaDB).~~ **Inaplicável por construção.** O alvo é Go (hot path) + Postgres + Redis + Redpanda + ClickHouse, empacotado em contêiner e implantado em Kubernetes (ver `docs/stack-tecnologico.md` e `docs/adr/0002-fase-1-sequenciamento-e-layout.md`). Não existe PHP nem MySQL/MariaDB no repositório, e não passará a existir. **Critério sucessor:** `make platform-validate` (6 checks: tofu, kubeconform, kyverno test, otel-validate, openbao-policy-check, cell-consistency) + o procedimento de `docs/ops/go-live-runbook.md` §2 (ordem de migrações por schema).
+- **N/A-legado** — ~~Plugins residem em `/etc/plugins`; ausência deles não deve esvaziar silenciosamente o menu de Rule Sets sem diagnóstico.~~ **Inaplicável por construção.** A reescrita não tem arquitetura de plugins carregados de `/etc/plugins`; as regras de entrega são código Go de primeira classe (`internal/cascade`, `internal/rules`), não plugins opcionais. **A preocupação de fundo — "ausência silenciosa não deve esvaziar o menu sem diagnóstico" — sobrevive e está satisfeita**, mas sob CA-4: o caso golden `CA4-018` prova que um `rule_set_id` desconhecido é **fail-closed** (inelegível), e não silenciosamente ignorado.
+- [~] MaxMind: chave de licença aceita e arquivos GeoLite2 auto-atualizam sem intervenção manual. — **Gate parcial:** `internal/geo/maxmind_reload_test.go` (via `make go-test`) prova o **hot-reload** do `.mmdb` sem restart do processo (fechado na 18ª onda). O **job de auto-atualização** que baixa periodicamente o GeoLite2 da MaxMind (e a aceitação da chave de licença real) **não** tem gate — depende de credencial e rede externas. Ver runbook §3.
+- [ ] Mailer/SMTP entrega relatórios batch sem cair em blacklist (sem uso do mail PHP nativo). — **NÃO implementado.** `grep -rniE 'smtp|mailer'` sobre `internal/`, `services/`, `bff/src` e `web/console/src` retorna **zero** ocorrências: não existe camada de e-mail no produto hoje. A cláusula "sem uso do mail PHP nativo" é satisfeita trivialmente (não há PHP), mas o critério **positivo** — entregar relatórios batch — está por fazer. Não marcar.
 
 ---
 

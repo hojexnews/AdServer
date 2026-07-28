@@ -4,8 +4,11 @@
 #
 # Cobre:
 #   verify-image-signatures  — imagem nao-ghcr deve ser rejeitada
-#   disallow-latest-tag      — :latest deve ser rejeitado; tag explicita aceita
-#   require-resource-limits  — pod sem limits rejeitado; com limits aceito
+#   disallow-latest-tag      — :latest deve ser rejeitado; tag explicita aceita;
+#                              MESMO se so o initContainer usar :latest (achado
+#                              kyverno-baseline-initcontainer-blindspot, 30a onda)
+#   require-resource-limits  — pod sem limits rejeitado; com limits aceito;
+#                              MESMO se so o initContainer nao tiver limits
 #
 # NOTA (E8 — nao ha mais placeholder de chave): verify-image-signatures usa
 # um attestor "keyless" (Sigstore/Fulcio+Rekor, identidade OIDC do workflow
@@ -57,3 +60,21 @@ results:
       - pod-with-limits
     kind: Pod
     result: pass
+
+  # --- kyverno-baseline-initcontainer-blindspot (30a onda): initContainer
+  # com :latest e sem limits deve ser rejeitado pelas DUAS policies, mesmo
+  # com o container principal 100% conforme — prova de que a REJEICAO
+  # cobre spec.initContainers, nao so spec.containers. ---
+  - policy: disallow-latest-tag
+    rule: require-image-tag
+    resources:
+      - pod-initcontainer-latest-nolimits
+    kind: Pod
+    result: fail
+
+  - policy: require-resource-limits
+    rule: require-limits
+    resources:
+      - pod-initcontainer-latest-nolimits
+    kind: Pod
+    result: fail

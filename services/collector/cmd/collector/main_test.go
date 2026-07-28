@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/xml"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +16,8 @@ import (
 	commonv1 "github.com/hojex/adserver/gen/go/adserver/common/v1"
 	"github.com/hojex/adserver/internal/clicktoken"
 	"github.com/hojex/adserver/internal/geo"
+	"github.com/hojex/adserver/internal/privacyscan"
+	"github.com/hojex/adserver/internal/telemetry"
 )
 
 // ---------------------------------------------------------------------------
@@ -596,27 +602,12 @@ func TestAsyncJS_UAClassEmitted_RawUANotInEvent(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // PRIVACY: Referer URL sanitized — query and fragment stripped
+//
+// The Sanitize() unit-level cases (query/fragment stripping, malformed
+// input, non-http(s) schemes) now live with the implementation in
+// internal/referer/sanitize_test.go — this package only verifies it is
+// actually WIRED IN to the /asyncjs → AdRequest event path.
 // ---------------------------------------------------------------------------
-
-func TestSanitizeReferer_StripsQueryAndFragment(t *testing.T) {
-	cases := []struct {
-		raw  string
-		want string
-	}{
-		{"https://example.com/page?session=abc123&user=456", "https://example.com/page"},
-		{"https://example.com/page#section", "https://example.com/page"},
-		{"https://example.com/page?q=1#frag", "https://example.com/page"},
-		{"https://example.com/path/to/page", "https://example.com/path/to/page"},
-		{"", ""},
-		{"not-a-url", ""}, // parse error → empty string
-	}
-	for _, tc := range cases {
-		got := sanitizeReferer(tc.raw)
-		if got != tc.want {
-			t.Errorf("sanitizeReferer(%q): got %q, want %q", tc.raw, got, tc.want)
-		}
-	}
-}
 
 func TestAsyncJS_RefererSanitized_NoQueryInEvent(t *testing.T) {
 	sink := &captureSink{}
@@ -982,5 +973,102 @@ func TestParseAlternateNumericIP(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("parseAlternateNumericIP(%q): got %q, want %q", tc.host, got, tc.want)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PRIVACY (PRIV-02, TX-5/DA-11): default-deny IP-literal scan over the WHOLE
+// persisted AdRequest event and over collector log output.
+//
+// This closes the "gate-órfão" gap: previously nothing asserted that the raw
+// client IP (or any other IP-shaped string, e.g. a value smuggled into a
+// publisher-supplied custom_vars entry) can never reach the WAL-durable
+// AdRequest event or a log line. Both tests below are DEFAULT-DENY: they
+// scan the ENTIRE serialized event / entire captured log buffer with
+// privacyscan.FindIPLiterals rather than checking a hand-picked list of
+// "risky" fields — narrowing to specific fields recreates exactly the gap
+// this gate exists to close.
+// ---------------------------------------------------------------------------
+
+// TestPrivacy_AdRequestWAL_NoIPLiteral_DefaultDeny drives a REAL
+// *telemetry.Producer (WAL-backed, no Kafka broker configured) through
+// handleAsyncJS — the exact code path production uses — with the client's
+// raw IP present in X-Forwarded-For and several publisher-supplied
+// custom_vars. It then reads the WAL file directly off disk (the bytes that
+// would be replayed/produced to Redpanda on restart) and fails if ANY byte
+// sequence in the entire record parses as an IPv4 or IPv6 address.
+func TestPrivacy_AdRequestWAL_NoIPLiteral_DefaultDeny(t *testing.T) {
+	dir := t.TempDir()
+	walPath := filepath.Join(dir, "adrequest.wal")
+
+	producer, err := telemetry.NewProducer(telemetry.Config{
+		WALPath:    walPath,
+		QueueDepth: 8,
+		Logger:     slog.New(slog.NewTextHandler(os.Stderr, nil)),
+	})
+	if err != nil {
+		t.Fatalf("telemetry.NewProducer: %v", err)
+	}
+
+	h := newTestHandlerWithSigner(producer, nil)
+
+	req := httptest.NewRequest(http.MethodGet,
+		"/asyncjs?zoneid=z1&tid=t1&cb=12345&csection=sports&cgender=female", nil)
+	req.Header.Set("X-Forwarded-For", "203.0.113.77") // the client's raw IP — must never be persisted
+	req.Header.Set("Referer", "https://publisher.example.com/article?session=abc123")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0")
+	rr := httptest.NewRecorder()
+	h.handleAsyncJS(rr, req)
+
+	producer.Close() // drains the queue; WAL is not truncated (no Kafka client → nothing acked)
+
+	data, err := os.ReadFile(walPath)
+	if err != nil {
+		t.Fatalf("read WAL file: %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatal("WAL file is empty — the AdRequest event was not persisted; this test is not exercising the path it claims to")
+	}
+	if hits := privacyscan.FindIPLiterals(data); len(hits) > 0 {
+		t.Errorf("AdRequest WAL record on disk contains IP-shaped literal(s) %v — TX-5/DA-11 violation (PRIV-02)", hits)
+	}
+}
+
+// TestPrivacy_CollectorLogs_NoIPLiteral_DefaultDeny exercises several
+// collector code paths that call h.logger (invalid click token, invalid VAST
+// src) on requests carrying a distinguishable client IP, and fails if that
+// IP — or anything IP-shaped — appears anywhere in the captured log output.
+func TestPrivacy_CollectorLogs_NoIPLiteral_DefaultDeny(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+	signer := newTestSigner(t)
+	h := newTestHandlerWithSigner(&captureSink{}, signer)
+	h.logger = logger
+
+	const clientIP = "198.51.100.42"
+
+	// 1. /asyncjs — normal ad-request path.
+	req1 := httptest.NewRequest(http.MethodGet, "/asyncjs?zoneid=z1&tid=t1&cb=1&cflag=hello", nil)
+	req1.Header.Set("X-Forwarded-For", clientIP)
+	h.handleAsyncJS(httptest.NewRecorder(), req1)
+
+	// 2. /ck — invalid/expired token rejected (logs a Warn).
+	req2 := httptest.NewRequest(http.MethodGet, "/ck?tok=not-a-valid-token&did=d1&bid=b1", nil)
+	req2.Header.Set("X-Forwarded-For", clientIP)
+	h.handleClick(httptest.NewRecorder(), req2)
+
+	// 3. /vast — invalid src rejected (logs a Warn).
+	q := url.Values{
+		"src": {"file:///etc/hosts"},
+		"did": {"d1"}, "bid": {"b1"}, "cid": {"c1"}, "zid": {"z1"}, "tid": {"t1"},
+	}
+	req3 := httptest.NewRequest(http.MethodGet, "/vast?"+q.Encode(), nil)
+	req3.Header.Set("X-Forwarded-For", clientIP)
+	h.handleVAST(httptest.NewRecorder(), req3)
+
+	if hits := privacyscan.FindIPLiterals(buf.Bytes()); len(hits) > 0 {
+		t.Errorf("collector log output contains IP-shaped literal(s) %v — TX-5/DA-11 violation (PRIV-02):\n%s",
+			hits, buf.String())
 	}
 }

@@ -12,11 +12,19 @@ PGURL="${PGURL:-postgres://postgres:postgres@localhost:5432/adserver?sslmode=dis
 
 zone="$(psql "$PGURL" -tAc "select id from config.zones where name='Sidebar 300x250' limit 1" | tr -d '[:space:]')"
 [ -n "$zone" ] || { echo "FAIL: seed zone 'Sidebar 300x250' not found in $PGURL"; exit 1; }
-echo "[smoke] zone_id=$zone  decision=$DEC"
+
+# A stable user identifier is REQUIRED to exercise the contract tier: the seed
+# puts a frequency cap (3/hour) on the "Contract BR" campaign, and the cascade
+# treats a capped campaign with NO stable identifier as ineligible — fail-closed
+# (DA-6: silence preferred over over-delivery, internal/cascade/cascade.go §Capper).
+# The production ad-tag/collector always supplies one; the smoke mirrors that.
+# Unique per run so re-running does not accumulate against the 3/hour cap.
+uid="smoke-$(date +%s)-${RANDOM}"
+echo "[smoke] zone_id=$zone  decision=$DEC  user_id=$uid"
 
 decide() {
   curl -fsS -X POST "$DEC/v1/decide" -H 'content-type: application/json' \
-    -d "{\"zone_id\":\"$zone\",\"geo_country\":\"$1\"}"
+    -d "{\"zone_id\":\"$zone\",\"geo_country\":\"$1\",\"user_id\":\"$uid\"}"
 }
 
 br="$(decide BR)";  echo "[smoke] BR -> $br"

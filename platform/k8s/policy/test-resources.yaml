@@ -69,3 +69,29 @@ spec:
         limits:
           cpu: "500m"
           memory: "512Mi"
+---
+# pod-initcontainer-latest-nolimits: initContainer com :latest e sem
+# requests/limits — deve ser rejeitado por disallow-latest-tag E por
+# require-resource-limits mesmo com o container principal 100% conforme
+# (achado kyverno-baseline-initcontainer-blindspot, 30ª onda: initContainers
+# rodam ANTES do container principal, frequentemente com mais privilégio
+# e acesso a volumes compartilhados — vetor real de supply-chain/exaustão).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-initcontainer-latest-nolimits
+  namespace: delivery
+spec:
+  initContainers:
+    - name: init-evil
+      image: ghcr.io/hojex/decision:latest
+  containers:
+    - name: app
+      image: ghcr.io/hojex/decision:v1.2.3
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "200m"
+          memory: "256Mi"

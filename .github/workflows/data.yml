@@ -44,3 +44,57 @@ jobs:
         run: pip install --quiet numpy pandas mmh3
       - name: IVT scoring job test (TX-6 / J6, sample sintetico)
         run: make data-ivt-test
+
+  # data-integration-test (achado #10, 31ª onda): data/clickhouse/tests/tenant_isolation_test.sql
+  # existia mas era ÓRFÃO — nenhum alvo/workflow o executava. Este job sobe um ClickHouse
+  # efêmero via `docker run` (NÃO via `services:` do GitHub Actions — services sobem ANTES
+  # do `actions/checkout`, e não podem montar data/clickhouse/ci/single_node_cluster.xml,
+  # que só existe depois do checkout), aplica as migrations e roda o runner de asserções
+  # (scripts/ci/data-integration-test.py) — mesmo padrão de container efêmero de
+  # make/db.mk::db-test-all, adaptado para ClickHouse.
+  data-integration-test:
+    runs-on: ubuntu-latest
+    env:
+      CH_HOST: "127.0.0.1"
+      CH_PORT: "9000"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: subir ClickHouse efêmero (docker run, sem cluster real — ver data/clickhouse/ci/single_node_cluster.xml)
+        run: |
+          docker run -d \
+            --name ch-integration-test \
+            -p 9000:9000 \
+            -p 8123:8123 \
+            -v "$(pwd)/data/clickhouse/ci/single_node_cluster.xml:/etc/clickhouse-server/config.d/single_node_cluster.xml:ro" \
+            clickhouse/clickhouse-server:24.8
+
+      - name: instalar clickhouse-client (mesma major version do server)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends apt-transport-https ca-certificates curl gnupg
+          curl -fsSL 'https://packages.clickhouse.com/rpm/lts/repodata/repomd.xml.key' | sudo gpg --dearmor -o /usr/share/keyrings/clickhouse-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/clickhouse-keyring.gpg] https://packages.clickhouse.com/deb stable main" | sudo tee /etc/apt/sources.list.d/clickhouse.list
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clickhouse-client
+          clickhouse-client --version
+
+      - name: aguardar ClickHouse ficar pronto
+        run: |
+          for i in $(seq 1 30); do
+            clickhouse-client --host "$CH_HOST" --port "$CH_PORT" --query "SELECT 1" >/dev/null 2>&1 && break
+            if [ "$i" = "30" ]; then
+              echo "ERRO: ClickHouse não ficou pronto em 30s." >&2
+              docker logs ch-integration-test >&2 || true
+              docker rm -f ch-integration-test >/dev/null 2>&1 || true
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: data-integration-test (migrations + tenant_isolation_test.sql com asserções, TX-3)
+        run: make data-integration-test
+
+      - name: derrubar ClickHouse efêmero
+        if: always()
+        run: docker rm -f ch-integration-test >/dev/null 2>&1 || true

@@ -4,9 +4,11 @@
 
 BFF_DIR := bff
 
-## bff-install: instala dependências do BFF
+## bff-install: instala dependências do BFF a partir do lockfile.
+## `npm ci` (não `npm install`) — mesma razão de make/web.mk: reprodutibilidade
+## e falha dura em drift de lockfile.
 bff-install:
-	cd $(BFF_DIR) && npm install
+	cd $(BFF_DIR) && npm ci
 
 ## bff-typecheck: tsc --noEmit strict no BFF
 bff-typecheck:

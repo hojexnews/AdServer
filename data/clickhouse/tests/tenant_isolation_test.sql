@@ -25,10 +25,29 @@
 --     b) Executa as queries de verificacao impersonando cada usuario tenant
 --        via clickhouse-client --user tenant_<uuid>.
 --     c) Verifica que o count() retorna 0 para o tenant errado e >0 para o correto.
+--
+-- EXECUCAO AUTOMATIZADA (achado #10, 31a onda):
+--   make data-integration-test (scripts/ci/data-integration-test.py) executa
+--   ESTE arquivo statement-a-statement contra um ClickHouse real, TROCANDO de
+--   usuario e AFIRMANDO cada resultado — nao apenas roda o arquivo e confere
+--   ausencia de erro SQL (o que "passaria" mesmo com isolamento quebrado, ja
+--   que um SELECT count() por si so nao afirma nada). As diretivas abaixo sao
+--   comentarios SQL adicionais, ignorados por qualquer client SQL comum, e
+--   lidos pelo runner:
+--     -- @user: <username-literal-do-CREATE-USER-acima> | admin
+--         Troca o usuario de impersonacao para os statements seguintes ate a
+--         proxima diretiva @user. 'admin' = sem --user/--password (usa o
+--         usuario default/admin do cliente).
+--     -- @expect: eq0 | ge1 | eq:'<valor>' | eq:NULL
+--         Afirma o resultado do PROXIMO SELECT (statement imediatamente
+--         seguinte). Falha alto (exit != 0) se o valor retornado nao bater.
+--   Sem ClickHouse/clickhouse-client disponiveis, o runner FALHA alto — nunca
+--   pula em silencio (ver make/data.mk::data-integration-test).
 
 -- =============================================================================
 -- [SETUP] Definicao de constantes de fixture
 -- =============================================================================
+-- @user: admin
 -- Tenant A: UUID canonico, usuario valido
 -- Tenant B: UUID canonico, usuario valido
 -- Usuario adversarial: nome com 'tenant_' no meio (nao e UUID valido no sufixo)
@@ -149,9 +168,11 @@ VALUES
 -- =============================================================================
 -- Impersonar o usuario tenant_11111111-1111-4111-a111-111111111111.
 -- Em clickhouse-client: executar com --user tenant_11111111-1111-4111-a111-111111111111
+-- @user: tenant_11111111-1111-4111-a111-111111111111
 
 -- TESTE 1a: stats_hourly — tenant A nao ve linhas de tenant B
 -- EXPECT: 0 rows (count = 0)
+-- @expect: eq0
 SELECT count() AS cross_tenant_leak_hourly
 FROM adserver.stats_hourly
 WHERE tenant_id = '22222222-2222-4222-a222-222222222222';
@@ -160,6 +181,7 @@ WHERE tenant_id = '22222222-2222-4222-a222-222222222222';
 
 -- TESTE 1b: raw_impression — tenant A nao ve linhas de tenant B
 -- EXPECT: 0 rows
+-- @expect: eq0
 SELECT count() AS cross_tenant_leak_impression
 FROM adserver.raw_impression FINAL
 WHERE tenant_id = '22222222-2222-4222-a222-222222222222';
@@ -167,6 +189,7 @@ WHERE tenant_id = '22222222-2222-4222-a222-222222222222';
 
 -- TESTE 1c: raw_ad_request — tenant A nao ve linhas de tenant B
 -- EXPECT: 0 rows
+-- @expect: eq0
 SELECT count() AS cross_tenant_leak_ad_request
 FROM adserver.raw_ad_request FINAL
 WHERE tenant_id = '22222222-2222-4222-a222-222222222222';
@@ -174,6 +197,7 @@ WHERE tenant_id = '22222222-2222-4222-a222-222222222222';
 
 -- TESTE 1d: raw_click — tenant A nao ve linhas de tenant B
 -- EXPECT: 0 rows
+-- @expect: eq0
 SELECT count() AS cross_tenant_leak_click
 FROM adserver.raw_click FINAL
 WHERE tenant_id = '22222222-2222-4222-a222-222222222222';
@@ -181,6 +205,7 @@ WHERE tenant_id = '22222222-2222-4222-a222-222222222222';
 
 -- TESTE 1e: raw_conversion — tenant A nao ve linhas de tenant B
 -- EXPECT: 0 rows
+-- @expect: eq0
 SELECT count() AS cross_tenant_leak_conversion
 FROM adserver.raw_conversion FINAL
 WHERE tenant_id = '22222222-2222-4222-a222-222222222222';
@@ -188,6 +213,7 @@ WHERE tenant_id = '22222222-2222-4222-a222-222222222222';
 
 -- TESTE 1e2: raw_ivt_score — tenant A nao ve linhas de tenant B
 -- EXPECT: 0 rows
+-- @expect: eq0
 SELECT count() AS cross_tenant_leak_ivt_score
 FROM adserver.raw_ivt_score FINAL
 WHERE tenant_id = '22222222-2222-4222-a222-222222222222';
@@ -196,6 +222,7 @@ WHERE tenant_id = '22222222-2222-4222-a222-222222222222';
 
 -- TESTE 1f: live_stats_exact — tenant A nao ve linhas de tenant B
 -- EXPECT: 0 rows
+-- @expect: eq0
 SELECT count() AS cross_tenant_leak_live_exact
 FROM adserver.live_stats_exact
 WHERE tenant_id = '22222222-2222-4222-a222-222222222222';
@@ -203,6 +230,7 @@ WHERE tenant_id = '22222222-2222-4222-a222-222222222222';
 
 -- TESTE 1g: live_stats_fast — tenant A nao ve linhas de tenant B
 -- EXPECT: 0 rows
+-- @expect: eq0
 SELECT count() AS cross_tenant_leak_live_fast
 FROM adserver.live_stats_fast
 WHERE tenant_id = '22222222-2222-4222-a222-222222222222';
@@ -212,9 +240,11 @@ WHERE tenant_id = '22222222-2222-4222-a222-222222222222';
 -- BLOCO 2: Tenant A consultando seus proprios dados (sanidade)
 -- =============================================================================
 -- Ainda impersonando tenant_11111111-1111-4111-a111-111111111111.
+-- @user: tenant_11111111-1111-4111-a111-111111111111
 
 -- TESTE 2a: tenant A ve suas proprias linhas em stats_hourly
 -- EXPECT: >= 1 rows
+-- @expect: ge1
 SELECT count() AS own_rows_hourly
 FROM adserver.stats_hourly
 WHERE tenant_id = '11111111-1111-4111-a111-111111111111';
@@ -223,6 +253,7 @@ WHERE tenant_id = '11111111-1111-4111-a111-111111111111';
 
 -- TESTE 2b: tenant A ve suas proprias impressoes
 -- EXPECT: >= 1 rows
+-- @expect: ge1
 SELECT count() AS own_rows_impression
 FROM adserver.raw_impression FINAL
 WHERE tenant_id = '11111111-1111-4111-a111-111111111111';
@@ -230,6 +261,7 @@ WHERE tenant_id = '11111111-1111-4111-a111-111111111111';
 
 -- TESTE 2c: tenant A ve seus proprios scores IVT
 -- EXPECT: >= 1 rows
+-- @expect: ge1
 SELECT count() AS own_rows_ivt_score
 FROM adserver.raw_ivt_score FINAL
 WHERE tenant_id = '11111111-1111-4111-a111-111111111111';
@@ -246,9 +278,11 @@ WHERE tenant_id = '11111111-1111-4111-a111-111111111111';
 --   sufixo = 'ab_tenant_cd' -> nao e UUID valido -> NULL -> 0 rows (fail-closed).
 --
 -- Impersonar o usuario tenant_ab_tenant_cd.
+-- @user: tenant_ab_tenant_cd
 
 -- TESTE 3a: usuario adversarial nao ve NENHUMA linha em stats_hourly (fail-closed)
 -- EXPECT: 0 rows (a row-policy retorna NULL para sufixo nao-UUID -> sem match)
+-- @expect: eq0
 SELECT count() AS adversarial_leak_hourly
 FROM adserver.stats_hourly;
 -- Resultado esperado: 0
@@ -256,30 +290,35 @@ FROM adserver.stats_hourly;
 
 -- TESTE 3b: usuario adversarial nao ve nenhuma linha em raw_impression
 -- EXPECT: 0 rows
+-- @expect: eq0
 SELECT count() AS adversarial_leak_impression
 FROM adserver.raw_impression FINAL;
 -- Resultado esperado: 0
 
 -- TESTE 3c: usuario adversarial nao ve nenhuma linha em raw_ad_request
 -- EXPECT: 0 rows
+-- @expect: eq0
 SELECT count() AS adversarial_leak_ad_request
 FROM adserver.raw_ad_request FINAL;
 -- Resultado esperado: 0
 
 -- TESTE 3d: usuario adversarial nao ve nenhuma linha em raw_click
 -- EXPECT: 0 rows
+-- @expect: eq0
 SELECT count() AS adversarial_leak_click
 FROM adserver.raw_click FINAL;
 -- Resultado esperado: 0
 
 -- TESTE 3e: usuario adversarial nao ve nenhuma linha em raw_conversion
 -- EXPECT: 0 rows
+-- @expect: eq0
 SELECT count() AS adversarial_leak_conversion
 FROM adserver.raw_conversion FINAL;
 -- Resultado esperado: 0
 
 -- TESTE 3f: usuario adversarial nao ve nenhuma linha em raw_ivt_score (fail-closed)
 -- EXPECT: 0 rows
+-- @expect: eq0
 SELECT count() AS adversarial_leak_ivt_score
 FROM adserver.raw_ivt_score FINAL;
 -- Resultado esperado: 0
@@ -290,9 +329,11 @@ FROM adserver.raw_ivt_score FINAL;
 -- =============================================================================
 -- Estas queries verificam a logica da expressao de row-policy diretamente,
 -- sem depender de impersonacao de usuario. Podem ser rodadas como admin.
+-- @user: admin
 
 -- TESTE 4a: prefixo correto + UUID valido -> extrai UUID
 -- EXPECT: '550e8400-e29b-41d4-a716-446655440000'
+-- @expect: eq:'550e8400-e29b-41d4-a716-446655440000'
 SELECT if(
     startsWith('tenant_550e8400-e29b-41d4-a716-446655440000', 'tenant_')
       AND match(
@@ -306,6 +347,7 @@ SELECT if(
 
 -- TESTE 4b: nome adversarial 'tenant_ab_tenant_cd' -> NULL (fail-closed)
 -- EXPECT: NULL
+-- @expect: eq:NULL
 SELECT if(
     startsWith('tenant_ab_tenant_cd', 'tenant_')
       AND match(
@@ -320,6 +362,7 @@ SELECT if(
 
 -- TESTE 4c: usuario sem prefixo 'tenant_' (ex.: 'adserver_admin') -> NULL
 -- EXPECT: NULL
+-- @expect: eq:NULL
 SELECT if(
     startsWith('adserver_admin', 'tenant_')
       AND match(
@@ -333,6 +376,7 @@ SELECT if(
 
 -- TESTE 4d: 'tenant_' sem UUID (so o prefixo) -> NULL
 -- EXPECT: NULL
+-- @expect: eq:NULL
 SELECT if(
     startsWith('tenant_', 'tenant_')
       AND match(
@@ -348,6 +392,7 @@ SELECT if(
 -- EXPECT: NULL
 -- Isso e intencional: os UUIDs de tenants sao sempre lowercase no sistema.
 -- Se necessario suportar maiusculas, adicionar toLower() no match.
+-- @expect: eq:NULL
 SELECT if(
     startsWith('tenant_550E8400-E29B-41D4-A716-446655440000', 'tenant_')
       AND match(
@@ -362,6 +407,7 @@ SELECT if(
 -- =============================================================================
 -- [TEARDOWN] Remover fixtures de teste (rodar como admin apos verificacao)
 -- =============================================================================
+-- @user: admin
 
 DROP USER IF EXISTS `tenant_11111111-1111-4111-a111-111111111111`;
 DROP USER IF EXISTS `tenant_22222222-2222-4222-a222-222222222222`;

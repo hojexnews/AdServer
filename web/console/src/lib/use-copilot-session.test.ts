@@ -33,6 +33,8 @@ register(new URL("./test-node-loader-hook.mjs", import.meta.url));
 const {
   checkDiffForContradictions,
   resolveContradictionWarning,
+  reducer,
+  INITIAL_STATE,
 } = (await import("./use-copilot-session.ts")) as typeof import("./use-copilot-session.ts");
 
 type RuleCandidateLike = {
@@ -212,4 +214,102 @@ test("resolveContradictionWarning: diff sem ownerType/ownerId -> fetcher NUNCA �
 
   assert.equal(calls, 0);
   assert.equal(warning, null);
+});
+
+// ---------------------------------------------------------------------------
+// reducer — máquina de estado da sessão (31ª onda)
+//
+// Antes desta onda o reducer não tinha NENHUM teste: `make web-test` ficava
+// verde com a bolha fantasma pós-HITL presente em toda aprovação/rejeição.
+// Estes testes são de MUTAÇÃO: reintroduzir o push de mensagem em
+// HITL_RESOLVED faz o primeiro teste abaixo FALHAR.
+// ---------------------------------------------------------------------------
+
+type StateLike = typeof INITIAL_STATE;
+
+/** Estado com uma resposta do assistente já concluída e um HITL pendente. */
+function stateWithPendingHitl(): StateLike {
+  return {
+    ...INITIAL_STATE,
+    status: "hitl_pending",
+    sessionId: "s-1",
+    threadId: "t-1",
+    messages: [
+      { role: "user", content: "crie uma campanha" },
+      { role: "assistant", content: "Segue a proposta:", streaming: false },
+    ],
+    hitl: {
+      threadId: "t-1",
+      diff: { kind: "zone_link", action: "create", campaignId: "c1", zoneId: "z1" },
+      message: "Confirma?",
+      contradictionWarning: null,
+    },
+  } as StateLike;
+}
+
+test("reducer HITL_RESOLVED -> NÃO insere slot de assistente (quem insere é BEGIN_STREAMING)", () => {
+  const before = stateWithPendingHitl();
+  const after = reducer(before, { type: "HITL_RESOLVED" });
+
+  assert.equal(after.status, "streaming");
+  assert.equal(after.hitl, null);
+  assert.equal(
+    after.messages.length,
+    before.messages.length,
+    "HITL_RESOLVED não pode criar mensagem: o BEGIN_STREAMING de openStream() " +
+      "já cria o slot. Dois pushes = bolha vazia permanente (bug da 31ª onda).",
+  );
+});
+
+test("reducer HITL_RESOLVED + BEGIN_STREAMING (sequência real de approve()) -> exatamente UM slot novo", () => {
+  const before = stateWithPendingHitl();
+  const resolved = reducer(before, { type: "HITL_RESOLVED" });
+  const streaming = reducer(resolved, { type: "BEGIN_STREAMING" });
+
+  assert.equal(
+    streaming.messages.length,
+    before.messages.length + 1,
+    "approve()/reject() despacham HITL_RESOLVED e em seguida openStream() " +
+      "despacha BEGIN_STREAMING — o par tem de produzir UM slot, não dois.",
+  );
+
+  const last = streaming.messages[streaming.messages.length - 1];
+  assert.equal(last?.role, "assistant");
+  assert.equal(last?.content, "");
+  assert.equal(last?.streaming, true);
+});
+
+test("reducer TOKEN após a sequência HITL -> texto vai para o slot visível (sem bolha vazia órfã)", () => {
+  const before = stateWithPendingHitl();
+  const resolved = reducer(before, { type: "HITL_RESOLVED" });
+  const streaming = reducer(resolved, { type: "BEGIN_STREAMING" });
+  const withToken = reducer(streaming, { type: "TOKEN", text: "Aplicado." });
+
+  const empties = withToken.messages.filter(
+    (m) => m.role === "assistant" && m.content === "",
+  );
+  assert.equal(
+    empties.length,
+    0,
+    "nenhuma bolha de assistente pode ficar vazia depois de chegar token",
+  );
+  assert.equal(
+    withToken.messages[withToken.messages.length - 1]?.content,
+    "Aplicado.",
+  );
+});
+
+test("reducer ERROR encerra o streaming da mensagem em curso (usado pelo fail-closed do hitl_required)", () => {
+  const streaming = reducer(
+    reducer(stateWithPendingHitl(), { type: "HITL_RESOLVED" }),
+    { type: "BEGIN_STREAMING" },
+  );
+  const errored = reducer(streaming, { type: "ERROR", message: "contrato incompatível" });
+
+  assert.equal(errored.status, "error");
+  assert.equal(errored.error, "contrato incompatível");
+  assert.ok(
+    errored.messages.every((m) => m.streaming !== true),
+    "ERROR tem de desligar o flag streaming — senão a UI fica com spinner eterno",
+  );
 });

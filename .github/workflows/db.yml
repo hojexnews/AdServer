@@ -1,14 +1,29 @@
 # db — migrações + isolamento RLS (Fase 1+3, hardening go-live TX-3).
 #
 # Sobe um Postgres 16 efêmero via service container do GitHub Actions,
-# aplica TODAS as migrations (_up) de todos os schemas em ordem obrigatória:
-#   asset_registry → config → ledger (0001..0004) → vector → compliance
+# aplica TODAS as migrations (_up) de todos os schemas em ordem obrigatória
+# entre schemas: asset_registry → config → ledger → vector → compliance.
 # Roda os testes de banco:
 #   - rls_isolation_test.sql de config, ledger, vector, compliance (TX-3)
 #   - postings_immutability_test.sql (ledger, migration 0004: append-only no
 #     banco via trigger — garantia da 28ª onda #6)
 # Aplica as migrations _down em ordem inversa e confirma reversão limpa.
 # Reporta PASS/FAIL por schema.
+#
+# DENTRO de cada schema a ordem das migrations NUNCA é enumerada à mão neste
+# arquivo: cada step deriva a lista via glob + sort sobre
+# db/<schema>/migrations/ — exatamente a mesma convenção de make/db.mk
+# (db-test-all): _up = *_up.sql ordenado; _down = *_down.sql em ordem
+# reversa. Uma migration nova (ex.: 0005_foo_{up,down}.sql) é aplicada
+# automaticamente; nenhum step deste workflow precisa ser editado. Se o
+# diretório não tiver nenhum *_up.sql/*_down.sql o step falha explicitamente
+# (sentinela anti-vazio) em vez de pular o schema em silêncio.
+#
+# O primeiro job step (make db-check-schema-list db-check-migration-pairing)
+# roda as duas sentinelas de make/db.mk ANTES de qualquer migration: uma
+# migration só com _up (ou só com _down) quebraria a reversão lá embaixo;
+# um schema novo em db/ sem entrada em DB_SCHEMAS ficaria invisível aos
+# steps abaixo. Fonte única com make/db.mk — nada duplicado aqui em YAML.
 #
 # Tudo sem DATABASE_URL externo: usa o service container de CI.
 # Sem credenciais de cloud — completamente offline/efêmero.
@@ -23,10 +38,36 @@ on:
       - "db/**"
       - "make/db.mk"
       - ".github/workflows/db.yml"
+      # go-test-integration (achado HIGH / Bundle A): o gate de banco agora
+      # também roda internal/ledger contra este Postgres — uma mudança em
+      # posting.go/crypto.go/posting_integration_test.go ou no alvo
+      # go-test-integration precisa reavaliar este workflow, não só go.yml.
+      - "internal/ledger/**"
+      - "make/go.mk"
+      # Provisionadores (32ª onda): dev-db-setup e o initdb do Docker aplicam
+      # as mesmas migrations que este job. Quando eles enumeravam à mão,
+      # divergiram do disco em silêncio — e nenhum workflow disparava para
+      # eles. Ver make/dev.mk::dev-db-setup e scripts/ci/db-provisioner-check.py.
+      - "make/dev.mk"
+      - "deploy/local/**"
+      - "scripts/ci/db-provisioner-check.py"
   push:
     branches: [main]
+    # Espelha pull_request.paths VERBATIM — o merge para a main é push FF
+    # direto, então este bloco é a última reavaliação que acontece. Até a 32ª
+    # onda faltavam aqui `make/db.mk` e o próprio `.github/workflows/db.yml`:
+    # dava para neutralizar as sentinelas de schema editando make/db.mk e
+    # empurrar para a main sem que este job rodasse uma vez sequer.
+    # Imposto por scripts/ci/workflow-paths-mirror-check.py.
     paths:
       - "db/**"
+      - "make/db.mk"
+      - ".github/workflows/db.yml"
+      - "internal/ledger/**"
+      - "make/go.mk"
+      - "make/dev.mk"
+      - "deploy/local/**"
+      - "scripts/ci/db-provisioner-check.py"
 
 permissions:
   contents: read
@@ -63,6 +104,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Necessário para o step "go test -tags integration" abaixo (achado HIGH
+      # / Bundle A, money-ledger-guardian): internal/ledger/posting_integration_test.go
+      # chama ledger.RecordEntry/FinalizeEntry/RecordPayout REAIS contra este
+      # mesmo Postgres, depois que o schema ledger estiver todo migrado.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
       - name: instalar psql (cliente PostgreSQL)
         run: |
           sudo apt-get update -qq
@@ -70,8 +120,42 @@ jobs:
           psql --version
 
       # ------------------------------------------------------------------
-      # Roles de aplicação (adserver_loader BYPASSRLS / adserver_app RLS).
+      # Sentinelas (make/db.mk): pareamento _up/_down por migration +
+      # diretórios reais de db/ vs. DB_SCHEMAS. Fail-fast antes de tocar
+      # o Postgres — mesmos alvos que db-test-all roda localmente.
+      # ------------------------------------------------------------------
+      - name: sentinelas de schema/migration (schema-list + migration-pairing + provisioners)
+        # db-check-provisioners (32ª onda): nenhum provisionador enumera
+        # migration à mão. Roda aqui E em repo-gates.yml — aqui porque uma
+        # mudança em db/ ou make/dev.mk tem de reprovar no job de banco, e lá
+        # porque a superfície do gate é mais larga do que o `paths:` deste
+        # workflow (a duplicação é deliberada, não descuido).
+        run: make db-check-schema-list db-check-migration-pairing db-check-provisioners
+
+      # ------------------------------------------------------------------
+      # Roles de aplicação (adserver_loader BYPASSRLS / adserver_app RLS /
+      # adserver_copilot NOBYPASSRLS / adserver_stats_writer NOBYPASSRLS).
       # Devem existir ANTES das migrations que criam GRANTs.
+      #
+      # adserver_copilot é criado aqui explicitamente por simetria/
+      # auditabilidade do caminho de enforcement (achado do guardião
+      # security, bundle F): antes, o role só passava a existir como efeito
+      # colateral de "grants adserver_loader + adserver_app" chamar
+      # db/seed/dev_roles.sql (que também cria o role via IF NOT EXISTS)
+      # mais adiante no job — funcionalmente correto (a ordem de migrations
+      # já garante que vector_store existe quando esse step roda), mas
+      # invisível para quem lê só este step. O CREATE ROLE aqui é idempotente
+      # com o de dev_roles.sql (IF NOT EXISTS em ambos); os GRANTs em
+      # vector_store para adserver_copilot continuam vindo de
+      # db/seed/dev_roles.sql, DEPOIS de "migrations up — vector" abaixo.
+      #
+      # adserver_stats_writer segue o MESMO padrão, pelo MESMO motivo (achado
+      # H-2, security-reviewer): db/stats/migrations/0001_stats_schema_up.sql
+      # costumava criar este role inline com `LOGIN PASSWORD` literal — o que
+      # um `make db-migrate-up` comum rodaria contra QUALQUER DATABASE_URL,
+      # inclusive staging/produção. O role agora só existe via
+      # db/seed/dev_roles.sql (chamado explicitamente aqui por simetria/
+      # auditabilidade, e de novo — idempotente — no step de grants abaixo).
       # ------------------------------------------------------------------
       - name: criar roles de aplicação
         run: |
@@ -84,6 +168,16 @@ jobs:
             IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'adserver_app') THEN
               CREATE ROLE adserver_app LOGIN PASSWORD 'app_dev_only';
             END IF;
+            IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'adserver_copilot') THEN
+              -- NOBYPASSRLS explicit (db/seed/dev_roles.sql header): the
+              -- copiloto's RAG reads MUST go through RLS.
+              CREATE ROLE adserver_copilot LOGIN PASSWORD 'copilot_dev_only' NOBYPASSRLS;
+            END IF;
+            IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'adserver_stats_writer') THEN
+              -- NOBYPASSRLS explicit (achado H-2): the pgsink write path
+              -- depends on stats.events_raw_tenant_isolation's WITH CHECK.
+              CREATE ROLE adserver_stats_writer LOGIN PASSWORD 'stats_writer_dev_only' NOBYPASSRLS;
+            END IF;
           END
           $$;
           SQL
@@ -92,40 +186,107 @@ jobs:
       # Migrations _up em ordem obrigatória
       # ------------------------------------------------------------------
       - name: migrations up — asset_registry
-        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f db/asset_registry/migrations/0001_asset_registry_up.sql
-
-      - name: migrations up — config (0001, 0002, 0003)
         run: |
-          for f in 0001_config_schema 0002_config_rls 0003_campaign_zones_rls; do
-            echo "  up: config/${f}"
-            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "db/config/migrations/${f}_up.sql"
+          dir="db/asset_registry/migrations"
+          files=$(ls "$dir"/*_up.sql 2>/dev/null | LC_ALL=C sort)
+          if [ -z "$files" ]; then
+            echo "ERRO: nenhuma migration *_up.sql encontrada em $dir (schema vazio ou mal formado)." >&2
+            exit 1
+          fi
+          for f in $files; do
+            echo "  up: asset_registry/$(basename "$f" _up.sql)"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
           done
 
-      - name: migrations up — ledger (0001, 0002, 0003, 0004)
+      - name: migrations up — config
         run: |
-          # 0004_ledger_postings_immutable: trigger BEFORE UPDATE/DELETE +
-          # append-only em ledger.postings (garantia da 28a onda #6). Sem ele
-          # aplicado na CI, o postings_immutability_test.sql abaixo nunca provaria
-          # a imutabilidade por-PR.
-          for f in 0001_ledger_schema 0002_reconciliation_exceptions 0003_ledger_rls 0004_ledger_postings_immutable; do
-            echo "  up: ledger/${f}"
-            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "db/ledger/migrations/${f}_up.sql"
+          dir="db/config/migrations"
+          files=$(ls "$dir"/*_up.sql 2>/dev/null | LC_ALL=C sort)
+          if [ -z "$files" ]; then
+            echo "ERRO: nenhuma migration *_up.sql encontrada em $dir (schema vazio ou mal formado)." >&2
+            exit 1
+          fi
+          for f in $files; do
+            echo "  up: config/$(basename "$f" _up.sql)"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
           done
 
-      - name: migrations up — vector (0001, 0002)
+      - name: migrations up — ledger
         run: |
-          for f in 0001_vector_schema 0002_vector_rls; do
-            echo "  up: vector/${f}"
-            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "db/vector/migrations/${f}_up.sql"
+          # A ordem/lista vem do diretório (glob + sort), não é enumerada à
+          # mão — inclui automaticamente 0004_ledger_postings_immutable
+          # (trigger BEFORE UPDATE/DELETE + append-only, garantia da 28a
+          # onda #6) e qualquer migration futura, sem editar este step.
+          dir="db/ledger/migrations"
+          files=$(ls "$dir"/*_up.sql 2>/dev/null | LC_ALL=C sort)
+          if [ -z "$files" ]; then
+            echo "ERRO: nenhuma migration *_up.sql encontrada em $dir (schema vazio ou mal formado)." >&2
+            exit 1
+          fi
+          for f in $files; do
+            echo "  up: ledger/$(basename "$f" _up.sql)"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
           done
 
-      - name: migrations up — compliance (0001)
-        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f db/compliance/migrations/0001_compliance_schema_up.sql
+      # stats (ADR-0005, perfil BETA): tabela-ponte stats.events_raw +
+      # view stats.live_kpis. A ordem segue DB_SCHEMAS em make/db.mk
+      # (asset_registry -> config -> ledger -> stats -> vector -> compliance).
+      #
+      # Este step existe porque db.yml enumera schemas À MÃO, um step por
+      # schema — um schema novo é invisível para a CI até alguém lembrar de
+      # editar aqui. É a 3ª reincidência da classe (29ª onda #10: db.yml nunca
+      # aplicava a migration 0004 do ledger; 30ª onda: os 4 runners paravam em
+      # 0003). Dentro de cada schema a enumeração JÁ é por glob; a lista de
+      # SCHEMAS é que continua manual. Ver a ressalva registrada no §5 do plano.
+      - name: migrations up — stats
+        run: |
+          dir="db/stats/migrations"
+          files=$(ls "$dir"/*_up.sql 2>/dev/null | LC_ALL=C sort)
+          if [ -z "$files" ]; then
+            echo "ERRO: nenhuma migration *_up.sql encontrada em $dir (schema vazio ou mal formado)." >&2
+            exit 1
+          fi
+          for f in $files; do
+            echo "  up: stats/$(basename "$f" _up.sql)"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
+          done
+
+      - name: migrations up — vector
+        run: |
+          dir="db/vector/migrations"
+          files=$(ls "$dir"/*_up.sql 2>/dev/null | LC_ALL=C sort)
+          if [ -z "$files" ]; then
+            echo "ERRO: nenhuma migration *_up.sql encontrada em $dir (schema vazio ou mal formado)." >&2
+            exit 1
+          fi
+          for f in $files; do
+            echo "  up: vector/$(basename "$f" _up.sql)"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
+          done
+
+      - name: migrations up — compliance
+        run: |
+          dir="db/compliance/migrations"
+          files=$(ls "$dir"/*_up.sql 2>/dev/null | LC_ALL=C sort)
+          if [ -z "$files" ]; then
+            echo "ERRO: nenhuma migration *_up.sql encontrada em $dir (schema vazio ou mal formado)." >&2
+            exit 1
+          fi
+          for f in $files; do
+            echo "  up: compliance/$(basename "$f" _up.sql)"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
+          done
 
       # ------------------------------------------------------------------
-      # Grants sobre os schemas criados pelas migrations
+      # Grants sobre os schemas criados pelas migrations.
+      #
+      # db/seed/dev_roles.sql concede config/asset_registry (loader+app) E
+      # vector_store (SELECT-only) para adserver_copilot — só é seguro chamá-lo
+      # aqui porque "migrations up — vector" já rodou acima (schema
+      # vector_store existe). Ver comentário do step "criar roles de
+      # aplicação" para o porquê de adserver_copilot já existir antes disso.
       # ------------------------------------------------------------------
-      - name: grants adserver_loader + adserver_app
+      - name: grants adserver_loader + adserver_app + adserver_copilot + adserver_stats_writer
         run: |
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f db/seed/dev_roles.sql
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q <<'SQL'
@@ -150,6 +311,23 @@ jobs:
           GRANT USAGE ON SCHEMA compliance TO adserver_loader, adserver_app;
           GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA compliance TO adserver_app;
           GRANT SELECT ON ALL TABLES IN SCHEMA compliance TO adserver_loader;
+          -- stats (ADR-0005): leitura para o BFF (adserver_app) e para o
+          -- construtor de snapshot (adserver_loader, que soma as contagens
+          -- ENTREGUES por campanha — sem este GRANT o pacing DA-4 volta a ser
+          -- inerte, degradando em silêncio).
+          GRANT USAGE ON SCHEMA stats TO adserver_loader, adserver_app;
+          GRANT SELECT ON stats.events_raw, stats.live_kpis TO adserver_loader, adserver_app;
+          GRANT EXECUTE ON FUNCTION stats.current_tenant_id() TO adserver_loader, adserver_app;
+          -- Escrita fica SÓ com a role dedicada adserver_stats_writer
+          -- (achado H-2: criada por db/seed/dev_roles.sql acima — já
+          -- rodou nesta mesma step — NÃO mais pela migration). GRANTs
+          -- comentados em db/stats/migrations/0001_stats_schema_up.sql,
+          -- executados aqui pelo mesmo motivo do bloco de adserver_app logo
+          -- acima: a migration não pode depender de um role que ela mesma
+          -- não cria mais.
+          GRANT USAGE ON SCHEMA stats TO adserver_stats_writer;
+          GRANT SELECT, INSERT ON stats.events_raw TO adserver_stats_writer;
+          GRANT EXECUTE ON FUNCTION stats.current_tenant_id() TO adserver_stats_writer;
           SQL
 
       # ------------------------------------------------------------------
@@ -178,6 +356,74 @@ jobs:
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
                -f db/ledger/tests/postings_immutability_test.sql
 
+      # ------------------------------------------------------------------
+      # Go real contra o Postgres (achado HIGH, money-ledger-guardian):
+      # ledger.RecordEntry / ledger.FinalizeEntry / ledger.RecordPayout
+      # (internal/ledger/posting.go, crypto.go) são as ÚNICAS funções que
+      # gravam journal_entries/postings em produção, mas antes desta suite
+      # nenhum teste as exercitava contra um Postgres real — o antigo
+      # ledger_test.go batia só numa reimplementação em memória
+      # (ver internal/ledger/ledger_test.go, comentário de topo). Cobre:
+      # idempotência via ON CONFLICT, transição pending->posted guardada por
+      # status, ordem de validação de asset (rejeita ANTES do INSERT) e
+      # direção dos postings de RecordPayout — as 4 mutações do achado, cada
+      # uma provada em internal/ledger/posting_integration_test.go.
+      #
+      # `make go-test-integration` deriva o escopo de pacotes a partir de
+      # quem tem arquivo `//go:build integration` (hoje só internal/ledger) —
+      # não roda a suite inteira do monorepo sob a tag. DATABASE_URL já está
+      # no env do job (mesmo Postgres, schema ledger já migrado acima).
+      - name: "go test -tags integration — internal/ledger contra Postgres real (achado HIGH)"
+        run: make go-test-integration
+
+      # ------------------------------------------------------------------
+      # DA-4 — contagens ENTREGUES chegam ao snapshot (ADR-0005).
+      #
+      # internal/configload/integration_test.go NÃO tem build tag
+      # `//go:build integration`, portanto `make go-test-integration` (que
+      # deriva o escopo por tag) NÃO o alcança — e sem as duas env vars o
+      # teste faz t.Skip(). Ou seja: sem este step, o único gate que prova
+      # que `snapshot.Campaign.DeliveredImpressions` deixou de ser
+      # constante 0 ficaria ÓRFÃO da CI e o job seguiria verde. É a mesma
+      # forma de defeito que a 29ª onda (#10) e a 30ª acharam.
+      #
+      # A SENTINELA ANTI-SKIP abaixo é o que torna este step não-tautológico:
+      # um SKIP passa a ser FALHA, não silêncio verde.
+      - name: "DA-4 — delivered counts no snapshot (anti-skip: SKIP = FALHA)"
+        env:
+          # Leitor: mesma role que o serviço de decisão usa em produção.
+          CONFIGLOAD_TEST_DSN: "postgres://adserver_loader:loader_dev_only@localhost:15432/adserver_test?sslmode=disable"
+          # Semeador: precisa ler config.campaigns E escrever stats.events_raw;
+          # nenhuma role de aplicação tem as duas (menor privilégio), então o
+          # teste semeia como admin. Isso NÃO afrouxa o que está sob teste —
+          # a leitura verificada continua sendo a do adserver_loader.
+          CONFIGLOAD_STATS_SEED_DSN: "postgres://postgres:postgres_test_only@localhost:15432/adserver_test?sslmode=disable"
+        run: |
+          set -o pipefail
+          go test -count=1 -v -run 'TestPostgresLoader_Integration_DeliveredCounts' \
+            ./internal/configload/ 2>&1 | tee /tmp/delivered.log
+          if grep -qE '^\s*--- SKIP' /tmp/delivered.log; then
+            echo "FALHOU: o teste de delivered-counts foi PULADO — as env vars não chegaram" >&2
+            echo "ao processo, ou o schema stats/os GRANTs não foram aplicados. Um SKIP aqui" >&2
+            echo "significa que o pacing DA-4 está sem gate, não que está correto." >&2
+            exit 1
+          fi
+          if ! grep -qE '^\s*--- PASS: TestPostgresLoader_Integration_DeliveredCounts' /tmp/delivered.log; then
+            echo "FALHOU: o teste não reportou PASS explicitamente (nem SKIP)." >&2
+            exit 1
+          fi
+
+      # Lado USING (leitura) da policy de stats.events_raw (achado M-2,
+      # security-reviewer). O lado WITH CHECK (escrita) já é provado por
+      # internal/telemetry/pgsink/pgsink_integration_test.go
+      # (TestIntegration_RLS_StatsWriterRoleRejectsCrossTenant, step
+      # "go test -tags integration" acima) — nenhum teste do repo exercitava
+      # o lado de leitura antes deste step.
+      - name: "RLS isolation — stats (ADR-0005 / TX-3)"
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+               -f db/stats/tests/rls_isolation_test.sql
+
       - name: "RLS isolation — vector (TX-3)"
         run: |
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
@@ -192,33 +438,110 @@ jobs:
       # Migrations _down em ordem inversa — confirma reversão limpa
       # ------------------------------------------------------------------
       - name: migrations down — compliance
-        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f db/compliance/migrations/0001_compliance_schema_down.sql
-
-      - name: migrations down — vector (0002, 0001)
         run: |
-          for f in 0002_vector_rls 0001_vector_schema; do
-            echo "  down: vector/${f}"
-            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "db/vector/migrations/${f}_down.sql"
+          dir="db/compliance/migrations"
+          files=$(ls "$dir"/*_down.sql 2>/dev/null | LC_ALL=C sort -r)
+          if [ -z "$files" ]; then
+            echo "ERRO: nenhuma migration *_down.sql encontrada em $dir (schema vazio ou mal formado)." >&2
+            exit 1
+          fi
+          for f in $files; do
+            echo "  down: compliance/$(basename "$f" _down.sql)"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
           done
 
-      - name: migrations down — ledger (0004, 0003, 0002, 0001)
+      - name: migrations down — vector
         run: |
-          # ordem inversa do _up: 0004 (imutabilidade) reverte PRIMEIRO.
-          for f in 0004_ledger_postings_immutable 0003_ledger_rls 0002_reconciliation_exceptions 0001_ledger_schema; do
-            echo "  down: ledger/${f}"
-            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "db/ledger/migrations/${f}_down.sql"
+          dir="db/vector/migrations"
+          files=$(ls "$dir"/*_down.sql 2>/dev/null | LC_ALL=C sort -r)
+          if [ -z "$files" ]; then
+            echo "ERRO: nenhuma migration *_down.sql encontrada em $dir (schema vazio ou mal formado)." >&2
+            exit 1
+          fi
+          for f in $files; do
+            echo "  down: vector/$(basename "$f" _down.sql)"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
           done
 
-      - name: migrations down — config (0003, 0002, 0001)
+      # stats desce ANTES de ledger/config — ordem inversa de DB_SCHEMAS.
+      #
+      # CORRIGIDO (achado M-3, security-reviewer — doc-lie do próprio
+      # comentário que este step carregava): o texto anterior afirmava que
+      # "o step final 'confirmar schema vazio apos reversao' só passa se o
+      # down realmente derrubar schema, view, tabela, função e a role
+      # dedicada adserver_stats_writer" — DUAS afirmações falsas, nenhuma
+      # delas verificada de fato: (1) aquele step nunca incluía 'stats' na
+      # lista de schemas checados (`WHERE schema_name IN (...)`) — passaria
+      # mesmo que o _down não derrubasse NADA; corrigido abaixo, 'stats'
+      # agora está na lista. (2) o role NUNCA é dropado pelo _down (decisão
+      # deliberada da própria migration, ver seu cabeçalho) — e desde o
+      # achado H-2 o role nem é mais CRIADO pelo _up, então a menção nem
+      # fazia sentido de qualquer forma. O que este step _down realmente
+      # garante, provado pelo step seguinte: DROP SCHEMA CASCADE remove
+      # schema, view, tabela e função — não o role (que vive fora do ciclo
+      # de vida do schema, em db/seed/dev_roles.sql).
+      - name: migrations down — stats
         run: |
-          for f in 0003_campaign_zones_rls 0002_config_rls 0001_config_schema; do
-            echo "  down: config/${f}"
-            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "db/config/migrations/${f}_down.sql"
+          dir="db/stats/migrations"
+          files=$(ls "$dir"/*_down.sql 2>/dev/null | LC_ALL=C sort -r)
+          if [ -z "$files" ]; then
+            echo "ERRO: nenhuma migration *_down.sql encontrada em $dir (schema vazio ou mal formado)." >&2
+            exit 1
+          fi
+          for f in $files; do
+            echo "  down: stats/$(basename "$f" _down.sql)"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
+          done
+
+      - name: migrations down — ledger
+        run: |
+          # Ordem inversa do _up derivada do diretório (sort -r): a
+          # migration mais recente (ex.: imutabilidade) reverte PRIMEIRO.
+          dir="db/ledger/migrations"
+          files=$(ls "$dir"/*_down.sql 2>/dev/null | LC_ALL=C sort -r)
+          if [ -z "$files" ]; then
+            echo "ERRO: nenhuma migration *_down.sql encontrada em $dir (schema vazio ou mal formado)." >&2
+            exit 1
+          fi
+          for f in $files; do
+            echo "  down: ledger/$(basename "$f" _down.sql)"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
+          done
+
+      - name: migrations down — config
+        run: |
+          dir="db/config/migrations"
+          files=$(ls "$dir"/*_down.sql 2>/dev/null | LC_ALL=C sort -r)
+          if [ -z "$files" ]; then
+            echo "ERRO: nenhuma migration *_down.sql encontrada em $dir (schema vazio ou mal formado)." >&2
+            exit 1
+          fi
+          for f in $files; do
+            echo "  down: config/$(basename "$f" _down.sql)"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
           done
 
       - name: migrations down — asset_registry
-        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f db/asset_registry/migrations/0001_asset_registry_down.sql
+        run: |
+          dir="db/asset_registry/migrations"
+          files=$(ls "$dir"/*_down.sql 2>/dev/null | LC_ALL=C sort -r)
+          if [ -z "$files" ]; then
+            echo "ERRO: nenhuma migration *_down.sql encontrada em $dir (schema vazio ou mal formado)." >&2
+            exit 1
+          fi
+          for f in $files; do
+            echo "  down: asset_registry/$(basename "$f" _down.sql)"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f "$f"
+          done
 
+      # CORRIGIDO (achado M-3, security-reviewer): 'stats' estava AUSENTE
+      # desta lista — a asserção abaixo passaria mesmo que
+      # db/stats/migrations/0001_stats_schema_down.sql não derrubasse nada.
+      # Provado por mutação (1ª mão, fora deste workflow, contra um scratch
+      # DB isolado): comentar `DROP SCHEMA IF EXISTS stats CASCADE;` no
+      # _down e rodar esta mesma query com 'stats' na lista devolve n=1 e
+      # RAISE EXCEPTION — vermelho, como esperado. Sem 'stats' na lista a
+      # mesma mutação passava em silêncio.
       - name: confirmar schema vazio apos reversao
         run: |
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -t <<'SQL'
@@ -228,7 +551,7 @@ jobs:
           BEGIN
             SELECT COUNT(*) INTO n
             FROM information_schema.schemata
-            WHERE schema_name IN ('config','ledger','vector_store','compliance','asset_registry');
+            WHERE schema_name IN ('config','ledger','vector_store','compliance','asset_registry','stats');
             IF n > 0 THEN
               RAISE EXCEPTION 'Reversão incompleta: % schema(s) ainda presentes', n;
             END IF;

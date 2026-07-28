@@ -5,9 +5,16 @@
 --   Provar que o RLS do schema config impede tenant A de ler dados de tenant B,
 --   inclusive via tabela campaign_zones (defesa-em-profundidade — 0003_up).
 --   Cobre também o caso fail-closed: sem adserver.tenant_id setado → 0 linhas.
+--   E prova o caminho de ESCRITA: WITH CHECK explícito em TODAS as policies do
+--   schema (BLOCO 5.5, catálogo pg_policy) e rejeição de INSERT/UPDATE
+--   cross-tenant em config.sites (BLOCO 6) e config.campaign_zones (BLOCO 6.5).
 --
 -- DEPENDÊNCIAS
---   - Postgres 16 com migrations 0001, 0002 e 0003 do schema config aplicadas.
+--   - Postgres 16 com migrations 0001, 0002, 0003 e 0004 do schema config
+--     aplicadas. A 0004 (WITH CHECK explícito em campaign_zones) NÃO é
+--     opcional: sem ela o BLOCO 5.5 falha, porque a policy de campaign_zones
+--     fica com pg_policy.polwithcheck NULL (isolamento de escrita apenas por
+--     fallback implícito de USING).
 --   - Usuário de aplicação (não superuser): adserver_app
 --     com GRANT SELECT, INSERT, UPDATE, DELETE em todas as tabelas do schema config.
 --   - Superuser (adserver_admin) para setup inicial e criação do role de teste.
@@ -479,45 +486,50 @@ $$;
 
 -- ===========================================================================
 -- BLOCO 5.5 — Anti-tautologia: confirma WITH CHECK EXPLICITO no catalogo
---   pg_policy, INDEPENDENTE do valor de USING.
+--   pg_policy, INDEPENDENTE do valor de USING.  DEFAULT-DENY: varre TODAS
+--   as policies de TODAS as tabelas do schema config, sem allowlist.
 --
 -- POR QUE ESTE BLOCO E NECESSARIO
---   As oito policies abaixo sao FOR ALL com USING === WITH CHECK (mesma
+--   As policies do schema config sao FOR ALL com USING === WITH CHECK (mesma
 --   expressao textual — 0002_config_rls_up.sql). Quando uma policy FOR ALL
 --   OMITE WITH CHECK, o Postgres reusa USING como verificacao de escrita EM
---   TEMPO DE EXECUCAO (o mesmo SQLSTATE 42501 observado no Bloco 6 abaixo)
---   — mas NAO grava nada em pg_policy.polwithcheck (verificado empiricamente
---   contra Postgres 16.14 nativo). Ou seja: o Bloco 6 sozinho passaria
---   IDENTICO mesmo se o WITH CHECK fosse removido da migration — e
---   tautologico em relacao a presenca do WITH CHECK. Este bloco fecha a
---   lacuna introspectando o catalogo diretamente, sem depender do
---   comportamento de fallback de USING.
+--   TEMPO DE EXECUCAO (o mesmo SQLSTATE 42501 observado nos Blocos 6 e 6.5
+--   abaixo) — mas NAO grava nada em pg_policy.polwithcheck (verificado
+--   empiricamente contra Postgres 16.14 nativo). Ou seja: os blocos de
+--   escrita sozinhos passariam IDENTICO mesmo se o WITH CHECK fosse removido
+--   da migration — sao tautologicos em relacao a PRESENCA do WITH CHECK.
+--   Este bloco fecha a lacuna introspectando o catalogo diretamente, sem
+--   depender do comportamento de fallback de USING.
 --
---   Nota: config.campaign_zones_tenant_isolation e INTENCIONALMENTE
---   USING-only (0003_campaign_zones_rls_up.sql) — tabela de juncao sem
---   tenant_id proprio, isolamento via subquery EXISTS em campaigns. Nao
---   entra nesta lista.
+-- POR QUE SEM ALLOWLIST (30a onda)
+--   A versao anterior deste bloco enumerava 8 nomes de policy e EXCLUIA
+--   explicitamente config.campaign_zones_tenant_isolation — que era, de
+--   fato, a unica USING-only do schema. Escopar um gate por allowlist de
+--   nomes significa que toda policy nova (ou renomeada) nasce FORA do gate:
+--   foi essa a classe de defeito dominante das ondas 27a-29a. Agora o
+--   criterio e DEFAULT-DENY — qualquer policy em qualquer tabela do schema
+--   config precisa de WITH CHECK explicito, inclusive as que ainda nao
+--   existem. O piso de contagem abaixo protege contra vacuidade.
 -- ===========================================================================
 
 DO $$
 DECLARE
-    v_rec     RECORD;
-    v_missing TEXT := '';
-    v_found   INT  := 0;
+    v_rec      RECORD;
+    v_missing  TEXT := '';
+    v_found    INT  := 0;
+    -- Piso de vacuidade: 8 policies de 0002 + campaign_zones (0003/0004).
+    -- Se policies forem removidas/renomeadas em massa, o loop rodaria
+    -- vazio e "passaria" sem checar nada — este piso quebra isso.
+    v_min_policies CONSTANT INT := 9;
 BEGIN
     FOR v_rec IN
-        SELECT polname, polrelid::regclass::text AS relname, polwithcheck
-        FROM pg_policy
-        WHERE polname IN (
-            'advertisers_tenant_isolation',
-            'campaigns_tenant_isolation',
-            'banners_tenant_isolation',
-            'sites_tenant_isolation',
-            'zones_tenant_isolation',
-            'delivery_rule_sets_tenant_isolation',
-            'delivery_rules_tenant_isolation',
-            'caps_tenant_isolation'
-        )
+        SELECT p.polname,
+               p.polrelid::regclass::text AS relname,
+               p.polwithcheck
+        FROM   pg_policy   p
+        JOIN   pg_class    c ON c.oid = p.polrelid
+        JOIN   pg_namespace n ON n.oid = c.relnamespace
+        WHERE  n.nspname = 'config'
     LOOP
         v_found := v_found + 1;
         IF v_rec.polwithcheck IS NULL THEN
@@ -525,10 +537,12 @@ BEGIN
         END IF;
     END LOOP;
 
-    -- Guarda contra falso-positivo por vacuidade: se as policies fossem
-    -- renomeadas/removidas, a query acima retornaria 0 linhas e o loop
-    -- "passaria" sem checar nada. Exige encontrar exatamente as 8 esperadas.
-    PERFORM pg_temp.assert_count('pg_policy: 8 policies do config encontradas', v_found::bigint, 8::bigint);
+    IF v_found < v_min_policies THEN
+        RAISE EXCEPTION
+            'ASSERT FALHOU [pg_policy vacuo]: schema config tem % policies, esperado >= % '
+            '(policies sumiram, ou o schema nao foi migrado)',
+            v_found, v_min_policies;
+    END IF;
 
     IF v_missing <> '' THEN
         RAISE EXCEPTION
@@ -536,7 +550,9 @@ BEGIN
             v_missing;
     END IF;
 
-    RAISE NOTICE 'PASS [pg_policy.polwithcheck NOT NULL nas 8 policies do config — WITH CHECK explicito, independente de USING]';
+    RAISE NOTICE
+        'PASS [pg_policy.polwithcheck NOT NULL em TODAS as % policies do schema config — WITH CHECK explicito, independente de USING]',
+        v_found;
 END;
 $$;
 
@@ -575,6 +591,131 @@ BEGIN
             'ASSERT FALHOU [WITH CHECK UPDATE]: UPDATE tenant-flip A→B ACEITO (esperado 42501)';
     EXCEPTION WHEN insufficient_privilege THEN
         RAISE NOTICE 'PASS [WITH CHECK: UPDATE tenant-flip (A→B) rejeitado]: SQLSTATE=%', SQLSTATE;
+    END;
+
+    RESET ROLE;
+END;
+$$;
+
+
+-- ===========================================================================
+-- BLOCO 6.5 — WITH CHECK de config.campaign_zones: o banco REJEITA ESCRITA
+--   cross-tenant no vínculo N:N (achado HIGH
+--   `campaign-zones-with-check-write-path-untested`, 30a onda).
+--
+-- POR QUE ESTE BLOCO E NECESSARIO
+--   Ate a 30a onda, NENHUM teste executavel do repo tentava INSERT/UPDATE em
+--   config.campaign_zones com campaign_id ou zone_id de outro tenant. O
+--   BLOCO 6 (unico teste de escrita cross-tenant do arquivo) exercita apenas
+--   config.sites. Os BLOCOS 1-5 so fazem SELECT — e WITH CHECK nao afeta
+--   SELECT. Resultado: um `WITH CHECK (true)` acidental na policy de
+--   campaign_zones abriria um vazamento de ESCRITA cross-tenant (advertiser
+--   do tenant A vinculando campanha a inventario alheio, corrompendo
+--   veiculacao e faturamento) com o arquivo inteiro 100% verde.
+--
+-- CONTROLE POSITIVO (anti-tautologia)
+--   `permission denied for table` tambem levanta SQLSTATE 42501. Se o role
+--   adserver_app simplesmente NAO tivesse INSERT/UPDATE em campaign_zones,
+--   todas as rejeicoes abaixo passariam sem que policy alguma fosse
+--   avaliada. Por isso 6.5a/6.5b provam PRIMEIRO que a escrita legitima
+--   (mesmo tenant nos dois lados) e ACEITA.
+-- ===========================================================================
+
+DO $$
+DECLARE
+    v_camp_a   BIGINT;
+    v_camp_b   BIGINT;
+    v_zone_a   BIGINT;
+    v_zone_b   BIGINT;
+    v_rows     BIGINT;
+BEGIN
+    -- Ids das fixtures, lidos ainda como superuser (bypass RLS).
+    SELECT id INTO STRICT v_camp_a FROM config.campaigns WHERE name = 'Campaign A CPM';
+    SELECT id INTO STRICT v_camp_b FROM config.campaigns WHERE name = 'Campaign B CPC';
+    SELECT id INTO STRICT v_zone_a FROM config.zones     WHERE name = 'Zone A 728x90';
+    SELECT id INTO STRICT v_zone_b FROM config.zones     WHERE name = 'Zone B 300x250';
+
+    SET LOCAL ROLE adserver_app;
+    SET LOCAL adserver.tenant_id = 'aaaaaaaa-0000-0000-0000-000000000001';
+
+    -- ---------------------------------------------------------------------
+    -- CONTROLE POSITIVO: escrita legitima (campanha A + zona A) e ACEITA
+    -- ---------------------------------------------------------------------
+
+    -- 6.5a. UPDATE same-tenant (auto-atribuicao) atinge a linha visivel de A.
+    UPDATE config.campaign_zones SET zone_id = v_zone_a
+    WHERE  campaign_id = v_camp_a;
+    GET DIAGNOSTICS v_rows = ROW_COUNT;
+    PERFORM pg_temp.assert_count(
+        'controle positivo: UPDATE same-tenant em campaign_zones aceito', v_rows, 1);
+
+    -- 6.5b. DELETE + re-INSERT do proprio vinculo (A↔A) e ACEITO.
+    --       Prova que adserver_app TEM privilegio de INSERT/DELETE na tabela
+    --       — logo os 42501 dos sub-blocos seguintes vem da POLICY, nao de
+    --       falta de GRANT.
+    DELETE FROM config.campaign_zones WHERE campaign_id = v_camp_a;
+    GET DIAGNOSTICS v_rows = ROW_COUNT;
+    PERFORM pg_temp.assert_count(
+        'controle positivo: DELETE same-tenant em campaign_zones aceito', v_rows, 1);
+
+    INSERT INTO config.campaign_zones (campaign_id, zone_id)
+    VALUES (v_camp_a, v_zone_a);
+    GET DIAGNOSTICS v_rows = ROW_COUNT;
+    PERFORM pg_temp.assert_count(
+        'controle positivo: INSERT same-tenant em campaign_zones aceito', v_rows, 1);
+
+    -- ---------------------------------------------------------------------
+    -- NEGATIVOS: toda combinacao que toca o outro tenant e REJEITADA (42501)
+    -- ---------------------------------------------------------------------
+
+    -- NOTA: nao ha sub-bloco "INSERT (campanha B, zona B)". O unico par
+    -- B↔B possivel com as fixtures ja EXISTE (criado no setup), entao sob uma
+    -- policy permissiva o INSERT abortaria com unique_violation em
+    -- campaign_zones_pk ANTES de a policy ser avaliada — a rejeicao viria da
+    -- constraint, nao do RLS, e o sub-bloco seria tautologico. Os pares
+    -- cruzados 6.5c/6.5d (e os UPDATEs 6.5e/6.5f) sao inexistentes nas
+    -- fixtures e cobrem as DUAS pernas do WITH CHECK (campaign_id e zone_id).
+
+    -- 6.5c. INSERT da campanha PROPRIA (A) numa zona ALHEIA (B) — sequestro
+    --       de inventario. O USING-only de 0003 so valida o lado campanha;
+    --       so o WITH CHECK explicito de 0004 (perna EXISTS em zones) pega.
+    BEGIN
+        INSERT INTO config.campaign_zones (campaign_id, zone_id)
+        VALUES (v_camp_a, v_zone_b);
+        RAISE EXCEPTION
+            'ASSERT FALHOU [WITH CHECK campaign_zones INSERT A↔B]: campanha propria em zona ALHEIA ACEITA (esperado 42501)';
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE NOTICE 'PASS [WITH CHECK campaign_zones: INSERT (campanha A, zona B ALHEIA) rejeitado]: SQLSTATE=%', SQLSTATE;
+    END;
+
+    -- 6.5d. INSERT de campanha ALHEIA (B) na zona propria (A).
+    BEGIN
+        INSERT INTO config.campaign_zones (campaign_id, zone_id)
+        VALUES (v_camp_b, v_zone_a);
+        RAISE EXCEPTION
+            'ASSERT FALHOU [WITH CHECK campaign_zones INSERT B↔A]: campanha ALHEIA em zona propria ACEITA (esperado 42501)';
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE NOTICE 'PASS [WITH CHECK campaign_zones: INSERT (campanha B ALHEIA, zona A) rejeitado]: SQLSTATE=%', SQLSTATE;
+    END;
+
+    -- 6.5e. UPDATE movendo o vinculo proprio para a campanha do tenant B.
+    BEGIN
+        UPDATE config.campaign_zones SET campaign_id = v_camp_b
+        WHERE  campaign_id = v_camp_a;
+        RAISE EXCEPTION
+            'ASSERT FALHOU [WITH CHECK campaign_zones UPDATE campaign_id A→B]: ACEITO (esperado 42501)';
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE NOTICE 'PASS [WITH CHECK campaign_zones: UPDATE campaign_id A→B rejeitado]: SQLSTATE=%', SQLSTATE;
+    END;
+
+    -- 6.5f. UPDATE apontando o vinculo proprio para a zona do tenant B.
+    BEGIN
+        UPDATE config.campaign_zones SET zone_id = v_zone_b
+        WHERE  campaign_id = v_camp_a;
+        RAISE EXCEPTION
+            'ASSERT FALHOU [WITH CHECK campaign_zones UPDATE zone_id A→B]: ACEITO (esperado 42501)';
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE NOTICE 'PASS [WITH CHECK campaign_zones: UPDATE zone_id A→B rejeitado]: SQLSTATE=%', SQLSTATE;
     END;
 
     RESET ROLE;

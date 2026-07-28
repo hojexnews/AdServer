@@ -43,6 +43,9 @@ DEFAULT_DIR = os.path.dirname(os.path.abspath(__file__))
 PATH_BLOCK_RE = re.compile(r'path\s+"([^"]+)"\s*\{(.*?)\}', re.DOTALL)
 CAPS_RE = re.compile(r'capabilities\s*=\s*\[([^\]]*)\]', re.DOTALL)
 
+# Comparação normalizada (case-insensitive) -- ver regras 2/3 abaixo:
+# "Sudo"/"SUDO" são a mesma capability proibida que "sudo", apenas com
+# capitalização diferente na declaração HCL (achado #11, auditoria bundle F).
 FORBIDDEN_CAPABILITIES = {"sudo", "*"}
 
 
@@ -101,7 +104,10 @@ def check_file(path, own_cell, other_cells, errors):
         if caps_match:
             caps = parse_capabilities(caps_match.group(1))
             for cap in caps:
-                if cap in FORBIDDEN_CAPABILITIES:
+                # Normaliza antes de comparar: capitalização não muda a
+                # semântica da capability no Vault/OpenBao ("Sudo"/"SUDO"
+                # é a mesma capability perigosa que "sudo").
+                if cap.strip().lower() in FORBIDDEN_CAPABILITIES:
                     errors.append(
                         f'{path}: path "{path_value}" declara capability '
                         f'"{cap}" -- excessiva/proibida (menor privilegio)'

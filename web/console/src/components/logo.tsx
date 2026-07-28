@@ -43,7 +43,7 @@ export function Logo({
         priority
       />
       {showWordmark && (
-        <span className="whitespace-nowrap text-base font-semibold text-brand-700">
+        <span className="whitespace-nowrap text-base font-semibold text-brand-700 dark:text-brand-300">
           {wordmark}
         </span>
       )}

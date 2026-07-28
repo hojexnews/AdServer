@@ -52,7 +52,7 @@ export default function AdvertisersPage() {
   return (
     <div>
       <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold text-gray-900">Anunciantes</h1>
+        <h1 className="text-2xl font-bold text-foreground">Anunciantes</h1>
         <button
           onClick={() => setShowForm((v) => !v)}
           className="rounded-md bg-brand-600 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-700 focus-visible:ring-2 focus-visible:ring-brand-500"
@@ -66,12 +66,12 @@ export default function AdvertisersPage() {
           onSubmit={handleSubmit((v) => void create.mutate(v))}
           aria-label="Criar anunciante"
           noValidate
-          className="mt-4 space-y-4 rounded-lg border border-gray-200 bg-white p-6"
+          className="mt-4 space-y-4 rounded-lg border border-border bg-card p-6"
         >
-          <h2 className="font-semibold text-gray-800">Novo anunciante</h2>
+          <h2 className="font-semibold text-foreground">Novo anunciante</h2>
 
           <div>
-            <label htmlFor="name" className="block text-sm font-medium text-gray-700">
+            <label htmlFor="name" className="block text-sm font-medium text-foreground">
               Nome
             </label>
             <input
@@ -79,17 +79,17 @@ export default function AdvertisersPage() {
               type="text"
               {...register("name")}
               aria-describedby={errors.name ? "name-err" : undefined}
-              className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-500"
+              className="mt-1 w-full rounded-md border border-border px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-500"
             />
             {errors.name && (
-              <p id="name-err" role="alert" className="mt-1 text-xs text-red-600">
+              <p id="name-err" role="alert" className="mt-1 text-xs text-red-600 dark:text-red-300">
                 {errors.name.message}
               </p>
             )}
           </div>
 
           <div>
-            <label htmlFor="loginUsername" className="block text-sm font-medium text-gray-700">
+            <label htmlFor="loginUsername" className="block text-sm font-medium text-foreground">
               Username (login)
             </label>
             <input
@@ -98,17 +98,17 @@ export default function AdvertisersPage() {
               autoComplete="off"
               {...register("loginUsername")}
               aria-describedby={errors.loginUsername ? "username-err" : undefined}
-              className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-500"
+              className="mt-1 w-full rounded-md border border-border px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-500"
             />
             {errors.loginUsername && (
-              <p id="username-err" role="alert" className="mt-1 text-xs text-red-600">
+              <p id="username-err" role="alert" className="mt-1 text-xs text-red-600 dark:text-red-300">
                 {errors.loginUsername.message}
               </p>
             )}
           </div>
 
           <div>
-            <label htmlFor="loginPassword" className="block text-sm font-medium text-gray-700">
+            <label htmlFor="loginPassword" className="block text-sm font-medium text-foreground">
               Senha
             </label>
             <input
@@ -117,10 +117,10 @@ export default function AdvertisersPage() {
               autoComplete="new-password"
               {...register("loginPassword")}
               aria-describedby={errors.loginPassword ? "pass-err" : undefined}
-              className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-500"
+              className="mt-1 w-full rounded-md border border-border px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-brand-500"
             />
             {errors.loginPassword && (
-              <p id="pass-err" role="alert" className="mt-1 text-xs text-red-600">
+              <p id="pass-err" role="alert" className="mt-1 text-xs text-red-600 dark:text-red-300">
                 {errors.loginPassword.message}
               </p>
             )}
@@ -131,9 +131,9 @@ export default function AdvertisersPage() {
               id="isNetwork"
               type="checkbox"
               {...register("isNetwork")}
-              className="h-4 w-4 rounded border-gray-300 text-brand-600 focus-visible:ring-2 focus-visible:ring-brand-500"
+              className="h-4 w-4 rounded border-border text-brand-600 focus-visible:ring-2 focus-visible:ring-brand-500"
             />
-            <label htmlFor="isNetwork" className="text-sm text-gray-700">
+            <label htmlFor="isNetwork" className="text-sm text-foreground">
               Ad network (não cliente direto)
             </label>
           </div>
@@ -154,7 +154,7 @@ export default function AdvertisersPage() {
             <button
               type="button"
               onClick={() => { setShowForm(false); reset(); }}
-              className="rounded-md border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 focus-visible:ring-2 focus-visible:ring-brand-500"
+              className="rounded-md border border-border px-4 py-2 text-sm font-medium text-foreground hover:bg-muted focus-visible:ring-2 focus-visible:ring-brand-500"
             >
               Cancelar
             </button>
@@ -170,27 +170,27 @@ export default function AdvertisersPage() {
           />
         ) : (
           <table
-            className="w-full border-collapse rounded-lg border border-gray-200 bg-white text-sm"
+            className="w-full border-collapse rounded-lg border border-border bg-card text-sm"
             aria-label="Lista de anunciantes"
           >
             <thead>
-              <tr className="border-b border-gray-200 bg-gray-50">
-                <th scope="col" className="px-4 py-3 text-left font-semibold text-gray-700">ID</th>
-                <th scope="col" className="px-4 py-3 text-left font-semibold text-gray-700">Nome</th>
-                <th scope="col" className="px-4 py-3 text-left font-semibold text-gray-700">Username</th>
-                <th scope="col" className="px-4 py-3 text-left font-semibold text-gray-700">Network</th>
-                <th scope="col" className="px-4 py-3 text-left font-semibold text-gray-700">Ativo</th>
-                <th scope="col" className="px-4 py-3 text-left font-semibold text-gray-700">
+              <tr className="border-b border-border bg-muted">
+                <th scope="col" className="px-4 py-3 text-left font-semibold text-foreground">ID</th>
+                <th scope="col" className="px-4 py-3 text-left font-semibold text-foreground">Nome</th>
+                <th scope="col" className="px-4 py-3 text-left font-semibold text-foreground">Username</th>
+                <th scope="col" className="px-4 py-3 text-left font-semibold text-foreground">Network</th>
+                <th scope="col" className="px-4 py-3 text-left font-semibold text-foreground">Ativo</th>
+                <th scope="col" className="px-4 py-3 text-left font-semibold text-foreground">
                   <span className="sr-only">Ações</span>
                 </th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-gray-100">
+            <tbody className="divide-y divide-border">
               {data?.map((adv) => (
-                <tr key={adv.id} className="hover:bg-gray-50">
-                  <td className="px-4 py-3 font-mono text-xs text-gray-500">{adv.id}</td>
-                  <td className="px-4 py-3 font-medium text-gray-900">{adv.name}</td>
-                  <td className="px-4 py-3 text-gray-600">{adv.loginUsername}</td>
+                <tr key={adv.id} className="hover:bg-muted">
+                  <td className="px-4 py-3 font-mono text-xs text-muted-foreground">{adv.id}</td>
+                  <td className="px-4 py-3 font-medium text-foreground">{adv.name}</td>
+                  <td className="px-4 py-3 text-muted-foreground">{adv.loginUsername}</td>
                   <td className="px-4 py-3">
                     <span aria-label={adv.isNetwork ? "Sim" : "Não"}>
                       {adv.isNetwork ? "Sim" : "Não"}
@@ -200,8 +200,8 @@ export default function AdvertisersPage() {
                     <span
                       className={`inline-flex rounded-full px-2 py-0.5 text-xs font-medium ${
                         adv.active
-                          ? "bg-green-100 text-green-800"
-                          : "bg-gray-100 text-gray-600"
+                          ? "bg-green-100 text-green-800 dark:bg-green-500/15 dark:text-green-200"
+                          : "bg-muted text-muted-foreground"
                       }`}
                     >
                       {adv.active ? "Ativo" : "Inativo"}
@@ -212,7 +212,7 @@ export default function AdvertisersPage() {
                       onClick={() => void del.mutate({ id: adv.id })}
                       disabled={del.isPending}
                       aria-label={`Excluir anunciante ${adv.name}`}
-                      className="text-xs text-red-600 hover:text-red-800 focus-visible:ring-2 focus-visible:ring-red-500 disabled:opacity-50"
+                      className="text-xs text-red-600 dark:text-red-300 hover:text-red-800 dark:hover:text-red-200 focus-visible:ring-2 focus-visible:ring-red-500 disabled:opacity-50"
                     >
                       Excluir
                     </button>

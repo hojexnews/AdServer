@@ -78,6 +78,21 @@
 // gets rejected by the database, not just by application code) at the cost
 // of one extra round trip per event — acceptable at beta traffic volumes.
 //
+// WHAT THIS DOES NOT GUARANTEE (achado H-1b, security-reviewer): both the
+// GUC value passed to set_config and ev.tenantID written into the row come
+// from the EXACT SAME untrusted source — the collector's unauthenticated
+// `?tid=` query parameter (services/collector/cmd/collector/main.go). An
+// attacker who controls that query string controls both sides of the WITH
+// CHECK comparison equally and satisfies it trivially with any
+// syntactically-valid tenant_id. The policy proves INTERNAL CONSISTENCY (the
+// GUC this transaction announced and the row it writes never diverge — a
+// bug in a future write path that computed the two from different sources
+// would be caught here), never AUTHENTICITY of the tenant against a
+// malicious caller. The correct control for that separate threat is a
+// data-side mitigation (filtering by a trustworthy tenant signal downstream,
+// in the aggregator/consumer) owned elsewhere and already in progress — not
+// reinvented in this package.
+//
 // # CA-6 (blank impressions are never billable)
 //
 // billable/blank arrive as parameters ALREADY computed by the single
@@ -106,14 +121,17 @@ package pgsink
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	commonv1 "github.com/hojex/adserver/gen/go/adserver/common/v1"
@@ -149,6 +167,32 @@ const insertEventSQL = `
 // doc "Multi-tenant RLS on the write path").
 const setTenantGUCSQL = `SELECT set_config('adserver.tenant_id', $1, true)`
 
+// tenantIDPattern matches a canonical (dashed, 8-4-4-4-12 hex) UUID, case
+// insensitive. stats.events_raw.tenant_id is `UUID NOT NULL` under FORCE RLS
+// (db/stats/migrations/0001_stats_schema_up.sql) — every value that reaches
+// this package's Emit* methods comes from an unauthenticated,
+// unvalidated collector query parameter (`?tid=`, see package doc
+// "Privacy"/"Multi-tenant RLS"). Validating the SHAPE here, before ever
+// enqueueing, is what achado M-1 (security-reviewer) requires: without it,
+// EmitImpression/EmitClick/EmitConversion enqueue any string, the worker's
+// single goroutine burns a BEGIN+set_config+INSERT (and a Warn log) per
+// malformed event, and an attacker who floods /lg with a garbage `tid` fills
+// the 8192-deep queue and crowds out legitimate events (denial-of-service on
+// the shared worker). This is intentionally stricter than what Postgres'
+// own ::uuid cast accepts (which also tolerates braces, no dashes, etc.) —
+// every tenant_id actually produced by config.advertisers.tenant_id
+// (gen_random_uuid()) is already in this canonical form, so the stricter
+// check costs nothing on the legitimate path and closes the DoS/log-spam
+// vector on the adversarial one.
+var tenantIDPattern = regexp.MustCompile(
+	`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// isValidTenantID reports whether s is shaped like a canonical UUID. Pure,
+// unit-testable without a database (see TestIsValidTenantID_Matrix).
+func isValidTenantID(s string) bool {
+	return tenantIDPattern.MatchString(s)
+}
+
 // pendingEvent is the internal, sink-agnostic representation enqueued by
 // every Emit* method and consumed by the background worker.
 type pendingEvent struct {
@@ -162,8 +206,8 @@ type pendingEvent struct {
 	// (AdRequest, which precedes campaign selection) or an unparsable cid
 	// query parameter (parseCampaignID). A row with campaignID=nil is still
 	// persisted (audit trail), never silently dropped.
-	campaignID *int64
-	bannerID   string
+	campaignID            *int64
+	bannerID              string
 	zoneID                string
 	decisionID            string
 	modelVersion          string
@@ -208,10 +252,21 @@ type PostgresSink struct {
 	writeErrors      atomic.Uint64 // Postgres write failures (event lost, not a duplicate)
 	ca6Clamped       atomic.Uint64 // defensive blank&&billable clamps (should stay 0)
 	skippedNoTenant  atomic.Uint64 // ad_request sem tenant (caso NORMAL — ver EmitAdRequest)
+	// invalidTenantID: achado M-1 (security-reviewer). tenant_id NÃO VAZIO
+	// mas que não tem forma de UUID, em QUALQUER um dos quatro Emit* — nunca
+	// um caminho normal (diferente de skippedNoTenant), sempre descartado
+	// ANTES de enfileirar. Ver isValidTenantID.
+	invalidTenantID atomic.Uint64
 
 	// logSkipOnce garante UM log para o descarte de ad_request sem tenant.
 	// Sem isso seria um WARN por requisicao no evento mais frequente do funil.
 	logSkipOnce sync.Once
+	// logInvalidTenantOnce garante UM log para o descarte de tenant_id
+	// malformado (mesmo motivo de logSkipOnce, e — achado MEDIUM-3,
+	// privacy-compliance-auditor — para nunca ecoar o valor bruto recebido
+	// de um `?tid=` não autenticado no log; a mensagem abaixo carrega só
+	// event_type e contadores, nunca o texto malformado em si).
+	logInvalidTenantOnce sync.Once
 }
 
 // New opens the Postgres pool, verifies connectivity (fail fast at
@@ -289,12 +344,58 @@ func (s *PostgresSink) WriteErrorCount() uint64 { return s.writeErrors.Load() }
 func (s *PostgresSink) CA6ClampedCount() uint64 { return s.ca6Clamped.Load() }
 
 // SkippedNoTenantCount returns the number of ad_request events discarded
-// because no tenant_id was available. This is the EXPECTED path for the
-// canonical ad tag (`/asyncjs?zoneid=NNNN`, no `?tid=`) — a non-zero value is
-// normal, not an incident. It exists so the gap is observable instead of
-// silent, and so a reader can tell "requests = 0 because nothing was
-// attributable" from "requests = 0 because nothing happened".
+// because no tenant_id was available (empty string). This is the EXPECTED
+// path for the canonical ad tag (`/asyncjs?zoneid=NNNN`, no `?tid=`) — a
+// non-zero value is normal, not an incident. It exists so the gap is
+// observable instead of silent, and so a reader can tell "requests = 0
+// because nothing was attributable" from "requests = 0 because nothing
+// happened". A non-EMPTY but malformed tenant_id is a DIFFERENT case — see
+// InvalidTenantIDCount.
 func (s *PostgresSink) SkippedNoTenantCount() uint64 { return s.skippedNoTenant.Load() }
+
+// InvalidTenantIDCount returns the number of events (across all four Emit*
+// methods) discarded because tenant_id was non-empty but not shaped like a
+// UUID (achado M-1, security-reviewer). Unlike SkippedNoTenantCount, this is
+// NEVER a normal/expected path for any endpoint: production code only ever
+// hands this package a tenant_id that is either empty (unresolved, see
+// SkippedNoTenantCount) or a canonical UUID sourced from
+// config.advertisers.tenant_id. A non-zero value here means something
+// downstream is sending a value that could not have come from that source —
+// a malformed/adversarial `?tid=` on an unauthenticated collector endpoint,
+// or a code regression. A sustained non-zero rate is worth investigating,
+// not silently tolerated.
+func (s *PostgresSink) InvalidTenantIDCount() uint64 { return s.invalidTenantID.Load() }
+
+// rejectInvalidTenant validates tenantID's SHAPE (isValidTenantID) and, if it
+// is not a canonical UUID, counts the rejection and — at most once per
+// process lifetime — logs it, then returns true (caller must not enqueue).
+// Empty string is ALSO rejected here (fails the UUID pattern); EmitAdRequest
+// special-cases empty separately BEFORE calling this, because an empty
+// tenant_id is that event type's normal/expected path (see
+// SkippedNoTenantCount) — everything that reaches this function is either a
+// genuinely malformed tenant_id, or (for Impression/Click/Conversion) an
+// empty one, which is NOT expected for those three event types.
+//
+// The log line NEVER includes tenantID (achado MEDIUM-3,
+// privacy-compliance-auditor): every value that reaches this package comes
+// from an unauthenticated `?tid=` collector query parameter that a
+// third party fully controls and could shape as an email address, a phone
+// number, or other free text — echoing it into the process log would put
+// that text outside the OTel redaction boundary. Counting via
+// InvalidTenantIDCount is the observable signal instead.
+func (s *PostgresSink) rejectInvalidTenant(eventType, tenantID string) bool {
+	if isValidTenantID(tenantID) {
+		return false
+	}
+	s.invalidTenantID.Add(1)
+	s.logInvalidTenantOnce.Do(func() {
+		s.logger.Warn("pgsink: tenant_id invalido (nao tem forma de UUID) — evento descartado antes de "+
+			"enfileirar; nunca ecoado aqui (TX-5/DA-11, achado MEDIUM-3) — ver InvalidTenantIDCount para o "+
+			"contador acumulado; log emitido uma unica vez por processo",
+			"event_type", eventType)
+	})
+	return true
+}
 
 // ---------------------------------------------------------------------------
 // EventSink methods — signatures match services/collector/cmd/collector/
@@ -306,12 +407,25 @@ func (s *PostgresSink) SkippedNoTenantCount() uint64 { return s.skippedNoTenant.
 //
 // billable/blank are NOT recomputed here — see package doc "CA-6". This
 // method only defends against the two arriving contradictory.
+//
+// tenantID is validated (isValidTenantID) BEFORE anything else, including
+// the CA-6 clamp-violation log below — achado M-1 (security-reviewer): an
+// unauthenticated `/lg` hit with a malformed `tid` used to enqueue anyway,
+// costing the single background worker a BEGIN+set_config+INSERT (and a Warn
+// log) per event, which an attacker could use to flood the shared 8192-deep
+// queue and crowd out legitimate events. Validating first also guarantees
+// that by the time tenantID reaches the "tenant_id" log field below, it is
+// always a well-formed UUID — never third-party-controlled free text
+// (achado MEDIUM-3, privacy-compliance-auditor).
 func (s *PostgresSink) EmitImpression(
 	tenantID, campaignID, bannerID, zoneID string,
 	servedTier commonv1.ServedTier,
 	billable, blank bool,
 	decisionID, modelVersion string,
 ) {
+	if s.rejectInvalidTenant(eventTypeImpression, tenantID) {
+		return
+	}
 	clamped, violated := clampBillable(blank, billable)
 	if violated {
 		s.ca6Clamped.Add(1)
@@ -335,10 +449,15 @@ func (s *PostgresSink) EmitImpression(
 }
 
 // EmitClick persists a Click event (ck endpoint — CA-6).
+//
+// tenantID is validated FIRST — see EmitImpression's doc comment (achado M-1).
 func (s *PostgresSink) EmitClick(
 	tenantID, campaignID, bannerID, zoneID, destURL string,
 	decisionID, modelVersion string,
 ) {
+	if s.rejectInvalidTenant(eventTypeClick, tenantID) {
+		return
+	}
 	s.enqueue(pendingEvent{
 		eventID:      telemetry.NewULID(),
 		eventType:    eventTypeClick,
@@ -360,11 +479,16 @@ func (s *PostgresSink) EmitClick(
 // column at all (see db/stats/migrations/0001_stats_schema_up.sql header:
 // "prefira NÃO ter dinheiro nesta tabela"). Money flows through
 // internal/ledger, never through stats.
+//
+// tenantID is validated FIRST — see EmitImpression's doc comment (achado M-1).
 func (s *PostgresSink) EmitConversion(
 	tenantID, campaignID, bannerID string,
 	attributionDecisionID string,
 	decisionID, modelVersion string,
 ) {
+	if s.rejectInvalidTenant(eventTypeConversion, tenantID) {
+		return
+	}
 	s.enqueue(pendingEvent{
 		eventID:               telemetry.NewULID(),
 		eventType:             eventTypeConversion,
@@ -418,6 +542,14 @@ func (s *PostgresSink) EmitConversion(
 // 0 para publishers cuja tag não carrega `tid` — que é por que o BFF devolve
 // `null` (não atribuível) em requests/inventoryLoss em vez de um número. Uma
 // tag que inclua `tid` passa a alimentar o KPI sem mudança alguma aqui.
+//
+// UM SEGUNDO CASO, DISTINTO (achado M-1, security-reviewer): tenantID
+// NÃO-VAZIO mas malformado (não é UUID) — por exemplo um `?tid=` forjado por
+// um chamador direto de `/asyncjs` (endpoint não autenticado). Esse caso NÃO
+// é normal (ao contrário do tenantID vazio acima) e é contabilizado
+// separadamente em InvalidTenantIDCount via rejectInvalidTenant, na MESMA
+// forma (descarte antes de enfileirar, log único, contador dedicado) usada
+// pelos outros três Emit* — ver rejectInvalidTenant e EmitImpression.
 func (s *PostgresSink) EmitAdRequest(
 	tenantID, zoneID, _ string,
 	_ *commonv1.Geo,
@@ -433,6 +565,9 @@ func (s *PostgresSink) EmitAdRequest(
 				"o BFF reporta null (não atribuível). Log emitido uma única vez.",
 				"zone_id", zoneID)
 		})
+		return
+	}
+	if s.rejectInvalidTenant(eventTypeAdRequest, tenantID) {
 		return
 	}
 	s.enqueue(pendingEvent{
@@ -534,6 +669,29 @@ func (s *PostgresSink) drainLoop() {
 	}
 }
 
+// sanitizedWriteErr reduces a Postgres write error to a form that is SAFE to
+// log — the SQLSTATE code, never the driver's full error text (achado
+// MEDIUM-3, privacy-compliance-auditor). Postgres routinely echoes the
+// OFFENDING VALUE verbatim in error messages for type-cast failures (e.g.
+// `invalid input syntax for type uuid: "victim@example.com"`, SQLSTATE
+// 22P02) and CHECK-constraint violations. Every free-text field that reaches
+// write()'s caller (tenant_id, banner_id, zone_id, decision_id,
+// model_version, dest_url, attribution_decision_id) originates from an
+// unauthenticated, unvalidated collector query parameter (see package doc
+// "Privacy") — logging err.Error() verbatim on a failed INSERT would put
+// third-party-controlled, potentially PII-shaped text into the process log,
+// outside the OTel redaction boundary. A non-Postgres error (connection
+// refused, timeout, context deadline) carries no attacker-controlled row
+// content, so its message is logged as-is — it is diagnostic infrastructure
+// information, not user input.
+func sanitizedWriteErr(err error) string {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return fmt.Sprintf("postgres sqlstate=%s", pgErr.Code)
+	}
+	return err.Error()
+}
+
 // write persists a single event in its own transaction: BEGIN; scope the
 // RLS tenant GUC; INSERT ... ON CONFLICT DO NOTHING; COMMIT. See package doc
 // "Multi-tenant RLS on the write path" for why this is one transaction per
@@ -552,14 +710,14 @@ func (s *PostgresSink) write(ev pendingEvent) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		s.writeErrors.Add(1)
-		s.logger.Warn("pgsink: begin tx failed", "err", err)
+		s.logger.Warn("pgsink: begin tx failed", "err", sanitizedWriteErr(err))
 		return
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // best-effort; no-op after Commit
 
 	if _, err := tx.Exec(ctx, setTenantGUCSQL, ev.tenantID); err != nil {
 		s.writeErrors.Add(1)
-		s.logger.Warn("pgsink: set tenant GUC failed", "err", err)
+		s.logger.Warn("pgsink: set tenant GUC failed", "err", sanitizedWriteErr(err))
 		return
 	}
 
@@ -569,13 +727,17 @@ func (s *PostgresSink) write(ev pendingEvent) {
 		ev.destURL, ev.attributionDecisionID, ev.occurredAt,
 	); err != nil {
 		s.writeErrors.Add(1)
-		s.logger.Warn("pgsink: insert failed", "event_type", ev.eventType, "event_id", ev.eventID, "err", err)
+		// event_id/event_type only — never err.Error() unsanitized (achado
+		// MEDIUM-3): this INSERT carries the row's free-text fields, and a
+		// type-cast/CHECK failure echoes the offending value in err's text.
+		s.logger.Warn("pgsink: insert failed", "event_type", ev.eventType, "event_id", ev.eventID,
+			"err", sanitizedWriteErr(err))
 		return
 	}
 
 	if err := tx.Commit(ctx); err != nil {
 		s.writeErrors.Add(1)
-		s.logger.Warn("pgsink: commit failed", "err", err)
+		s.logger.Warn("pgsink: commit failed", "err", sanitizedWriteErr(err))
 		return
 	}
 }

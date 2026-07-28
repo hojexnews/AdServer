@@ -14,11 +14,11 @@ import { ChatPanel } from "@/components/copilot/chat-panel";
 export default function CopilotPage() {
   return (
     <div className="flex h-full flex-col">
-      <div className="border-b border-gray-200 pb-4">
-        <h1 className="text-2xl font-bold text-gray-900">
+      <div className="border-b border-border pb-4">
+        <h1 className="text-2xl font-bold text-foreground">
           Copiloto do anunciante
         </h1>
-        <p className="mt-1 text-sm text-gray-500">
+        <p className="mt-1 text-sm text-muted-foreground">
           Assistente de IA para otimizacao de campanhas. Toda acao de escrita
           (criar, editar, vincular) requer sua aprovacao explicita antes de ser
           aplicada — nunca ocorre de forma autonoma.
@@ -29,7 +29,7 @@ export default function CopilotPage() {
         {/* Painel principal de chat */}
         <section
           aria-label="Chat com o copiloto"
-          className="flex flex-1 flex-col overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm"
+          className="flex flex-1 flex-col overflow-hidden rounded-xl border border-border bg-card shadow-sm"
           style={{ minHeight: "500px" }}
         >
           <ChatPanel />
@@ -40,18 +40,18 @@ export default function CopilotPage() {
           aria-label="Dicas de uso do copiloto"
           className="hidden w-72 shrink-0 xl:block"
         >
-          <div className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm">
-            <h2 className="text-sm font-semibold text-gray-900">
+          <div className="rounded-xl border border-border bg-card p-4 shadow-sm">
+            <h2 className="text-sm font-semibold text-foreground">
               O que voce pode perguntar
             </h2>
             <ul
-              className="mt-3 space-y-2 text-sm text-gray-600"
+              className="mt-3 space-y-2 text-sm text-muted-foreground"
               role="list"
             >
               {EXAMPLE_PROMPTS.map((p, i) => (
                 <li
                   key={i}
-                  className="rounded-md bg-gray-50 px-3 py-2 text-xs leading-relaxed"
+                  className="rounded-md bg-muted px-3 py-2 text-xs leading-relaxed"
                 >
                   &ldquo;{p}&rdquo;
                 </li>
@@ -60,7 +60,7 @@ export default function CopilotPage() {
 
             <div
               role="note"
-              className="mt-5 rounded-md border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800"
+              className="mt-5 rounded-md border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-500/25 dark:bg-amber-500/10 dark:text-amber-300"
             >
               <strong>Seguranca:</strong> o copiloto nao tem acesso a suas
               credenciais. Toda acao de escrita exige sua aprovacao (HITL).

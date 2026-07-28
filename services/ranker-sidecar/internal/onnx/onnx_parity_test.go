@@ -10,47 +10,41 @@
 // This is the inference-side counterpart to internal/ranker/parity_test.go
 // (which only proves Featurize/featurize vector parity, not model scoring).
 //
-// # Portability (CI without libonnxruntime)
+// # Portability (local dev without libonnxruntime) / CI wiring
 //
-// This file is built ONLY with `-tags onnx`. Even then, TestOnnxScoreParity
-// skips (not fails) if ONNXRUNTIME_SHARED_LIBRARY_PATH is unset or does not
-// point at a loadable shared library, and if the compiled model artefact is
-// missing — so `go test -tags onnx ./...` remains safe to run in
-// environments that build with CGO but do not have the runtime library
-// installed.
+// This file is built ONLY with `-tags onnx`. TestOnnxScoreParity skips (not
+// fails) if ONNXRUNTIME_SHARED_LIBRARY_PATH is unset or does not point at a
+// loadable shared library, and if the compiled model artefact is missing —
+// so `go test -tags onnx ./...` remains safe to run on a bare local checkout
+// that builds with CGO but does not have the runtime library installed.
+//
+// This is a graceful-degradation path for local dev ONLY. In CI, the
+// go-onnx-parity job (.github/workflows/go.yml) provisions
+// ONNXRUNTIME_SHARED_LIBRARY_PATH (the native .so the pip `onnxruntime`
+// wheel already embeds) and runs `make ranker-onnx-fixtures` to generate
+// ml/registry/artifacts/pctr_model.onnx before this test runs, then greps
+// the `-v` output for `--- SKIP` and fails the job if this test (or any
+// other under `-tags onnx`) ever skips there — the skip path above must
+// never be silently exercised by a green CI run.
 //
 // # Regenerating the golden fixture (testdata/score_golden.json)
 //
-// The golden "features"/"expected_score" pairs are the SAME
-// expected_vector_computed vectors from ml/features/testdata/parity_cases.json,
-// scored by Python onnxruntime directly against pctr_model.onnx. Regenerate
-// with (from the repo root, after re-exporting pctr_model.onnx):
+// Since the 30th-wave remediation of the sibling HIGH finding
+// "calibration-never-applied-in-serving" (which is what wired this test into
+// CI at all — see internal/wiring/calibration_parity_test.go), this golden
+// is captured from the SAME small deterministic synthetic model (fixed
+// seed) as calibrated_score_golden.json, via a single generator script.
+// Regenerate both goldens together (from the repo root, only after
+// intentionally changing the recipe — e.g. the seed):
 //
-//	ml/.venv/bin/python -c "
-//	import json
-//	import numpy as np
-//	import onnxruntime as ort
+//	PYTHONPATH=. ml/.venv/bin/python \
+//	  services/ranker-sidecar/scripts/gen_calibration_fixtures.py --write-golden
 //
-//	with open('ml/features/testdata/parity_cases.json') as f:
-//	    fixtures = json.load(f)
-//	sess = ort.InferenceSession('ml/registry/artifacts/pctr_model.onnx',
-//	                             providers=['CPUExecutionProvider'])
-//	input_name = sess.get_inputs()[0].name
-//	cases = []
-//	for case in fixtures['cases']:
-//	    vec = [0.0] * 23
-//	    for key, value in case['expected_vector_computed'].items():
-//	        if not key.startswith('index_'):
-//	            continue
-//	        vec[int(key.split('_')[1])] = float(value)
-//	    X = np.array([vec], dtype=np.float32)
-//	    probs = sess.run(None, {input_name: X})[1]
-//	    cases.append({'id': case['id'], 'features': vec,
-//	                  'expected_score': float(probs[0, 1])})
-//	print(json.dumps({'feature_spec_version': fixtures['feature_spec_version'],
-//	                   'model_path': 'ml/registry/artifacts/pctr_model.onnx',
-//	                   'cases': cases}, indent=2))
-//	"
+// See services/ranker-sidecar/scripts/gen_calibration_fixtures.py's module
+// docstring for the determinism contract (verified by running the generator
+// twice and diffing the resulting golden byte-for-byte) and why the "features"
+// numeric content is unrelated to real production feature semantics (this
+// test proves Go<->Python ONNX serving PLUMBING, not model quality).
 package onnx
 
 import (

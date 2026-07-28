@@ -1,0 +1,75 @@
+# db/schema-order.txt — ORDEM DE APLICAÇÃO ENTRE SCHEMAS (fonte única).
+#
+# POR QUE ESTE ARQUIVO EXISTE
+#   A ordem DENTRO de cada schema é derivada por glob + sort sobre
+#   db/<schema>/migrations/*_up.sql (prefixo 0001, 0002, ... zero-padded).
+#   Nenhum runner enumera migration à mão — isso é imposto pelo gate
+#   `make db-check-provisioners` (scripts/ci/db-provisioner-check.py).
+#
+#   A ordem ENTRE schemas, porém, é uma dependência real de negócio que um
+#   `ls | sort` alfabético NÃO reproduz (ex.: "compliance" ordena antes de
+#   "ledger" alfabeticamente, mas depende de config e tem que vir por último).
+#   Ela precisa ser declarada. O que este arquivo corrige é a declaração ser
+#   feita em VÁRIOS lugares independentes: antes da 32ª onda, a ordem (e a
+#   lista de migrations) vivia copiada em make/db.mk (DB_SCHEMAS),
+#   make/dev.mk (dev-db-setup), deploy/local/postgres/10-init.sh e
+#   .github/workflows/db.yml — e as cópias divergiram. `dev-db-setup` e o
+#   initdb do Docker pararam em config/0003, deixando
+#   config.campaign_zones_tenant_isolation SEM WITH CHECK no catálogo
+#   (pg_policy.polwithcheck IS NULL) e, no caso do Docker, o ledger inteiro
+#   sem RLS (0003) e sem imutabilidade append-only (0004).
+#
+# DEPENDÊNCIAS QUE FIXAM ESTA ORDEM
+#   asset_registry  — independente; config referencia seus assets.
+#   config          — depende de asset_registry; cria config.current_tenant_id(),
+#                     usada pelas policies de vector_store e compliance.
+#   ledger          — independente de config no schema, mas antes de compliance.
+#   stats           — independente (ADR-0005, perfil BETA); posicionado após
+#                     ledger só para manter a ordem de leitura do diretório.
+#   vector          — independente; as policies chamam config.current_tenant_id().
+#   compliance      — depende de config (current_tenant_id()); sempre por último.
+#
+# CONSUMIDORES QUE DERIVAM DAQUI
+#   make/db.mk           -> DB_SCHEMAS / DB_SCHEMAS_REV (e, via elas,
+#                           db-test-all, db-migrate-*, db-check-schema-list)
+#   make/dev.mk          -> dev-db-setup (Postgres local, "Caminho A")
+#   deploy/local/postgres/10-init.sh -> initdb do Docker Compose ("Caminho B")
+#
+# EXCEÇÃO DECLARADA — .github/workflows/db.yml NÃO deriva daqui.
+#   Ele tem um step nomeado por schema ("migrations up — config", "— ledger",
+#   ...), e a ordem está implícita na ordem dos steps. Isso é deliberado: o log
+#   de CI fica legível e um schema que falha aparece pelo nome. O preço é que a
+#   ORDEM ENTRE SCHEMAS continua declarada em dois lugares — aqui e lá.
+#   O que já está coberto: `db-check-provisioners` (scripts/ci/
+#   db-provisioner-check.py) impede que db.yml enumere MIGRATIONS à mão, e
+#   `db-check-schema-list` detecta schema novo ausente de DB_SCHEMAS.
+#
+#   O que NÃO está: nada compara os steps de db.yml com este arquivo — **nem a
+#   ORDEM nem o CONJUNTO**. A lacuna do conjunto é a mais séria das duas: um
+#   schema declarado aqui e esquecido nos steps de db.yml passa em
+#   `db-check-schema-list` (que compara `db/*/migrations` contra DB_SCHEMAS, não
+#   contra o YAML) e nunca é migrado nem tem a RLS exercitada na CI — ou seja,
+#   um schema com isolamento por tenant jamais testado (TX-3). O próprio db.yml
+#   admite isso em comentário e a chama de "3ª reincidência da classe".
+#   Residual honesto, registrado no fecho da 32ª onda no README e no plano §5.
+#   O gate que fecharia isso — comparar `grep 'migrations up — '` de db.yml com
+#   este arquivo — cabe em ~10 linhas e já tem casa em repo-gates.yml; é onda
+#   seguinte, não bloqueio. Até lá: reordenar ou acrescentar schema aqui exige
+#   editar db.yml no mesmo commit, por disciplina e não por gate.
+#
+# GATE
+#   scripts/ci/db-provisioner-check.py -> default-deny sobre todo o repo:
+#   ninguém aplica migration por enumeração à mão, e nenhuma instrução
+#   operacional enumera uma lista parcial.
+#
+# FORMATO: um schema por linha, na ordem de aplicação. `#` inicia comentário.
+# A reversão (_down) é exatamente esta lista lida de baixo para cima.
+# Um diretório novo em db/ com subpasta migrations/ que não apareça aqui é
+# detectado por `make db-check-schema-list`.
+
+asset_registry
+config
+ledger
+stats
+vector
+compliance

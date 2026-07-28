@@ -39,6 +39,8 @@
 #   db/ledger/migrations/0001_ledger_schema_up.sql — schema, trigger de balance, particions
 #   db/ledger/migrations/0002_reconciliation_exceptions_up.sql — tabela de excecoes
 #   db/ledger/migrations/0003_ledger_rls_up.sql — RLS por tenant, SECURITY INVOKER na view
+#   db/ledger/migrations/0004_ledger_postings_immutable_up.sql — append-only de postings e
+#                                   journal_entries (a semantica de estorno do smoke depende dela)
 #   bff/src/adapters/postgres-payments.ts  — getBalances/listPaymentStatus (TX-2/TX-3)
 #
 # INVARIANTES TX-2 / DA-10 no script:
@@ -101,10 +103,12 @@ LEDGER_OK="$(psql -v ON_ERROR_STOP=1 -tA "$PGURL" \
     -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='ledger' AND table_name='journal_entries'" \
     2>/dev/null || echo 0)"
 if [ "$LEDGER_OK" != "1" ]; then
-    echo "FAIL: schema ledger nao encontrado — aplique as migrations 0001/0002/0003:"
-    echo "  psql \$PGURL -f $REPO_ROOT/db/ledger/migrations/0001_ledger_schema_up.sql"
-    echo "  psql \$PGURL -f $REPO_ROOT/db/ledger/migrations/0002_reconciliation_exceptions_up.sql"
-    echo "  psql \$PGURL -f $REPO_ROOT/db/ledger/migrations/0003_ledger_rls_up.sql"
+    echo "FAIL: schema ledger nao encontrado. Provisione o banco pelo caminho canonico"
+    echo "      (que aplica TODAS as migrations, derivadas do diretorio, na ordem de"
+    echo "      db/schema-order.txt) em vez de aplicar arquivo por arquivo:"
+    echo "  make dev-db-setup            # Postgres local, sem Docker"
+    echo "  make dev-up                  # stack Docker Compose"
+    echo "  ls $REPO_ROOT/db/ledger/migrations/*_up.sql   # o que existe, se for aplicar a mao"
     exit 1
 fi
 echo "[smoke-payments] schema ledger (0001): OK"
@@ -114,8 +118,8 @@ RECON_OK="$(psql -v ON_ERROR_STOP=1 -tA "$PGURL" \
     -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='ledger' AND table_name='reconciliation_exceptions'" \
     2>/dev/null || echo 0)"
 if [ "$RECON_OK" != "1" ]; then
-    echo "FAIL: tabela ledger.reconciliation_exceptions nao encontrada — aplique 0002:"
-    echo "  psql \$PGURL -f $REPO_ROOT/db/ledger/migrations/0002_reconciliation_exceptions_up.sql"
+    echo "FAIL: tabela ledger.reconciliation_exceptions nao encontrada."
+    echo "      Provisione pelo caminho canonico: make dev-db-setup (ou make dev-up)."
     exit 1
 fi
 echo "[smoke-payments] schema ledger (0002 reconciliation): OK"
@@ -125,11 +129,29 @@ RLS_OK="$(psql -v ON_ERROR_STOP=1 -tA "$PGURL" \
     -c "SELECT COUNT(*) FROM pg_policies WHERE schemaname='ledger' AND tablename='accounts' AND policyname='accounts_tenant_isolation'" \
     2>/dev/null || echo 0)"
 if [ "$RLS_OK" != "1" ]; then
-    echo "FAIL: RLS da ledger.accounts nao encontrado — aplique 0003:"
-    echo "  psql \$PGURL -f $REPO_ROOT/db/ledger/migrations/0003_ledger_rls_up.sql"
+    echo "FAIL: RLS da ledger.accounts nao encontrado."
+    echo "      Provisione pelo caminho canonico: make dev-db-setup (ou make dev-up)."
     exit 1
 fi
 echo "[smoke-payments] schema ledger (0003 RLS): OK"
+
+# Verifica migration 0004 (append-only de ledger.postings / journal_entries).
+# Ausente deste preflight ate a 32a onda — o smoke exercita RecordEntry/
+# RecordDeposit/RecordReversal, cuja semantica de estorno ("nunca edita a entry
+# original, sempre cria uma nova") so e IMPOSTA por estes triggers. Sem eles o
+# smoke passava verde contra um ledger mutavel, isto e, provava menos do que
+# dizia provar. Os dois triggers vem da MESMA migration; checar os dois evita
+# que meia aplicacao passe.
+IMMUT_OK="$(psql -v ON_ERROR_STOP=1 -tA "$PGURL" \
+    -c "SELECT COUNT(*) FROM pg_trigger WHERE NOT tgisinternal AND tgname IN ('postings_immutable_trg','journal_entries_immutable_trg')" \
+    2>/dev/null || echo 0)"
+if [ "$IMMUT_OK" != "2" ]; then
+    echo "FAIL: triggers de imutabilidade append-only do ledger ausentes (achados: ${IMMUT_OK}/2)."
+    echo "      Provisione pelo caminho canonico (make dev-db-setup / make dev-up), que aplica"
+    echo "      todas as migrations do diretorio — inclusive a que cria estes triggers."
+    exit 1
+fi
+echo "[smoke-payments] schema ledger (0004 append-only): OK"
 
 # Verifica asset USDC habilitado no Asset Registry (scale=6, enabled=true).
 # TX-2/DA-10: sem USDC com scale definido, nao ha aritmetica correta.

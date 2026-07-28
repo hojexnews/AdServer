@@ -24,8 +24,22 @@
 //  3. The raw id is never stored in any struct field, log record, telemetry
 //     event, or forwarded to any other component.  It exists only on the
 //     stack of capKey() for the duration of the hash computation.
-//  4. The salt is a rotating secret (CAPPING_SALT from OpenBao).  The salt
-//     MUST be non-empty; New() returns an error on an empty salt (fail-closed).
+//  4. The salt is a rotating secret (CAPPING_SALT from OpenBao).  The salt MUST
+//     be non-empty: New() PANICS on an empty salt (fail-closed).  It does NOT
+//     return an error — do not write a caller that tries to handle one.  Panic
+//     is deliberate for this control: New is a boot-time constructor called once
+//     from main, so the blast radius is "process refuses to start", never a
+//     failed request; and an `error` return is ignorable with `_`, whereas a
+//     panic is not.  An empty salt would silently reduce every cap key to
+//     SHA-256(userID + ":"), i.e. an unsalted, fleet-stable, precomputable
+//     identifier — the exact de-identification failure DA-6/TX-5 exists to
+//     prevent.  The contract is gated by TestNew_EmptySalt_Panics
+//     (capping_test.go) and TestCA5_EmptySalt_Panics (tests/parity).
+//
+//     Caveat, stated because this block must not overclaim: the non-empty
+//     invariant is enforced ONLY at construction.  SetSalt does not re-validate,
+//     so a rotation path that fed it "" would bypass the check.  Today SetSalt
+//     has no production caller (only tests), so this is latent, not live.
 //
 // Capping keys are ephemeral Redis strings with short TTLs — they NEVER appear
 // in events, telemetry, decision logs, or any persistent store.

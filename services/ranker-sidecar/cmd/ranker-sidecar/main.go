@@ -20,6 +20,30 @@
 //	                     In stub mode, use "stub-j1" (or leave empty for "stub-j1").
 //	                     Default: "stub-j1"
 //
+//	RANKER_HEALTHZ_ADDR  HTTP listen address for GET /healthz (observability only —
+//	                     NOT the scoring hot path, which stays the Unix socket above).
+//	                     Reports whether isotonic calibration is actually being
+//	                     applied (see wiring.Status / Mandato #3 "Calibracao isotonica
+//	                     monitorada"): {"calibrated": true|false, "calibration_reason": ...}.
+//	                     A bind failure here (e.g. port in use) logs an error and does
+//	                     NOT stop the sidecar from serving scores. Default: ":9102"
+//
+//	RANKER_CALIBRATION_PATH  Path to the isotonic calibration_map.json artefact
+//	                     (ml/calibration/calibrate.py:save_calibration_map, versioned
+//	                     in the MLflow registry alongside the .onnx model). Applied as
+//	                     stage (b) of the two-stage design ("ONDE A CALIBRACAO VIVE" in
+//	                     ml/calibration/calibrate.py's module docstring): (a) infer
+//	                     pCTR_raw with the .onnx graph, (b) interpolate pCTR_raw through
+//	                     this map -> pCTR_cal, which is what the sidecar actually writes
+//	                     to the wire. Only consulted when an OnnxInferencer loaded
+//	                     successfully (stub mode never calibrates — score is always 0).
+//	                     Default: "" (auto-derives the sibling "calibration_map.json" in
+//	                     the same directory as RANKER_MODEL_PATH). If the file is missing
+//	                     or fails validation, the sidecar logs a warning and serves the
+//	                     RAW (uncalibrated) score instead of refusing to start or
+//	                     erroring the hot path (DA-3 fail-open). See
+//	                     internal/calibration and internal/wiring.
+//
 //	DEEP_ENABLED         K1/Fase 3 gate: enables the deep ranker Triton/GPU backend.
 //	                     Default: "false" (GBDT ONNX-CPU is always the production backend
 //	                     until K8 promotes the deep model under A/B uplift proof).
@@ -95,14 +119,16 @@
 package main
 
 import (
-	"errors"
+	"context"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
-	"github.com/hojex/adserver/services/ranker-sidecar/internal/onnx"
 	"github.com/hojex/adserver/services/ranker-sidecar/internal/stub"
+	"github.com/hojex/adserver/services/ranker-sidecar/internal/wiring"
 )
 
 func main() {
@@ -137,6 +163,20 @@ func main() {
 	//     `-tags onnx`-less build) the sidecar logs a warning and falls back
 	//     to StubInferencer. This is a fail-safe path, not fail-open: it
 	//     happens once at startup, never mid-request.
+	//   onnx.New succeeds → the sidecar additionally loads
+	//     RANKER_CALIBRATION_PATH (calibration_map.json — default: the
+	//     sibling "calibration_map.json" next to RANKER_MODEL_PATH) and, on
+	//     success, wraps the OnnxInferencer with the isotonic calibration
+	//     map (internal/calibration) so the score written to the wire is
+	//     pCTR_cal, not pCTR_raw — closing the gap where
+	//     ml/calibration/calibrate.py produced calibration_map.json but
+	//     nothing in serving ever read it. A missing/invalid calibration
+	//     artefact fails OPEN to the raw (uncalibrated) OnnxInferencer, with
+	//     a warning logged — it never blocks startup or the hot path.
+	//     See internal/wiring.BuildInferencer for the actual selection code
+	//     (this comment documents it; wiring.go is the single source of
+	//     truth, also exercised directly by
+	//     internal/wiring/calibration_parity_test.go).
 	// ---------------------------------------------------------------------------
 	if deepEnabled {
 		logger.Info("ranker-sidecar: DEEP_ENABLED=true (K8 gate open)",
@@ -151,46 +191,11 @@ func main() {
 				"Set DEEP_ENABLED=true only after K8 uplift A/B proof.")
 	}
 
-	var inf stub.Inferencer
-	if modelPath != "" {
-		if _, err := os.Stat(modelPath); err == nil {
-			// Model file present: attempt the real OnnxInferencer (G0/E11).
-			// onnx.New's behaviour depends on the build tag:
-			//   - `-tags onnx`:  loads the model via onnxruntime (CGO, dlopen).
-			//   - default build: always returns onnx.ErrNotCompiled (CGO-free).
-			// Either way, ANY error here is a fail-SAFE (not fail-open) startup
-			// fallback to StubInferencer — the sidecar always starts serving.
-			onnxInf, onnxErr := onnx.New(modelPath, modelVersion)
-			if onnxErr != nil {
-				if errors.Is(onnxErr, onnx.ErrNotCompiled) {
-					logger.Warn("ranker-sidecar: RANKER_MODEL_PATH set but ONNX runtime not compiled in — "+
-						"using StubInferencer. Build with -tags onnx and provide libonnxruntime.so to enable it.",
-						"model_path", modelPath,
-						"model_version", modelVersion)
-				} else {
-					logger.Warn("ranker-sidecar: onnx.New failed to load model — using StubInferencer",
-						"model_path", modelPath,
-						"model_version", modelVersion,
-						"err", onnxErr)
-				}
-				inf = stub.NewStub(modelVersion)
-			} else {
-				logger.Info("ranker-sidecar: OnnxInferencer loaded",
-					"model_path", modelPath,
-					"model_version", modelVersion)
-				inf = onnxInf
-			}
-		} else {
-			logger.Warn("ranker-sidecar: RANKER_MODEL_PATH set but file not found — using StubInferencer",
-				"model_path", modelPath,
-				"err", err)
-			inf = stub.NewStub(modelVersion)
-		}
-	} else {
-		logger.Info("ranker-sidecar: RANKER_MODEL_PATH not set — running in stub mode",
-			"model_version", modelVersion)
-		inf = stub.NewStub(modelVersion)
-	}
+	inf, calStatus := wiring.BuildInferencer(wiring.Config{
+		ModelPath:       modelPath,
+		ModelVersion:    modelVersion,
+		CalibrationPath: os.Getenv("RANKER_CALIBRATION_PATH"),
+	}, logger)
 	defer inf.Close() //nolint:errcheck // best-effort
 
 	// Consume deepEnabled and tritonURL to avoid "declared and not used" errors.
@@ -202,6 +207,30 @@ func main() {
 
 	srv := stub.NewServer(socketPath, inf, logger)
 
+	// Observability endpoint (Mandato #3 — "Calibracao isotonica
+	// monitorada"): GET /healthz exposes calStatus, captured once here at
+	// startup, so a bad/missing calibration_map.json is no longer visible
+	// ONLY as the slog.Warn line wiring.BuildInferencer already emitted —
+	// see healthz.go. A bind failure here is logged and non-fatal: the
+	// scoring Unix socket below is the only thing that gates the hot path.
+	healthzAddr := envOr("RANKER_HEALTHZ_ADDR", ":9102")
+	healthzSrv := &http.Server{
+		Addr:              healthzAddr,
+		Handler:           newHealthzHandler(modelVersion, calStatus),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		logger.Info("ranker-sidecar: /healthz listening",
+			"addr", healthzAddr,
+			"calibrated", calStatus.Calibrated,
+			"calibration_reason", calStatus.Reason)
+		if err := healthzSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("ranker-sidecar: /healthz server error (non-fatal — scoring socket unaffected)",
+				"addr", healthzAddr,
+				"err", err)
+		}
+	}()
+
 	// Signal handling: SIGINT/SIGTERM → graceful shutdown.
 	stopCh := make(chan struct{})
 	sigCh := make(chan os.Signal, 1)
@@ -210,6 +239,9 @@ func main() {
 	go func() {
 		sig := <-sigCh
 		logger.Info("ranker-sidecar: shutdown signal received", "signal", sig.String())
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = healthzSrv.Shutdown(shutdownCtx) //nolint:errcheck // best-effort
 		close(stopCh)
 	}()
 

@@ -1,0 +1,87 @@
+# repo-gates — gates de superfície AMPLA, sem filtro de `paths`.
+#
+# POR QUE ESTE WORKFLOW EXISTE
+#   Um gate cuja superfície guardada é o repositório inteiro (ou um conjunto
+#   espalhado por vários diretórios) não pode morar num workflow com `paths:`.
+#   Se morar, ele fica órfão para tudo que estiver fora daquele filtro — e o
+#   órfão é silencioso: o job simplesmente não aparece, e a ausência de job
+#   vermelho lê-se como verde.
+#
+#   Foi o que aconteceu com `make-quoting-check`. Ele guarda `Makefile` +
+#   `make/*.mk`. A onda "perfil BETA" detectou que ele era órfão (estava só em
+#   `make verify`, e NENHUM workflow roda `make verify`) e o cabeou em
+#   `buf.yml` — cujo gatilho é `paths: proto/**`. Ou seja: o conserto do órfão
+#   nasceu órfão de novo, um nível acima. Editar `make/dev.mk` nunca acionou o
+#   gate que existe justamente para validar recipes de make.
+#
+#   A correção da FORMA é este arquivo: um workflow cujo gatilho é
+#   default-deny-free — dispara em TODO pull_request e em TODO push para a
+#   `main`, por construção. Um gate colocado aqui não pode ser re-orfanado por
+#   um filtro de path, porque não há filtro. O preço é rodar sempre; por isso
+#   só entram aqui gates BARATOS: python puro, sem toolchain de build, sem
+#   container, sem banco. A única dependência externa é **PyYAML**, instalada
+#   abaixo pelo mesmo padrão de data.yml/ml.yml (`setup-python` + `pip`) — o
+#   `workflow-paths-mirror-check` precisa dela para ler o bloco `on:` sem
+#   reescrever um parser de YAML. O cabeçalho desta seção dizia "sem
+#   dependência de rede além do checkout", o que era falso já no primeiro step
+#   deste mesmo arquivo (achado do tech-lead na barreira da 32ª onda);
+#   corrigido para o que o workflow de fato faz.
+#
+#   Critério de admissão (para a próxima pessoa): entra aqui o gate cuja
+#   superfície guardada NÃO é descritível por um `paths:` honesto. Se a
+#   superfície é um diretório, o gate pertence ao workflow daquele diretório.
+#
+# Ausência de `paths:` nos dois gatilhos também é o que faz
+# scripts/ci/workflow-paths-mirror-check.py aprovar este arquivo: nenhum dos
+# dois lados filtra, logo não há espelho a divergir.
+name: repo-gates (superfície ampla)
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  repo-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # workflow-paths-mirror-check e db-provisioner-check leem o índice
+          # via `git grep` / `git ls-files`; profundidade 1 basta (nenhum dos
+          # dois compara contra histórico), mas o checkout precisa ser real.
+          fetch-depth: 1
+
+      # Padrão do repo (data.yml, ml.yml, go.yml): setup-python antes do pip,
+      # em vez do python3 do runner. Sem isto o step depende da política
+      # PEP-668 da imagem do runner — e, como este é o único workflow SEM
+      # `paths:`, uma quebra aqui deixaria VERMELHO todo PR do repo.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: instalar PyYAML (workflow-paths-mirror-check)
+        run: python3 -m pip install --quiet pyyaml
+
+      # make-quoting-check — variável de path NUA em recipe de make (TX-DX).
+      # O repo vive num caminho COM ESPAÇO (a 24ª onda foi paga inteira por
+      # causa disso: `platform-validate` falso-RED). Uma variável de path não
+      # aspada em recipe quebra na hora, e só na máquina de quem tem espaço no
+      # caminho — a pior classe de falha, porque passa na CI e quebra local.
+      - name: make-quoting-check (path com espaço quebra recipes)
+        run: python3 scripts/ci/make-quoting-check.py
+
+      # db-provisioner-check — nenhum provisionador enumera migration à mão.
+      # Superfície: make/, deploy/, scripts/, .github/, db/ — espalhada por
+      # construção, logo não descritível por um `paths:` honesto.
+      - name: db-provisioner-check (migration enumerada à mão)
+        run: python3 scripts/ci/db-provisioner-check.py
+
+      # workflow-paths-mirror-check — push.paths espelha pull_request.paths.
+      # Superfície: .github/workflows/** — mas um workflow que só disparasse
+      # para .github/workflows/** teria exatamente o problema que ele mede.
+      - name: workflow-paths-mirror-check (push.paths espelha pull_request.paths)
+        run: python3 scripts/ci/workflow-paths-mirror-check.py

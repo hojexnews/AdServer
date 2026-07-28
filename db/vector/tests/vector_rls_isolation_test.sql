@@ -8,12 +8,17 @@
 --     - help_doc_embeddings: isolamento + docs públicos (tenant_id NULL)
 --     - Caso fail-closed: sem adserver.tenant_id → 0 linhas
 --     - Cross-tenant: A não lê embeddings de B mesmo filtrando por tenant_id de B
+--     - adserver_copilot (role RAG do copiloto, achado #7/bundle F): NOBYPASSRLS
+--       explícito + isolamento por RLS + privilégio mínimo (SELECT-only,
+--       INSERT rejeitado) — ver BLOCO 8
 --
 -- DEPENDÊNCIAS:
 --   - Postgres 16 com extensão pgvector instalada
 --   - Migrations 0001 e 0002 do schema vector_store aplicadas
 --   - config.current_tenant_id() de 0002_config_rls_up.sql (Fase 1)
 --   - Role adserver_app (não-superuser) com GRANTs nas tabelas vector_store
+--   - Role adserver_copilot (não-superuser, NOBYPASSRLS, SELECT-only em
+--     vector_store) — ver db/seed/dev_roles.sql
 --
 -- COMO RODAR:
 --   psql -U adserver_admin -d adserver \
@@ -45,6 +50,11 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'adserver_app') THEN
         RAISE EXCEPTION
             'Role adserver_app não existe. Crie antes de rodar este teste.';
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'adserver_copilot') THEN
+        RAISE EXCEPTION
+            'Role adserver_copilot não existe. Crie antes de rodar este teste (db/seed/dev_roles.sql).';
     END IF;
 
     IF NOT EXISTS (
@@ -367,6 +377,77 @@ BEGIN
             'ASSERT FALHOU [WITH CHECK creative B]: INSERT cross-tenant ACEITO (esperado 42501)';
     EXCEPTION WHEN insufficient_privilege THEN
         RAISE NOTICE 'PASS [WITH CHECK: creative do tenant B rejeitado]: %', SQLSTATE;
+    END;
+
+    RESET ROLE;
+END;
+$$;
+
+-- ===========================================================================
+-- BLOCO 8 — adserver_copilot: NOBYPASSRLS explícito + isolamento + privilégio
+--   mínimo (achado #7, auditoria bundle F). O copiloto usa este role para as
+--   queries pgvector do RAG (services/copilot/tools/gateway.py), que
+--   dependem 100% do RLS para isolar tenants — nada impedia, antes deste
+--   bloco, que o DATABASE_URL do copiloto apontasse para um role BYPASSRLS
+--   (ex.: adserver_loader) sem que NENHUM gate reprovasse.
+-- ===========================================================================
+DO $$
+DECLARE
+    v_tenant_a  UUID := 'cccccccc-0000-0000-0000-000000000001';
+    v_tenant_b  UUID := 'dddddddd-0000-0000-0000-000000000001';
+    v_zero_vec  TEXT := '[' || repeat('0,', 1023) || '0]';
+    v_bypassrls BOOLEAN;
+    v_count     BIGINT;
+BEGIN
+    -- 8a. Invariante de catálogo: adserver_copilot NUNCA tem BYPASSRLS.
+    --     Checagem direta em pg_roles — não depende de comportamento OK
+    --     "por acidente"; se alguém rodar `ALTER ROLE adserver_copilot
+    --     BYPASSRLS` no futuro (ou recriar o role sem o NOBYPASSRLS
+    --     explícito), este assert falha imediatamente.
+    SELECT rolbypassrls INTO v_bypassrls
+    FROM pg_roles WHERE rolname = 'adserver_copilot';
+    IF v_bypassrls THEN
+        RAISE EXCEPTION
+            'ASSERT FALHOU [adserver_copilot NOBYPASSRLS]: role tem BYPASSRLS=true — '
+            'o RAG do copiloto depende 100%% do RLS (achado #7); isto é uma regressão '
+            'crítica de isolamento cross-tenant.';
+    END IF;
+    RAISE NOTICE 'PASS [adserver_copilot: BYPASSRLS=false (NOBYPASSRLS explícito)]';
+
+    -- 8b. Isolamento comportamental: adserver_copilot como tenant A só vê os
+    --     próprios criativos (mesma prova que adserver_app no BLOCO 1, mas
+    --     para o role que o copiloto realmente usa em produção).
+    SET LOCAL ROLE adserver_copilot;
+    SET LOCAL adserver.tenant_id = 'cccccccc-0000-0000-0000-000000000001';
+
+    SELECT COUNT(*) INTO v_count FROM vector_store.creative_embeddings;
+    PERFORM pg_temp.vec_assert_count(
+        'adserver_copilot RLS: tenant_a vê 2 criativos (não os de B)', v_count, 2
+    );
+
+    SELECT COUNT(*) INTO v_count
+    FROM vector_store.creative_embeddings
+    WHERE tenant_id = v_tenant_b;
+    PERFORM pg_temp.vec_assert_count(
+        'adserver_copilot RLS: cross-tenant A não lê de B (filtro explícito)', v_count, 0
+    );
+
+    -- 8c. Privilégio mínimo: adserver_copilot é SELECT-only em vector_store —
+    --     um INSERT deve ser rejeitado por FALTA DE PRIVILÉGIO (42501), não
+    --     apenas pelo WITH CHECK do RLS. Isto prova que o grant em si é
+    --     estreito (achado #7: "privilégios mínimos"), não só que o RLS
+    --     filtraria a leitura de volta.
+    BEGIN
+        INSERT INTO vector_store.creative_embeddings
+            (id, tenant_id, banner_id, campaign_id, creative_type, ctr,
+             impression_count, description_snippet, embedding, embedding_model)
+        VALUES (900004, v_tenant_a, 1, 1, 'image', 0.01, 1, 'copilot não deveria escrever',
+                v_zero_vec::vector, 'test-model');
+        RAISE EXCEPTION
+            'ASSERT FALHOU [adserver_copilot privilégio mínimo]: INSERT ACEITO '
+            '(esperado 42501 — role deve ser SELECT-only)';
+    EXCEPTION WHEN insufficient_privilege THEN
+        RAISE NOTICE 'PASS [adserver_copilot: INSERT rejeitado por privilégio (SELECT-only)]: %', SQLSTATE;
     END;
 
     RESET ROLE;

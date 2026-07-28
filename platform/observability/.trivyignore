@@ -1,0 +1,47 @@
+# platform/observability/.trivyignore — exceções AUDITÁVEIS de CVE para o
+# Trivy scan de imagem (.github/workflows/supply-chain.yml,
+# TRIVY_SEVERITY=CRITICAL,HIGH, fail-closed por padrão).
+#
+# ESTE ARQUIVO COMEÇA VAZIO DE PROPÓSITO — e deve continuar vazio na
+# imensa maioria do tempo. Nenhuma exceção está concedida hoje. O
+# comportamento default segue fail-closed puro: qualquer CVE
+# CRITICAL/HIGH — COM ou SEM fix upstream — bloqueia o job (decisão da
+# 30ª onda, achado `trivy-ignore-unfixed-doclie`: um `ignore-unfixed:
+# true` global e silencioso deixava passar exatamente o pior caso — CVE
+# crítico sem patch — enquanto o comentário do workflow prometia o
+# oposto. Esse flag foi removido e NÃO deve voltar).
+#
+# Esta válvula de escape (decisão da 31ª onda de remediação, achado
+# `trivy-escape-valve-auditavel`, item otel-privacy #3) é a alternativa
+# EXPLÍCITA e AUDITÁVEL ao ignore-unfixed global: por-CVE, com
+# justificativa e expiração, revisável em PR. Regras para adicionar uma
+# exceção:
+#
+#   1. UMA linha por CVE, com a justificativa em um comentário na linha
+#      imediatamente acima (por que o CVE não se aplica a este serviço,
+#      ou por que o risco é aceito por prazo determinado).
+#   2. Expiração OBRIGATÓRIA via sufixo `exp:YYYY-MM-DD` — é um recurso
+#      NATIVO do Trivy: passada a data, a linha deixa de suprimir o CVE e
+#      o scan volta a bloquear sozinho, sem exigir uma segunda ação
+#      humana para "religar" o gate. Nunca adicionar uma linha sem `exp:`.
+#   3. A mudança só entra via PR revisado (branch protection da main) —
+#      nunca commit direto. O diff deste arquivo É o registro de auditoria.
+#   4. Ao expirar sem renovação deliberada (novo `exp:` + nova
+#      justificativa revisada), o CVE volta a bloquear — esse é o
+#      comportamento correto, não um bug: a omissão é fail-closed.
+#
+# Formato (nativo do Trivy — https://trivy.dev, --ignorefile / input
+# `trivyignores` da aquasecurity/trivy-action):
+#
+#   # <justificativa curta: por que este CVE não se aplica, ou por que o
+#   #  risco é aceito, e até quando>
+#   CVE-XXXX-YYYYY exp:YYYY-MM-DD
+#
+# Exemplo (mantido comentado — NÃO é uma exceção ativa; é só ilustração
+# de formato para quem for adicionar a primeira exceção real):
+#
+#   # CVE-2024-00000: falso positivo conhecido do scanner para libX nesta
+#   # versão de base image; o caminho vulnerável não é exercitado por
+#   # nenhum serviço deste repositório (ver issue upstream #123).
+#   # Revisar/renovar antes de 2026-12-31.
+#   # CVE-2024-00000 exp:2026-12-31

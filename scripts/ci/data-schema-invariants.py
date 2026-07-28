@@ -426,13 +426,129 @@ else:
     print("AVISO: 003_kafka_to_raw_mvs.sql nao encontrado em data/clickhouse/migrations/.")
 
 # ---------------------------------------------------------------------------
-# Verifica que ReplacingMergeTree e usado para dedupe por event_id (TX-1),
-# escopado ao statement CREATE TABLE de CADA tabela raw_* (nao satisfeito
-# por prosa/diagrama em comentarios nem por outra tabela com esse engine)
+# Verifica que ReplacingMergeTree e usado para dedupe (TX-1), escopado ao
+# statement CREATE TABLE de CADA tabela raw_* (nao satisfeito por
+# prosa/diagrama em comentarios nem por outra tabela com esse engine).
+#
+# ANTES (oco, achado dedupe-order-by-event-id-unverified): o check so
+# confirmava ENGINE = ReplacingMergeTree no statement, mas NUNCA inspecionava
+# a clausula ORDER BY. ReplacingMergeTree so deduplica linhas que compartilham
+# a MESMA sorting key (ORDER BY) — se a chave de dedupe sair do ORDER BY, a
+# 'dedupe por event_id' que o comentario do 002_raw_tables.sql promete deixa
+# de existir na pratica, mas o gate continuava verde por so olhar o token
+# ENGINE.
+#
+# AGORA: para cada tabela, extrai a chave de dedupe DECLARADA (event_id na
+# maioria; decision_id para raw_decision, que dedupe pelo decision log —
+# ver comentario 'Decision log deduplicado por decision_id' em
+# 002_raw_tables.sql) e confirma que ela e um elemento EXATO (nao substring)
+# da clausula ORDER BY DENTRO do proprio statement CREATE TABLE.
 # ---------------------------------------------------------------------------
-RAW_TABLES_REQUIRING_DEDUPE = (
-    "raw_ad_request", "raw_impression", "raw_click", "raw_conversion", "raw_decision",
+#
+# DERIVACAO (achado #3, 31a onda; corrigido achado BLOCO-C, 32a onda):
+#
+# 31a onda: RAW_TABLES_REQUIRING_DEDUPE deixou de ser uma lista hardcoded.
+# Antes, uma tupla fixa com as 5 tabelas de 002_raw_tables.sql deixava o gate
+# CEGO a qualquer tabela raw_* nova (ex.: raw_ivt_score e raw_ivt_unsup_score,
+# adicionadas em 007/008 sem que ninguem lembrasse de editar esta lista).
+#
+# 32a onda (BLOCO C — a propria correcao da 31a onda enfraqueceu o gate): a
+# derivacao so incluia no conjunto verificado as tabelas 'adserver.raw_*' cujo
+# PROPRIO statement JA declarasse 'ENGINE = ReplacingMergeTree'. Isso significa
+# que a mutacao que o gate deveria detectar — REMOVER o ReplacingMergeTree de
+# uma tabela raw_* — fazia essa tabela simplesmente SAIR do conjunto derivado
+# (em vez de permanecer no conjunto e violar a regra 'engine == ReplacingMergeTree').
+# A derivacao se auto-isentava: nenhuma tabela no conjunto, nenhuma checagem
+# rodava para ela, gate verde. O gate antigo (lista hardcoded) pegava essa
+# regressao porque a tabela continuava na lista independente do que a migration
+# dissesse sobre o engine.
+#
+# CORRECAO: agora o conjunto e derivado de TODA tabela 'adserver.raw_*' criada
+# via 'CREATE TABLE IF NOT EXISTS', INDEPENDENTE do ENGINE declarado (ou da
+# ausencia de ENGINE). A tabela ENTRA no conjunto pela sua EXISTENCIA, nao pela
+# sua conformidade -- e so DEPOIS, no loop de verificacao abaixo (inalterado),
+# e que se exige ENGINE = ReplacingMergeTree + a chave de dedupe na ORDER BY.
+# Remover o ReplacingMergeTree de uma tabela raw_* agora e uma VIOLACAO (a
+# tabela continua no conjunto, falha o check de ENGINE), nunca mais uma
+# isencao silenciosa. Uma migration futura que crie 'raw_algumacoisa' (com
+# QUALQUER engine) tambem e coberta automaticamente, sem editar este arquivo.
+#
+# ALLOWLIST EXPLICITA: caso exista, no futuro, uma excecao LEGITIMA — uma
+# tabela 'adserver.raw_*' que por design nao precisa de dedupe por event_id
+# via ReplacingMergeTree (ex.: um log append-only auditavel sem necessidade de
+# versionamento) — ela deve ser adicionada NOMINALMENTE a
+# RAW_TABLE_DEDUPE_ALLOWLIST_EXCEPTIONS abaixo, com justificativa em
+# comentario. Uma tabela NUNCA se isenta implicitamente por so nao declarar o
+# engine; a isencao tem de ser um ato explicito e revisavel neste arquivo.
+RAW_TABLE_DEDUPE_ALLOWLIST_EXCEPTIONS = frozenset()
+# ^ vazio hoje: todas as 7 tabelas adserver.raw_* atuais (raw_ad_request,
+# raw_impression, raw_click, raw_conversion, raw_decision, raw_ivt_score,
+# raw_ivt_unsup_score) exigem dedupe por TX-1.
+
+
+def derive_all_raw_tables(statements):
+    """Deriva TODAS as tabelas 'adserver.raw_*' declaradas via 'CREATE TABLE
+    IF NOT EXISTS', INDEPENDENTE do ENGINE (cobertura por existencia, nao por
+    conformidade -- ver nota BLOCO-C acima). Preserva a ordem de aparicao."""
+    derived = []
+    for stmt in statements:
+        m = re.match(
+            r"CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+adserver\.(raw_[A-Za-z0-9_]+)\b",
+            stmt,
+            re.I,
+        )
+        if not m:
+            continue
+        derived.append(m.group(1))
+    return tuple(derived)
+
+
+ALL_RAW_TABLES = derive_all_raw_tables(ddl_statements)
+
+# Sentinela anti-vazio: se a derivacao nao achar NENHUMA tabela, o regex/parsing
+# de statements esta quebrado (todas as migrations atuais tem pelo menos
+# raw_ad_request) — falhar ALTO em vez de deixar o loop abaixo virar um no-op
+# silencioso que "passaria" sem checar nada.
+if not ALL_RAW_TABLES:
+    print(
+        "ERRO: derivacao de ALL_RAW_TABLES (toda 'adserver.raw_*' via CREATE "
+        "TABLE IF NOT EXISTS) nao encontrou NENHUMA tabela. Isso indica "
+        "regex/parsing quebrado no gate de dedupe, nao ausencia real de "
+        "tabelas raw_*. Falhando alto em vez de pular o check em silencio.",
+        file=sys.stderr,
+    )
+    fail = 1
+
+RAW_TABLES_REQUIRING_DEDUPE = tuple(
+    t for t in ALL_RAW_TABLES if t not in RAW_TABLE_DEDUPE_ALLOWLIST_EXCEPTIONS
 )
+
+# Chave de dedupe exigida na ORDER BY de cada tabela. Default: event_id.
+# raw_decision e a excecao documentada (dedupe pelo decision log, TX-1).
+# Override explicito para tabelas cuja chave de dedupe nao e event_id — a
+# derivacao acima decide QUAIS tabelas sao verificadas; este dict so decide
+# QUAL coluna cada uma deve ter na ORDER BY.
+DEDUPE_KEY_BY_TABLE = {
+    "raw_decision": "decision_id",
+}
+
+
+def order_by_columns(stmt: str):
+    """Extrai os identificadores da clausula ORDER BY de um statement CREATE
+    TABLE (forma tupla 'ORDER BY (a, b)' ou coluna unica 'ORDER BY a').
+    Retorna lista de nomes de coluna (sem ASC/DESC) ou None se nao houver
+    ORDER BY no statement."""
+    m = re.search(r"ORDER\s+BY\s*\(([^)]*)\)", stmt, re.I)
+    if m:
+        cols_text = m.group(1)
+    else:
+        m2 = re.search(r"ORDER\s+BY\s+([A-Za-z_][A-Za-z0-9_]*)", stmt, re.I)
+        if not m2:
+            return None
+        cols_text = m2.group(1)
+    return [c.strip().split()[0] for c in cols_text.split(",") if c.strip()]
+
+
 for _tbl in RAW_TABLES_REQUIRING_DEDUPE:
     _stmt = find_statement(
         ddl_statements,
@@ -441,10 +557,33 @@ for _tbl in RAW_TABLES_REQUIRING_DEDUPE:
     if _stmt is None:
         print(f"ERRO: tabela adserver.{_tbl} nao encontrada (dedupe TX-1).", file=sys.stderr)
         fail = 1
-    elif not re.search(r"ENGINE\s*=\s*ReplacingMergeTree\b", _stmt, re.I):
+        continue
+
+    if not re.search(r"ENGINE\s*=\s*ReplacingMergeTree\b", _stmt, re.I):
         print(
             f"ERRO: adserver.{_tbl} nao usa ENGINE = ReplacingMergeTree; "
-            f"necessario para dedupe por event_id (TX-1).",
+            f"necessario para dedupe (TX-1).",
+            file=sys.stderr,
+        )
+        fail = 1
+        continue
+
+    _dedupe_key = DEDUPE_KEY_BY_TABLE.get(_tbl, "event_id")
+    _order_by_cols = order_by_columns(_stmt)
+    if _order_by_cols is None:
+        print(
+            f"ERRO: adserver.{_tbl} usa ReplacingMergeTree mas nao tem "
+            f"clausula ORDER BY no proprio statement (dedupe TX-1 "
+            f"indeterminada — ReplacingMergeTree deduplica pela sorting key).",
+            file=sys.stderr,
+        )
+        fail = 1
+    elif _dedupe_key not in _order_by_cols:
+        print(
+            f"ERRO: adserver.{_tbl} nao tem '{_dedupe_key}' na ORDER BY "
+            f"(dedupe TX-1 quebrada). ReplacingMergeTree so deduplica linhas "
+            f"que compartilham a MESMA sorting key; ORDER BY atual: "
+            f"({', '.join(_order_by_cols)}).",
             file=sys.stderr,
         )
         fail = 1

@@ -18,6 +18,11 @@ DEV_SUPER_DSN ?= postgres://$(DEV_PGUSER)@/postgres?host=$(DEV_PGHOST)&sslmode=d
 DEV_ADMIN_DSN ?= postgres://$(DEV_PGUSER)@/$(DEV_DB)?host=$(DEV_PGHOST)&sslmode=disable
 # DSN do loader (papel BYPASSRLS) via TCP — usado pelo decision e pelo teste IT.
 DEV_LOADER_DSN ?= postgres://adserver_loader:loader_dev_only@localhost:5432/$(DEV_DB)?sslmode=disable
+# DSN do writer de telemetria via Postgres (onda "perfil BETA" / addon §3.3):
+# role criada de forma auto-contida por db/stats/migrations/0001_stats_schema_up.sql
+# (INSERT-only em stats.events_raw, NOBYPASSRLS — ver comentário da migration).
+# Valor a passar em TELEMETRY_PG_DSN para services/collector/cmd/collector.
+DEV_STATS_WRITER_DSN ?= postgres://adserver_stats_writer:stats_writer_dev_only@localhost:5432/$(DEV_DB)?sslmode=disable
 
 COMPOSE := docker compose -f deploy/local/docker-compose.yml
 
@@ -37,17 +42,116 @@ dev-db-setup:
 	@echo "== dev-db-setup: (re)criando $(DEV_DB) =="
 	@psql "$(DEV_SUPER_DSN)" -v ON_ERROR_STOP=1 -q -c "DROP DATABASE IF EXISTS $(DEV_DB);"
 	@psql "$(DEV_SUPER_DSN)" -v ON_ERROR_STOP=1 -q -c "CREATE DATABASE $(DEV_DB);"
-	@psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q -f db/asset_registry/migrations/0001_asset_registry_up.sql
-	@for f in 0001_config_schema 0002_config_rls 0003_campaign_zones_rls; do \
-	  psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q -f db/config/migrations/$$f\_up.sql; \
-	done
-	@psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q -f db/ledger/migrations/0001_ledger_schema_up.sql
+	@# Migrations: NADA é enumerado à mão aqui. A ordem ENTRE schemas vem de
+	@# db/schema-order.txt (fonte única, derivada em DB_SCHEMAS por make/db.mk);
+	@# a ordem DENTRO de cada schema vem de glob + sort sobre *_up.sql, exatamente
+	@# como db-test-all (make/db.mk) e .github/workflows/db.yml. Sentinela
+	@# anti-vazio por schema: diretório sem *_up.sql FALHA em vez de ser pulado
+	@# em silêncio.
+	@#
+	@# 32ª onda — por que isto deixou de ser uma lista: as três listas escritas à
+	@# mão que viviam aqui (config parando em 0003, ledger, vector) divergiram do
+	@# disco. `db/config/migrations/0004_campaign_zones_with_check_up.sql` nunca
+	@# era aplicada, então neste banco config.campaign_zones_tenant_isolation
+	@# ficava com pg_policy.polwithcheck IS NULL — a policy caía no fallback
+	@# implícito USING→WITH CHECK, que valida só o lado `campaign_id`. O lado
+	@# `zone_id` ficava sem validação: um advertiser do tenant A podia vincular a
+	@# SUA campanha a uma zona de OUTRO tenant, veiculando criativo em inventário
+	@# alheio. `make db-test` reprovava contra o banco que este próprio alvo monta.
+	@# É a 4ª reincidência da classe "enumeração à mão"; o gate que impede a 5ª é
+	@# `make db-check-provisioners`.
+	@FAIL=0; \
+	 for schema in $(DB_SCHEMAS); do \
+	   dir="db/$$schema/migrations"; \
+	   files=$$(ls "$$dir"/*_up.sql 2>/dev/null | LC_ALL=C sort); \
+	   if [ -z "$$files" ]; then \
+	     echo "ERRO: nenhuma migration *_up.sql em $$dir (schema '$$schema' vazio ou mal formado) — sentinela anti-vazio."; \
+	     FAIL=1; break; \
+	   fi; \
+	   for fpath in $$files; do \
+	     echo "  up: $$schema/$$(basename "$$fpath" _up.sql)"; \
+	     psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q -f "$$fpath" || { FAIL=1; break; }; \
+	   done; \
+	   [ "$$FAIL" = "1" ] && break; \
+	 done; \
+	 [ "$$FAIL" = "0" ] || { echo "ERRO: migrations _up falharam."; exit 1; }
+	@# db/seed/dev_roles.sql cria adserver_loader/adserver_app/adserver_copilot
+	@# E (achado H-2) adserver_stats_writer. TUDO que segue abaixo depende
+	@# desses quatro roles já existirem. Roda DEPOIS das migrations porque faz
+	@# GRANT em schemas que elas criam (inclusive vector_store — faltar isso
+	@# fazia o arquivo abortar com "schema vector_store does not exist",
+	@# achado HIGH / bundle F da 31ª).
 	@psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q -f db/seed/dev_roles.sql
+	@# Grants de vector_store e compliance para adserver_app/adserver_loader.
+	@# dev_roles.sql só concede vector_store a adserver_copilot (SELECT-only, o
+	@# papel de RAG) e não toca compliance — então, antes da 32ª onda,
+	@# `make db-test-vector` e `make db-test-compliance` morriam com "permission
+	@# denied for schema" contra o banco montado por este alvo, enquanto passavam
+	@# na CI. Mesmo bloco da FASE 3 de make/db.mk::db-test-all e do step "grants"
+	@# de .github/workflows/db.yml — replicado, não inventado.
+	@psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q \
+	  -c "GRANT USAGE ON SCHEMA vector_store TO adserver_loader, adserver_app;" \
+	  -c "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA vector_store TO adserver_app;" \
+	  -c "GRANT SELECT ON ALL TABLES IN SCHEMA vector_store TO adserver_loader;" \
+	  -c "GRANT USAGE ON SCHEMA compliance TO adserver_loader, adserver_app;" \
+	  -c "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA compliance TO adserver_app;" \
+	  -c "GRANT SELECT ON ALL TABLES IN SCHEMA compliance TO adserver_loader;"
+	@# Grants de leitura em stats para adserver_app (BFF), executados AQUI —
+	@# depois de dev_roles.sql garantir que adserver_app existe. Descomentados
+	@# a partir do bloco de exemplo deixado em
+	@# db/stats/migrations/0001_stats_schema_up.sql (não executado por lá de
+	@# propósito, para a migration não falhar num banco sem adserver_app).
+	@psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q \
+	  -c "GRANT USAGE ON SCHEMA stats TO adserver_app;" \
+	  -c "GRANT SELECT ON stats.events_raw TO adserver_app;" \
+	  -c "GRANT SELECT ON stats.live_kpis TO adserver_app;" \
+	  -c "GRANT EXECUTE ON FUNCTION stats.current_tenant_id() TO adserver_app;"
+	@# Leitura em stats para adserver_loader (BYPASSRLS) — o construtor de
+	@# snapshot (internal/configload) precisa somar as contagens ENTREGUES por
+	@# campanha para que o pacing DA-4 deixe de ser inerte (hoje
+	@# snapshot.Campaign.DeliveredImpressions nunca é escrito por nenhum código
+	@# de produção, então computeDeficit devolve 1.0 sempre). O loader já lê
+	@# todo o `config` de todos os tenants pelo mesmo motivo — ler `stats` é o
+	@# mesmo escopo, não um alargamento. `make beta-check` também consulta
+	@# stats.events_raw por este DSN.
+	@psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q \
+	  -c "GRANT USAGE ON SCHEMA stats TO adserver_loader;" \
+	  -c "GRANT SELECT ON stats.events_raw TO adserver_loader;" \
+	  -c "GRANT SELECT ON stats.live_kpis TO adserver_loader;" \
+	  -c "GRANT EXECUTE ON FUNCTION stats.current_tenant_id() TO adserver_loader;"
+	@# Escrita em stats para adserver_stats_writer (o role do pgsink,
+	@# TELEMETRY_PG_DSN) — GRANTs comentados na própria migration (achado H-2,
+	@# mesmo motivo do bloco de adserver_app acima: a migration não pode
+	@# depender de um role que ela mesma não cria mais).
+	@psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q \
+	  -c "GRANT USAGE ON SCHEMA stats TO adserver_stats_writer;" \
+	  -c "GRANT SELECT, INSERT ON stats.events_raw TO adserver_stats_writer;" \
+	  -c "GRANT EXECUTE ON FUNCTION stats.current_tenant_id() TO adserver_stats_writer;"
+	@# Ledger para adserver_app (achado C-1, security-reviewer): sem isto o
+	@# BFF (bff/src/adapters/postgres-payments.ts, PostgresPaymentsAdapter)
+	@# não tinha NENHUM role NOBYPASSRLS com acesso a `ledger`, o que empurrava
+	@# a doc do beta local a usar adserver_loader (BYPASSRLS) para o BFF
+	@# inteiro — desligando RLS de toda a aplicação, não só do ledger. Mesmo
+	@# bloco de .github/workflows/db.yml e da FASE 3 de make/db.mk::db-test-all
+	@# (fonte única de verdade replicada aqui, não inventada). O REVOKE
+	@# reafirma o least-privilege já provado pelo trigger
+	@# postings_immutable_trg (migration 0004 do ledger): adserver_app nunca
+	@# faz UPDATE/DELETE em ledger.postings (internal/ledger/posting.go só
+	@# faz INSERT/SELECT).
+	@psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q \
+	  -c "GRANT USAGE ON SCHEMA ledger TO adserver_loader, adserver_app;" \
+	  -c "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ledger TO adserver_app;" \
+	  -c "GRANT SELECT ON ALL TABLES IN SCHEMA ledger TO adserver_loader;" \
+	  -c "GRANT USAGE ON ALL SEQUENCES IN SCHEMA ledger TO adserver_app;" \
+	  -c "GRANT EXECUTE ON FUNCTION ledger.current_tenant_id() TO adserver_app, adserver_loader;" \
+	  -c "REVOKE UPDATE, DELETE ON ledger.postings FROM adserver_app;"
 	@psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q -f db/seed/dev_seed.sql
 	@# Provisionamento real do publisher Hojex News: zonas por-placement (E11).
 	@psql "$(DEV_ADMIN_DSN)" -v ON_ERROR_STOP=1 -q -f db/seed/hojex_news_seed.sql
 	@echo "== dev-db-setup: OK. Loader DSN:"
 	@echo "   $(DEV_LOADER_DSN)"
+	@echo "   Telemetry (pgsink) writer DSN — export as TELEMETRY_PG_DSN for services/collector:"
+	@echo "   $(DEV_STATS_WRITER_DSN)"
 
 ## dev-db-drop: remove o banco de dev $(DEV_DB)
 dev-db-drop:

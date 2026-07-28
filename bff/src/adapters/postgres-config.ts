@@ -53,6 +53,7 @@ import type {
   CreateCapInput,
   UpdateCapInput,
 } from "../schemas/config.js";
+import { assertCapScopeInvariant } from "../schemas/config.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -640,17 +641,54 @@ export class PostgresConfigAdapter implements ConfigAdapter {
   linkCampaignZones(tenantId: string, campaignId: string, zoneIds: string[]): Promise<CampaignZone[]> {
     return this.withTenant(tenantId, async (c) => {
       // INSERT...SELECT filtrado pelo RLS: só resolve campanha/zonas do tenant.
-      const r = await c.query<CampaignZoneRow>(
+      await c.query(
         `INSERT INTO config.campaign_zones (campaign_id, zone_id)
          SELECT c.id, z.id
            FROM config.campaigns c
            JOIN config.zones z ON z.id = ANY($2::bigint[])
           WHERE c.id = $1
-         ON CONFLICT (campaign_id, zone_id) DO NOTHING
-         RETURNING campaign_id, zone_id, created_at`,
+         ON CONFLICT (campaign_id, zone_id) DO NOTHING`,
         [campaignId, zoneIds]
       );
-      return r.rows.map(mapCampaignZone);
+
+      // FIX (31ª onda, bff-campaignzone-link-silent-noop): a versão anterior
+      // devolvia direto o RETURNING do INSERT. Isso confunde três estados
+      // MUITO diferentes, todos como "sucesso silencioso":
+      //   (a) vínculo criado agora            -> vinha no RETURNING
+      //   (b) vínculo JÁ existia              -> ON CONFLICT DO NOTHING, não vinha
+      //   (c) campanha ou zona NÃO é do tenant (ou não existe) -> o JOIN/RLS
+      //       filtra a linha, não vinha, e NENHUM erro era levantado
+      // Como o console só faz `onSuccess: fecha o formulário`, o anunciante que
+      // digitasse um zoneId de outro tenant (ou inexistente) via o formulário
+      // fechar como se tivesse funcionado, e a zona nunca era vinculada.
+      //
+      // Passamos a ler o ESTADO FINAL e a exigir que todo zoneId pedido esteja
+      // vinculado. (b) vira sucesso legítimo (idempotência), (c) vira erro
+      // explícito. Não vaza existência cross-tenant: a mensagem não distingue
+      // "não existe" de "não é seu" — ambos são simplesmente "indisponível".
+      const final = await c.query<CampaignZoneRow>(
+        `SELECT cz.campaign_id, cz.zone_id, cz.created_at
+           FROM config.campaign_zones cz
+          WHERE cz.campaign_id = $1
+            AND cz.zone_id = ANY($2::bigint[])
+            AND cz.campaign_id IN (SELECT id FROM config.campaigns)
+          ORDER BY cz.zone_id`,
+        [campaignId, zoneIds]
+      );
+
+      const linked = new Set(final.rows.map((row) => String(row.zone_id)));
+      const missing = zoneIds.filter((z) => !linked.has(String(z)));
+      if (missing.length > 0) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message:
+            `Não foi possível vincular ${missing.length} zona(s): ` +
+            `${missing.join(", ")}. Verifique se a campanha e as zonas ` +
+            `pertencem a esta conta.`,
+        });
+      }
+
+      return final.rows.map(mapCampaignZone);
     });
   }
 
@@ -678,6 +716,15 @@ export class PostgresConfigAdapter implements ConfigAdapter {
         [opts.ownerType, opts.ownerId]
       );
       return r.rows.map(mapDeliveryRule);
+    });
+  }
+
+  getDeliveryRule(tenantId: string, id: string): Promise<DeliveryRule | null> {
+    return this.withTenant(tenantId, async (c) => {
+      const r = await c.query<DeliveryRuleRow>(
+        `SELECT ${DELIVERY_RULE_COLS} FROM config.delivery_rules WHERE id = $1`, [id]
+      );
+      return r.rows[0] ? mapDeliveryRule(r.rows[0]) : null;
     });
   }
 
@@ -810,7 +857,12 @@ export class PostgresConfigAdapter implements ConfigAdapter {
         [input.id, ...set.vals]
       );
       if ((r.rowCount ?? 0) === 0) notFound("Cap", input.id);
-      return mapCap(r.rows[0]!);
+      const updated = mapCap(r.rows[0]!);
+      // Valida o ESTADO RESULTANTE (scope persistido × resetInterval após o
+      // UPDATE). Lançar aqui dispara o ROLLBACK do withTenant, então a linha
+      // incoerente nunca é commitada (31ª onda).
+      assertCapScopeInvariant(updated.scope, updated.resetInterval);
+      return updated;
     });
   }
 

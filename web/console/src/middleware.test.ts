@@ -191,3 +191,237 @@ test("dev (sem SESSION_SECRET) + token dev-stub -> autentica normalmente (compor
     }
   );
 });
+
+// ---------------------------------------------------------------------------
+// DENYLIST de headers forjados pelo cliente (31ª onda)
+//
+// Achado denylist-header-sem-teste / middleware-denylist-csrf-untested: a
+// denylist do passo 1 (remover x-adserver-*, x-tenant-*, x-internal-* vindos do
+// browser) é a defesa que impede o cliente de injetar tenant_id direto no header
+// que o BFF confia — e NÃO tinha nenhum teste. Apagar o laço de `delete` deixava
+// `make web-test` verde.
+//
+// MUTAÇÃO: remover o `cleanedHeaders.delete(key)` de middleware.ts faz o
+// primeiro teste abaixo FALHAR.
+// ---------------------------------------------------------------------------
+
+test("denylist: x-adserver-session-tenant enviado pelo BROWSER é sobrescrito pelo tenant da sessão", async () => {
+  await withEnv(
+    { NODE_ENV: "production", SESSION_SECRET: STRONG_SECRET },
+    async () => {
+      const middleware = await freshMiddleware();
+      const { NextRequest: NextReq } = await import("next/server.js");
+      const REAL_TENANT = "33333333-3333-3333-3333-333333333333";
+      const REAL_USER = "44444444-4444-4444-4444-444444444444";
+
+      const req = new NextReq(PROTECTED_URL, {
+        headers: {
+          cookie: `${COOKIE_NAME}=${signedToken(REAL_TENANT, REAL_USER, STRONG_SECRET)}`,
+          // O atacante tenta injetar OUTRO tenant direto no header interno.
+          "x-adserver-session-tenant": FORGED_TENANT,
+          "x-adserver-session-user": FORGED_USER,
+        },
+      });
+
+      const res = await middleware(req);
+
+      assert.equal(res.headers.get("x-middleware-next"), "1");
+      assert.equal(
+        res.headers.get("x-middleware-request-x-adserver-session-tenant"),
+        REAL_TENANT,
+        "o tenant que chega ao BFF tem de vir do cookie assinado, nunca do header do browser",
+      );
+      assert.notEqual(
+        res.headers.get("x-middleware-request-x-adserver-session-tenant"),
+        FORGED_TENANT,
+      );
+    },
+  );
+});
+
+test("denylist: x-tenant-* e x-internal-* do browser NUNCA sobrevivem ao middleware", async () => {
+  await withEnv(
+    { NODE_ENV: "production", SESSION_SECRET: STRONG_SECRET },
+    async () => {
+      const middleware = await freshMiddleware();
+      const { NextRequest: NextReq } = await import("next/server.js");
+      const REAL_TENANT = "33333333-3333-3333-3333-333333333333";
+
+      const req = new NextReq(PROTECTED_URL, {
+        headers: {
+          cookie: `${COOKIE_NAME}=${signedToken(REAL_TENANT, REAL_TENANT, STRONG_SECRET)}`,
+          "x-tenant-id": FORGED_TENANT,
+          // Assinatura interna console→copiloto: se o browser pudesse definir,
+          // falaria com o serviço interno se passando pelo console.
+          "x-internal-signature": "forjada",
+        },
+      });
+
+      const res = await middleware(req);
+
+      assert.equal(
+        res.headers.get("x-middleware-request-x-tenant-id"),
+        null,
+        "x-tenant-* do browser tem de ser removido antes de qualquer handler",
+      );
+      assert.equal(
+        res.headers.get("x-middleware-request-x-internal-signature"),
+        null,
+        "x-internal-* do browser tem de ser removido antes de qualquer handler",
+      );
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// CSRF (31ª onda, achado copilot-stream-get-csrf)
+//
+// A condição antiga era `origin !== null && !ALLOWED_ORIGINS.has(origin)`:
+// requisição SEM Origin passava direto. Navegadores omitem Origin em GET
+// same-origin, então GET /api/copilot/stream/:id?message=... — que dispara
+// chamada PAGA de LLM — não tinha checagem alguma.
+//
+// MUTAÇÃO: reintroduzir o `origin !== null &&` no guard de método não-seguro
+// faz o teste de POST-sem-Origin FALHAR.
+// ---------------------------------------------------------------------------
+
+const COPILOT_URL =
+  "http://localhost:3000/api/copilot/stream/55555555-5555-5555-5555-555555555555";
+
+test("CSRF: Sec-Fetch-Site cross-site -> 403 mesmo em GET (EventSource forjado de outro site)", async () => {
+  await withEnv(
+    { NODE_ENV: "production", SESSION_SECRET: STRONG_SECRET, ALLOWED_ORIGINS: "https://app.hojex.com" },
+    async () => {
+      const middleware = await freshMiddleware();
+      const { NextRequest: NextReq } = await import("next/server.js");
+      const REAL_TENANT = "33333333-3333-3333-3333-333333333333";
+
+      const req = new NextReq(COPILOT_URL, {
+        headers: {
+          cookie: `${COOKIE_NAME}=${signedToken(REAL_TENANT, REAL_TENANT, STRONG_SECRET)}`,
+          "sec-fetch-site": "cross-site",
+        },
+      });
+
+      const res = await middleware(req);
+      assert.equal(res.status, 403);
+    },
+  );
+});
+
+test("CSRF: método de mutação SEM header Origin -> 403 (fail-closed; antes passava)", async () => {
+  await withEnv(
+    { NODE_ENV: "production", SESSION_SECRET: STRONG_SECRET, ALLOWED_ORIGINS: "https://app.hojex.com" },
+    async () => {
+      const middleware = await freshMiddleware();
+      const { NextRequest: NextReq } = await import("next/server.js");
+      const REAL_TENANT = "33333333-3333-3333-3333-333333333333";
+
+      const req = new NextReq(PROTECTED_URL, {
+        method: "POST",
+        headers: {
+          cookie: `${COOKIE_NAME}=${signedToken(REAL_TENANT, REAL_TENANT, STRONG_SECRET)}`,
+          // sem Origin — navegador legítimo SEMPRE envia em POST
+        },
+      });
+
+      const res = await middleware(req);
+      assert.equal(res.status, 403);
+    },
+  );
+});
+
+test("CSRF: GET same-origin SEM Origin (EventSource legítimo) -> NÃO é bloqueado", async () => {
+  await withEnv(
+    { NODE_ENV: "production", SESSION_SECRET: STRONG_SECRET, ALLOWED_ORIGINS: "https://app.hojex.com" },
+    async () => {
+      const middleware = await freshMiddleware();
+      const { NextRequest: NextReq } = await import("next/server.js");
+      const REAL_TENANT = "33333333-3333-3333-3333-333333333333";
+
+      const req = new NextReq(COPILOT_URL, {
+        headers: {
+          cookie: `${COOKIE_NAME}=${signedToken(REAL_TENANT, REAL_TENANT, STRONG_SECRET)}`,
+          "sec-fetch-site": "same-origin",
+        },
+      });
+
+      const res = await middleware(req);
+      assert.equal(
+        res.headers.get("x-middleware-next"),
+        "1",
+        "o EventSource do próprio console não pode ser barrado — regressão de funcionalidade",
+      );
+    },
+  );
+});
+
+test("CSRF: POST com Origin permitido -> passa (caminho feliz das mutations tRPC)", async () => {
+  await withEnv(
+    { NODE_ENV: "production", SESSION_SECRET: STRONG_SECRET, ALLOWED_ORIGINS: "https://app.hojex.com" },
+    async () => {
+      const middleware = await freshMiddleware();
+      const { NextRequest: NextReq } = await import("next/server.js");
+      const REAL_TENANT = "33333333-3333-3333-3333-333333333333";
+
+      const req = new NextReq(PROTECTED_URL, {
+        method: "POST",
+        headers: {
+          cookie: `${COOKIE_NAME}=${signedToken(REAL_TENANT, REAL_TENANT, STRONG_SECRET)}`,
+          origin: "https://app.hojex.com",
+          "sec-fetch-site": "same-origin",
+        },
+      });
+
+      const res = await middleware(req);
+      assert.equal(res.headers.get("x-middleware-next"), "1");
+    },
+  );
+});
+
+test("CSRF: Sec-Fetch-Site same-site (subdomínio do mesmo site) -> 403", async () => {
+  // O console não faz nenhuma requisição legítima a si mesmo que não seja
+  // same-origin, então `same-site` só existiria vindo de outro host sob o mesmo
+  // domínio registrável (ex.: um blog em *.hojex.com comprometido por XSS).
+  // Aceitá-lo ampliaria a superfície sem habilitar nada
+  // (31ª onda, CSRF-SAME-SITE-BYPASS — pego pela revisão do próprio diff).
+  await withEnv(
+    { NODE_ENV: "production", SESSION_SECRET: STRONG_SECRET, ALLOWED_ORIGINS: "https://app.hojex.com" },
+    async () => {
+      const middleware = await freshMiddleware();
+      const { NextRequest: NextReq } = await import("next/server.js");
+      const REAL_TENANT = "33333333-3333-3333-3333-333333333333";
+
+      const req = new NextReq(COPILOT_URL, {
+        headers: {
+          cookie: `${COOKIE_NAME}=${signedToken(REAL_TENANT, REAL_TENANT, STRONG_SECRET)}`,
+          "sec-fetch-site": "same-site",
+        },
+      });
+
+      const res = await middleware(req);
+      assert.equal(res.status, 403);
+    },
+  );
+});
+
+test("CSRF: Sec-Fetch-Site none (barra de endereço/favorito) -> NÃO é bloqueado", async () => {
+  await withEnv(
+    { NODE_ENV: "production", SESSION_SECRET: STRONG_SECRET, ALLOWED_ORIGINS: "https://app.hojex.com" },
+    async () => {
+      const middleware = await freshMiddleware();
+      const { NextRequest: NextReq } = await import("next/server.js");
+      const REAL_TENANT = "33333333-3333-3333-3333-333333333333";
+
+      const req = new NextReq(COPILOT_URL, {
+        headers: {
+          cookie: `${COOKIE_NAME}=${signedToken(REAL_TENANT, REAL_TENANT, STRONG_SECRET)}`,
+          "sec-fetch-site": "none",
+        },
+      });
+
+      const res = await middleware(req);
+      assert.equal(res.headers.get("x-middleware-next"), "1");
+    },
+  );
+});

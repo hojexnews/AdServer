@@ -16,25 +16,38 @@
 //     superusers/BYPASSRLS roles regardless, so it cannot mask an
 //     idempotency or CHECK-constraint bug.
 //
-//   - RLS isolation on the write path (TX-3): a superuser would bypass FORCE
+//   - RLS isolation on the WRITE path (TX-3): a superuser would bypass FORCE
 //     ROW LEVEL SECURITY, so this half opens its OWN raw pgx connection and
-//     `SET ROLE adserver_stats_writer` (idempotent role created inline by
-//     db/stats/migrations/0001_stats_schema_up.sql) — mirroring the
-//     established `SET ROLE adserver_app` idiom already used by
-//     db/config/tests/rls_isolation_test.sql. No db/stats/tests/*.sql file
-//     exists (out of this package's file-ownership scope for this wave) —
-//     this Go test is the RLS proof instead.
+//     `SET ROLE adserver_stats_writer` — mirroring the established
+//     `SET ROLE adserver_app` idiom already used by
+//     db/config/tests/rls_isolation_test.sql. This Go test is the WITH CHECK
+//     (write) proof; db/stats/tests/rls_isolation_test.sql (achado M-2,
+//     security-reviewer) is the complementary USING (read) proof, in the
+//     exact mold of db/config/tests/ — the two together cover both halves
+//     of the policy.
+//
+//     CORRIGIDO (achado H-2, security-reviewer): adserver_stats_writer is
+//     NO LONGER created inline by db/stats/migrations/0001_stats_schema_up.sql
+//     (that migration used to CREATE ROLE ... LOGIN PASSWORD literally,
+//     which a plain `make db-migrate-up` would run against ANY
+//     DATABASE_URL, including staging/production). The role now lives in
+//     db/seed/dev_roles.sql, same as adserver_app/adserver_loader/
+//     adserver_copilot — this test's SET ROLE below depends on that seed
+//     having run BEFORE this test, not on the migration alone.
 //
 // HOW TO RUN
 //
 //	export DATABASE_URL=postgres://user:pass@host:5432/db?sslmode=disable
-//	# with db/stats/migrations/0001_stats_schema_up.sql already applied
+//	# with db/stats/migrations/0001_stats_schema_up.sql already applied,
+//	# AND db/seed/dev_roles.sql already applied (creates adserver_stats_writer
+//	# — see achado H-2 above; SET ROLE below fails without it)
 //	go test -tags integration -count=1 -race ./internal/telemetry/pgsink/...
 //
 // Or via `make go-test-integration` (escopo derivado por
 // `//go:build integration` — este arquivo entra automaticamente, sem editar
 // make/go.mk; ver seu comentário de topo). In CI: .github/workflows/db.yml
-// applies db/stats/migrations/0001 before running this package.
+// applies db/stats/migrations/0001 and db/seed/dev_roles.sql, in that order,
+// before running this package.
 package pgsink_test
 
 import (
@@ -300,10 +313,14 @@ func TestIntegration_RLS_StatsWriterRoleRejectsCrossTenant(t *testing.T) {
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
-	// adserver_stats_writer is created idempotently by db/stats/migrations/
-	// 0001_stats_schema_up.sql itself — no dependency on db/seed/dev_roles.sql.
+	// adserver_stats_writer is created idempotently by db/seed/dev_roles.sql
+	// (achado H-2, security-reviewer: moved OUT of
+	// db/stats/migrations/0001_stats_schema_up.sql, which must never
+	// CREATE ROLE ... LOGIN PASSWORD against a real DATABASE_URL) — this
+	// SET ROLE depends on that seed file having run first, not on the
+	// migration alone.
 	if _, err := tx.Exec(ctx, "SET ROLE adserver_stats_writer"); err != nil {
-		t.Fatalf(`SET ROLE adserver_stats_writer: %v (a migration 0001_stats_schema_up.sql criou o role?)`, err)
+		t.Fatalf(`SET ROLE adserver_stats_writer: %v (db/seed/dev_roles.sql foi aplicado depois das migrations?)`, err)
 	}
 	// set_config(..., true), not a literal `SET LOCAL adserver.tenant_id = $1`:
 	// Postgres' SET command does not accept bind parameters at all (syntax

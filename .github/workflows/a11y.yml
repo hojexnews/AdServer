@@ -3,26 +3,37 @@
 # Materializa o alvo `make web-a11y` (G0/frontend E10): axe-core injetado via
 # @axe-core/puppeteer + puppeteer-core contra o Chrome JÁ INSTALADO no runner
 # (nenhum download de browser — puppeteer-core nunca baixa Chromium; ver
-# web/console/scripts/a11y-check.test.ts). Audita a rota /a11y-harness
-# (client-only, props-fixture, gated por A11Y_HARNESS=1 — nunca acessível em
-# produção real) contra as tags wcag2a/wcag2aa/wcag21a/wcag21aa/wcag22aa.
+# web/console/scripts/a11y-check.test.ts). Audita a rota sintética
+# /a11y-harness (client-only, props-fixture, gated por A11Y_HARNESS=1 — nunca
+# acessível em produção real) E as 9 rotas reais do console (advertisers,
+# campaigns, banners, sites, zones, rules, dashboard, billing, copilot —
+# wave 30, achado a11y-ci-harness-only-real-pages-unaudited; ver
+# PAGES_TO_AUDIT em web/console/scripts/a11y-check.test.ts para o alcance
+# exato de cada rota real sem um BFF vivo) contra as tags
+# wcag2a/wcag2aa/wcag21a/wcag21aa/wcag22aa.
 #
 # Separado do workflow `web.yml` (make web-ci) de propósito: builda o Next.js
 # e sobe um browser real — mais lento que typecheck+lint+test, não deve
 # bloquear feedback rápido de PR.
 name: a11y (WCAG 2.2 AA)
 
+# bff/** entra no filtro pelo mesmo motivo de web.yml: `make web-a11y` roda
+# `next build`, que typecheca o console e portanto carrega bff/src/**.
 on:
   pull_request:
     paths:
       - "web/console/**"
+      - "bff/**"
       - "make/web.mk"
+      - "make/bff.mk"
       - ".github/workflows/a11y.yml"
   push:
     branches: [main]
     paths:
       - "web/console/**"
+      - "bff/**"
       - "make/web.mk"
+      - "make/bff.mk"
       - ".github/workflows/a11y.yml"
 
 permissions:
@@ -36,8 +47,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
-      - name: install deps
+      - name: install deps (console)
         run: make web-install
+      # Obrigatório: `make web-a11y` roda `next build`, que typecheca o console
+      # e resolve pg/zod/@trpc/server de bff/node_modules. Sem este passo o job
+      # morria no build — o axe NUNCA chegou a executar neste workflow.
+      - name: install deps (bff — exigido pelo build do console)
+        run: make bff-install
       - name: resolve chrome do runner (sem download de browser)
         run: |
           CHROME_BIN="$(command -v google-chrome-stable || command -v google-chrome || command -v chromium-browser || command -v chromium || true)"

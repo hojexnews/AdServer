@@ -120,6 +120,21 @@ type CampaignZoneRow struct {
 	ZoneID     string
 }
 
+// DeliveredRow is one per-campaign aggregate of delivered counts, sourced
+// from the perfil BETA Postgres telemetry sink (stats.events_raw — ADR-0005,
+// db/stats/migrations/0001_stats_schema_up.sql). impressions counts only
+// billable=true rows (CA-6: a blank impression is never "delivered" for
+// pacing purposes, same rule stats.live_kpis already applies). A campaign
+// with no rows in the stats store simply has no DeliveredRow — see
+// Assemble, which leaves snapshot.Campaign's Delivered* fields at their
+// zero value for any campaign absent from this slice.
+type DeliveredRow struct {
+	CampaignID  string
+	Impressions int64
+	Clicks      int64
+	Conversions int64
+}
+
 // RawConfig is the full set of rows pulled from db/config for one snapshot.
 type RawConfig struct {
 	Zones         []ZoneRow
@@ -128,6 +143,12 @@ type RawConfig struct {
 	Caps          []CapRow
 	Rules         []RuleRow
 	CampaignZones []CampaignZoneRow
+	// Delivered is OPTIONAL: nil/empty when the stats store is unavailable
+	// (see PostgresLoader.loadDelivered's degradation policy). Every
+	// snapshot.Campaign.Delivered* field simply stays at its zero value in
+	// that case — identical to this package's behavior before DeliveredRow
+	// existed.
+	Delivered []DeliveredRow
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +228,21 @@ func Assemble(raw RawConfig, version string, now time.Time) *snapshot.Snapshot {
 		applyCaps(capsByOwner["campaign:"+cr.ID],
 			&camp.CapTotal, &camp.CapSession, &camp.CapClock, &camp.CapClockWindowSec)
 		snap.Campaigns[cr.ID] = camp
+	}
+
+	// Delivered counts (DA-4 pacing input; perfil BETA / ADR-0005 — see
+	// DeliveredRow's doc). Matched onto the campaigns just built above; a
+	// campaign_id present in raw.Delivered but absent from snap.Campaigns
+	// (e.g. a since-deleted campaign with historical events) is silently
+	// dropped — there is no snapshot.Campaign to attach it to, and this is
+	// not a targeting/eligibility change (no campaign is added, removed, or
+	// filtered by this loop — only an existing Campaign's counters are set).
+	for _, d := range raw.Delivered {
+		if camp, ok := snap.Campaigns[d.CampaignID]; ok {
+			camp.DeliveredImpressions = d.Impressions
+			camp.DeliveredClicks = d.Clicks
+			camp.DeliveredConversions = d.Conversions
+		}
 	}
 
 	// Banners — attach to campaigns and compute eligible rule sets.

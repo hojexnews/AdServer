@@ -294,15 +294,66 @@ export async function middleware(request: NextRequest): Promise<NextResponse> {
       );
     }
 
-    // ---- 5. Verifica Origin para rotas de mutação (M1 — CSRF defense-in-depth) ----
-    // A verificação completa de CSRF está no BFF (context.ts).
-    // O middleware adiciona uma camada extra: rejeita mutations SSE/tRPC
-    // cujo Origin não está na allow-list.
-    const origin = request.headers.get("origin");
-    const isStateMutatingRoute =
-      /^\/api\/trpc\//.test(pathname) || /^\/api\/copilot\//.test(pathname);
+    // ---- 5. CSRF (M1 — defense-in-depth; a verificação completa está no BFF) ----
+    //
+    // FIX (31ª onda, copilot-stream-get-csrf): a condição anterior era
+    // `origin !== null && !ALLOWED_ORIGINS.has(origin)` — ou seja, requisição
+    // SEM header Origin passava direto. Navegadores omitem Origin em GET
+    // same-origin, então a checagem simplesmente não existia para
+    // `GET /api/copilot/stream/:id?message=...` — uma rota que dispara chamada
+    // PAGA de LLM no tenant da vítima.
+    //
+    // Duas camadas, escolhidas para NÃO quebrar o EventSource:
+    //
+    //   (a) Sec-Fetch-Site — enviado por navegadores modernos em TODA
+    //       requisição, inclusive GET same-origin (ao contrário de Origin).
+    //       Só `same-origin` e `none` passam; `cross-site` e `same-site` são
+    //       rejeitados. Ausência é tolerada (navegador antigo / cliente
+    //       não-browser): endurecer isso quebraria compatibilidade, e a
+    //       camada (b) + a política SameSite do cookie cobrem esse caso.
+    //
+    //   (b) Origin obrigatório em métodos que mudam estado (não-GET/HEAD).
+    //       Aqui o fail-closed é seguro: navegadores SEMPRE enviam Origin em
+    //       POST, então ausência indica cliente forjado. É o caso das mutations
+    //       tRPC (hitlApprove/hitlReject/chat). Para GET, a allow-list de
+    //       Origin segue aplicada quando o header está presente — redundante
+    //       com (a) nos navegadores modernos, mas é a única barreira nos que
+    //       não enviam Sec-Fetch-Site.
+    // Bloqueia `cross-site` E `same-site`. Só `same-origin` e `none` passam.
+    //
+    // `same-site` cobre um subdomínio do MESMO site registrável — por exemplo
+    // um blog ou uma landing em `*.hojex.com` que sofra XSS. O console não faz
+    // nenhuma requisição legítima cross-origin para si mesmo (o cliente tRPC e
+    // o EventSource usam caminhos relativos, sempre `same-origin`), então
+    // aceitar `same-site` só ampliaria a superfície sem habilitar nada
+    // (31ª onda, CSRF-SAME-SITE-BYPASS).
+    //
+    // `none` = navegação digitada na barra de endereço / favorito: legítima.
+    // Header ausente = navegador antigo ou cliente não-browser; a camada (b)
+    // abaixo e a política SameSite do cookie continuam valendo.
+    const secFetchSite = request.headers.get("sec-fetch-site");
+    if (secFetchSite === "cross-site" || secFetchSite === "same-site") {
+      return NextResponse.json(
+        { error: "Origem não permitida." },
+        { status: 403 }
+      );
+    }
 
-    if (isStateMutatingRoute && origin !== null && !ALLOWED_ORIGINS.has(origin)) {
+    const origin = request.headers.get("origin");
+    const method = request.method.toUpperCase();
+    const isSafeMethod = method === "GET" || method === "HEAD";
+
+    if (!isSafeMethod) {
+      // Fail-closed: sem Origin OU fora da allow-list.
+      if (origin === null || !ALLOWED_ORIGINS.has(origin)) {
+        return NextResponse.json(
+          { error: "Origem não permitida." },
+          { status: 403 }
+        );
+      }
+    } else if (origin !== null && !ALLOWED_ORIGINS.has(origin)) {
+      // GET com Origin explícito fora da allow-list (requisição cross-origin
+      // de verdade) continua barrado.
       return NextResponse.json(
         { error: "Origem não permitida." },
         { status: 403 }

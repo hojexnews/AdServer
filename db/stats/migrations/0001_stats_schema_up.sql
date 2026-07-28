@@ -117,6 +117,25 @@
 --   Isto é aceitável para validar o funil "ao vivo" agora; um job de
 --   retenção (ou a migração para ClickHouse, que É o destino de longo
 --   prazo) precisa endereçar isso antes de um beta de longa duração.
+--   Higiene sugerida (não implementada aqui): expurgo por occurred_at com
+--   teto de ~90 dias — mesmo teto de privacidade já usado por
+--   internal/capping.campaignTotalTTL (DA-6/TX-5/DA-11) — antes de operar
+--   um beta prolongado.
+--
+-- CONDIÇÃO DE REABERTURA DE DPIA (achado do privacy-compliance-auditor,
+--   onda "perfil BETA"): a auditoria de 1ª mão contra Postgres real
+--   confirmou que NENHUMA das 16 colunas desta tabela é ligável a pessoa —
+--   sem IP, sem user-agent bruto, sem cookie/user_id, sem geo (ver
+--   internal/telemetry/pgsink.EmitAdRequest, "Privacy", sobre por que geo/
+--   uaClass/refererURL/cachebuster/customVars nunca chegam aqui). Por isso
+--   a retenção indefinida acima é um residual de higiene, não um bloqueio.
+--   ESTA CONCLUSÃO DEPENDE DO SCHEMA ATUAL: no dia em que QUALQUER coluna
+--   ligável a pessoa (IP, e-mail, cookie, user_id, geo granular etc.) for
+--   adicionada a stats.events_raw — por esta migration ou por uma futura —
+--   esta análise fica obsoleta e o schema exige uma DPIA antes de subir.
+--   Nenhuma migration futura que adicione tal coluna deve se apoiar nesta
+--   nota como cobertura; ela vale só para o schema exatamente como está
+--   definido nesta versão.
 -- =============================================================================
 
 CREATE SCHEMA IF NOT EXISTS stats;
@@ -236,24 +255,48 @@ CREATE POLICY events_raw_tenant_isolation ON stats.events_raw
     WITH CHECK (tenant_id = stats.current_tenant_id());
 
 COMMENT ON POLICY events_raw_tenant_isolation ON stats.events_raw IS
-    'Isola eventos por tenant. Fail-closed: sem adserver.tenant_id setado, '
-    'nenhuma linha visível. WITH CHECK: banco rejeita INSERT/UPDATE com '
-    'tenant_id diferente do tenant corrente da sessão (TX-3).';
+    'TX-3. USING: isola LEITURA por tenant — fail-closed, sem '
+    'adserver.tenant_id setado nenhuma linha e visivel. WITH CHECK: banco '
+    'rejeita INSERT/UPDATE cujo tenant_id da LINHA diverge do GUC '
+    'adserver.tenant_id da SESSAO. O QUE ISSO NAO GARANTE (achado H-1b, '
+    'security-reviewer): o GUC e o tenant_id da linha nascem da MESMA '
+    'origem nao confiavel -- o `?tid=` da query string do /lg,/ck,/ct, nao '
+    'autenticado (ver internal/telemetry/pgsink, pendingEvent.tenantID e a '
+    'nota "Multi-tenant RLS on the write path" no pacote). Um chamador que '
+    'forja ?tid= controla os dois lados da comparacao igualmente e passa '
+    'por este WITH CHECK trivialmente com qualquer tenant_id sintaticamente '
+    'valido. A policy prova CONSISTENCIA interna (GUC e linha nunca '
+    'divergem -- pega um bug de codigo que tentasse gravar uma linha com '
+    'tenant diferente do que a transacao anunciou), NAO autenticidade do '
+    'tenant perante um cliente nao confiavel. A mitigacao do lado do dado '
+    '(filtro por tenant confiavel no consumidor/agregador rio abaixo) e de '
+    'outro dono e ja esta encaminhada -- nao reinventada aqui.';
 
 -- ---------------------------------------------------------------------------
--- adserver_stats_writer — role dedicada, criada de forma auto-contida NESTA
--- migration (diferente de adserver_app/adserver_loader/adserver_copilot, que
--- são centralizados em db/seed/dev_roles.sql — fora do escopo de arquivos
--- desta onda). Padrão de criação idempotente idêntico ao de dev_roles.sql.
+-- adserver_stats_writer — role dedicada de escrita.
+--
+-- CORRIGIDO (achado H-2, security-reviewer, onda "perfil BETA"): a primeira
+-- versão desta migration criava o role AQUI, de forma "auto-contida", com
+-- `CREATE ROLE ... LOGIN PASSWORD 'stats_writer_dev_only'` literal. Como
+-- `stats` está em DB_SCHEMAS (make/db.mk), um `make db-migrate-up` comum
+-- (fluxo documentado em db/README.md) roda esta migration contra QUALQUER
+-- DATABASE_URL — inclusive staging/produção — e criaria um role com LOGIN e
+-- senha conhecida no banco real. Pior: o `_down` desta migration
+-- deliberadamente NÃO dropa roles (mesma convenção do resto do repo — ver
+-- cabeçalho de 0001_stats_schema_down.sql), então a credencial sobreviveria
+-- à reversão. A criação do role agora é centralizada em
+-- db/seed/dev_roles.sql — MESMO padrão de adserver_app/adserver_loader/
+-- adserver_copilot, que já viviam lá. Em produção a credencial vem do
+-- OpenBao (platform/secrets/openbao), nunca de um arquivo versionado —
+-- db/seed/ é DEV/LOCAL ONLY (ver o próprio cabeçalho desse arquivo).
 --
 -- Least-privilege: INSERT em events_raw. NÃO tem UPDATE/DELETE — o pgsink
 -- nunca apaga nem modifica o que grava (append-only, mesmo espírito do
 -- REVOKE UPDATE,DELETE em ledger.postings). NOBYPASSRLS explícito: o pgsink
 -- grava com SET LOCAL adserver.tenant_id por-evento (uma transação por
 -- evento) e depende da policy WITH CHECK para nunca gravar tenant_id
--- divergente — não porque confia no valor recebido, mas para que a MESMA
--- garantia de banco valha tanto para o pgsink quanto para qualquer outro
--- escritor futuro.
+-- divergente — ver a nota H-1b no COMMENT ON POLICY logo abaixo sobre
+-- exatamente o que essa garantia cobre e o que ela NÃO cobre.
 --
 -- GRANT SELECT (medido, não assumido): o `INSERT ... ON CONFLICT (event_id)
 -- DO NOTHING` exigido pela idempotência (DA-7) FALHA com "permission denied"
@@ -264,18 +307,19 @@ COMMENT ON POLICY events_raw_tenant_isolation ON stats.events_raw IS
 -- confidencialidade: RLS + FORCE ROW LEVEL SECURITY continuam valendo para
 -- este role (NOBYPASSRLS), então mesmo com SELECT ele só enxergaria linhas
 -- do tenant corrente da própria transação — nunca cross-tenant.
+--
+-- Comentado aqui DELIBERADAMENTE (mesma convenção já usada logo abaixo para
+-- adserver_app, e de db/vector/migrations/0002_vector_rls_up.sql): esta
+-- migration não pode falhar num banco onde adserver_stats_writer ainda não
+-- existe — e depois do achado H-2 ela NUNCA mais cria esse role. A execução
+-- real (descomentada) roda em make/dev.mk::dev-db-setup e
+-- .github/workflows/db.yml, SEMPRE depois de db/seed/dev_roles.sql garantir
+-- que o role existe.
+--
+-- GRANT USAGE ON SCHEMA stats TO adserver_stats_writer;
+-- GRANT SELECT, INSERT ON stats.events_raw TO adserver_stats_writer;
+-- GRANT EXECUTE ON FUNCTION stats.current_tenant_id() TO adserver_stats_writer;
 -- ---------------------------------------------------------------------------
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'adserver_stats_writer') THEN
-        CREATE ROLE adserver_stats_writer LOGIN PASSWORD 'stats_writer_dev_only' NOBYPASSRLS;
-    END IF;
-END
-$$;
-
-GRANT USAGE ON SCHEMA stats TO adserver_stats_writer;
-GRANT SELECT, INSERT ON stats.events_raw TO adserver_stats_writer;
-GRANT EXECUTE ON FUNCTION stats.current_tenant_id() TO adserver_stats_writer;
 
 -- ---------------------------------------------------------------------------
 -- stats.live_kpis — "ao vivo" (DA-7). Contrato fixo com o BFF: colunas

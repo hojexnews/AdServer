@@ -10,12 +10,22 @@
 //   - No synchronous network call in the hot path beyond Redis capping
 //     (best-effort + fail-safe DA-6).
 //   - Every response includes a decision_id and model_version (even blank — TX-1).
-//   - The IP address is resolved to geo and then immediately discarded (TX-5/DA-11).
+//   - This service DOES see a client IP: POST /v1/decide is called directly
+//     by the browser's ad tag (a client-side fetch()), so r.RemoteAddr /
+//     X-Forwarded-For carry the real client IP. Explicit geo_country/geo_city
+//     in the request body always win (see the DecideRequest.GeoCountry/GeoCity
+//     doc comment below); when the body carries neither, this handler derives
+//     Geo from the request IP via internal/clientip.ResolveAndDiscard — the
+//     SAME function services/collector uses — and discards the IP immediately
+//     after (TX-5/DA-11). The IP is never logged, stored, or forwarded.
 //   - tenant_id is DERIVED SERVER-SIDE from the zone_id via snapshot (CA-1).
 //     Any tenant_id supplied by the client is IGNORED.
 //   - DecisionSink (I2): Redpanda producer with WAL + at-least-once + dedupe.
 //   - Capper (I2): Redis-backed with fail-safe — no id → abort capped campaigns.
-//   - GeoResolver (I2): MaxMind GeoLite2 in memory; degraded to empty on miss.
+//   - GeoResolver (I2): MaxMind GeoLite2 in memory, consulted on the served
+//     path as the IP-derived fallback described above; degrades to empty
+//     (EmptyResolver) when GEOIP_DB_PATH is unset, same as an absent
+//     GeoCountry/GeoCity in the request — never a hot-path failure (DA-9).
 //   - Ranker (Fase 2 extension point): DefaultRanker in I0/I2; ML ranker in I4+.
 //   - Click tokens: HMAC-SHA256 signed at serve time (CK_HMAC_SECRET, fail-closed).
 //   - Capping salt: CAPPING_SALT required at boot; fail-closed if absent.
@@ -37,10 +47,12 @@ import (
 	decisionv1 "github.com/hojex/adserver/gen/go/adserver/decision/v1"
 	"github.com/hojex/adserver/internal/capping"
 	"github.com/hojex/adserver/internal/cascade"
+	"github.com/hojex/adserver/internal/clientip"
 	"github.com/hojex/adserver/internal/clicktoken"
 	"github.com/hojex/adserver/internal/configload"
 	"github.com/hojex/adserver/internal/geo"
 	mlranker "github.com/hojex/adserver/internal/ranker"
+	"github.com/hojex/adserver/internal/referer"
 	"github.com/hojex/adserver/internal/rules"
 	"github.com/hojex/adserver/internal/snapshot"
 	"github.com/hojex/adserver/internal/telemetry"
@@ -93,15 +105,45 @@ type DecideRequest struct {
 	// The tenant_id is derived SERVER-SIDE from this zone_id via the snapshot (CA-1).
 	// Any "tenant_id" field sent by the client is IGNORED.
 	ZoneID string `json:"zone_id"`
-	// Geo fields: pre-derived by the collector before reaching this endpoint.
-	// The collector discards the IP after deriving these (TX-5/DA-11).
-	// When called from the asyncjs JS tag, the collector derives geo from
-	// the client IP and passes only country+city here.
+	// Geo fields: OPTIONAL. On the served path — the ad tag's direct browser
+	// fetch() to POST /v1/decide (see buildAdTagJS in services/collector) —
+	// these normally arrive EMPTY, because the browser has no IP-to-geo
+	// capability of its own and the ad tag never calls a geo API. When BOTH
+	// are empty, ServeHTTP derives Geo-Country/Geo-City itself from the
+	// REQUEST'S OWN IP (r.RemoteAddr / X-Forwarded-For — this endpoint is a
+	// direct browser connection, so it legitimately sees the raw client IP)
+	// via internal/clientip.ResolveAndDiscard, backed by the SAME
+	// geo.MaxMindResolver constructed at boot (see main()) — the IP is
+	// discarded immediately after that call (TX-5/DA-11); it never reaches
+	// this struct, a log line, or an emitted event.
+	//
+	// If EITHER field is explicitly supplied here, it is used AS-IS and the
+	// IP-derived fallback does NOT run — explicit input always wins (this is
+	// what deploy/local/smoke.sh and `make beta-check` rely on to exercise
+	// the Geo-Country delivery rule (§4.6) deterministically, independent of
+	// whatever IP the test harness happens to connect from).
 	GeoCountry string `json:"geo_country,omitempty"`
 	GeoCity    string `json:"geo_city,omitempty"`
-	// UserAgent of the end-user browser (coarse class only — never raw UA).
+	// UserAgent of the end-user browser. On the served path this is the RAW
+	// navigator.userAgent string sent directly by the ad tag — NOT a coarse
+	// class. It is used only within this request's stack frame for
+	// Client-Useragent rule matching (rules.Context.UserAgent) and is never
+	// logged, persisted, or included in the emitted Decision event. Rule
+	// matching intentionally needs the raw string — legacy-parity device
+	// targeting relies on substrings such as "contains android" (see the
+	// CA-4 golden tests); reducing it to a coarse class here would change
+	// rule-matching semantics. The coarse-class reduction (useragent.Classify)
+	// is a SEPARATE value used only by the collector's /asyncjs → AdRequest
+	// telemetry event — the two paths do not share a UA representation today.
 	UserAgent string `json:"user_agent,omitempty"`
-	// SiteURL is the referer / page URL (sanitized: scheme+host+path only).
+	// SiteURL is the page location reported directly by the ad tag as
+	// location.origin + location.pathname (query string and fragment are
+	// stripped client-side before this request is ever sent — see
+	// buildAdTagJS). It is defensively re-sanitized server-side
+	// (internal/referer.Sanitize, the same function the collector uses for
+	// its Referer header) before being used for Site-URL rule matching,
+	// since this endpoint is called directly by the browser and cannot
+	// assume the caller already sanitized its input.
 	SiteURL string `json:"site_url,omitempty"`
 	// SiteVars are first-party custom variables from the ad tag.
 	SiteVars map[string]string `json:"site_vars,omitempty"`
@@ -143,6 +185,36 @@ type DecideResponse struct {
 	Height   int32  `json:"height,omitempty"`
 }
 
+// buildRulesContext constructs the rules.Context used for cascade/rule
+// evaluation from an incoming DecideRequest.
+//
+// PRIVACY (TX-5/DA-11, PRIV-01): SiteURL is re-sanitized here with the SAME
+// function the collector uses for its Referer header (internal/referer.
+// Sanitize — query string and fragment stripped, only scheme+host+path
+// retained). This endpoint is called directly by the browser's ad tag (see
+// buildAdTagJS in services/collector), so decision cannot assume the caller
+// already stripped identifying query parameters or fragments; sanitizing on
+// receipt, before the value is used for rule matching or could reach any
+// future log/telemetry field, closes that gap regardless of what the client
+// actually sent.
+//
+// UserAgent is passed through UNCHANGED (raw, not classified): Client-
+// Useragent rule matching requires raw substring semantics (e.g. "contains
+// android") for parity with legacy device-targeting rules (CA-4 golden
+// tests) — reducing it to a coarse class here would change that matching
+// behaviour. See the DecideRequest.UserAgent doc comment for the full
+// rationale and the confinement invariant (raw UA never leaves this
+// request's stack frame into any persisted or logged artifact).
+func buildRulesContext(req DecideRequest, g *commonv1.Geo, now time.Time) *rules.Context {
+	return &rules.Context{
+		Geo:         g,
+		SiteURL:     referer.Sanitize(req.SiteURL),
+		UserAgent:   req.UserAgent,
+		RequestTime: now,
+		SiteVars:    req.SiteVars,
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
@@ -153,6 +225,20 @@ type decisionHandler struct {
 	sink        DecisionSink
 	logger      *slog.Logger
 	clickSigner *clicktoken.Signer // nil → click tokens omitted (degraded)
+
+	// geoResolver / trustedDepth: IP-derived geo fallback (TX-5/DA-11).
+	// POST /v1/decide is called directly by the browser, so this handler DOES
+	// see a raw client IP (unlike the rest of this file's historical
+	// assumption). geoResolver is never nil — geo.NewMaxMindResolver already
+	// degrades to geo.EmptyResolver{} when GEOIP_DB_PATH is unset, so a
+	// missing database degrades to an empty Geo, not a nil dereference or a
+	// hot-path error (DA-9). trustedDepth mirrors services/collector's
+	// TRUSTED_PROXY_DEPTH handling via the shared internal/clientip package —
+	// see ServeHTTP for where this is consulted (ONLY when the request body
+	// supplies neither geo_country nor geo_city; explicit body values always
+	// win — see buildRulesContext callers below).
+	geoResolver  geo.Resolver
+	trustedDepth int
 
 	// mlRanker is the ML re-ranker client (Fase 2 / J1).
 	// nil when RANKER_ENABLED=false (default in J1 — flag is OFF by default).
@@ -286,11 +372,29 @@ func (h *decisionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// tenantID is authoritative from snapshot — never from client input.
 	tenantID := zone.TenantID
 
-	// Geo is passed in already-derived by the collector (TX-5/DA-11):
-	// no IP is present or needed in this handler.
+	// Geo (TX-5/DA-11, DA-9): explicit geo_country/geo_city in the request
+	// body ALWAYS win — this is the precedence deploy/local/smoke.sh and
+	// `make beta-check` rely on to exercise the contract tier deterministically,
+	// and it lets any caller (test, future server-to-server integration)
+	// override geo without depending on network topology.
+	//
+	// Only when the body supplies NEITHER field do we fall back to deriving
+	// Geo from the request's own IP: POST /v1/decide is called directly by
+	// the browser's ad tag, so this handler legitimately sees the raw client
+	// IP in r.RemoteAddr/X-Forwarded-For. clientip.ResolveAndDiscard is the
+	// SOLE enforcement point for that derivation — the IP is used only
+	// inside that call and is never returned, logged, stored, or forwarded
+	// (see internal/clientip's package doc). h.geoResolver is never nil (see
+	// decisionHandler doc) and never errors — a missing/unloaded database or
+	// unresolvable IP degrades to an empty Geo, exactly like an absent
+	// geo_country/geo_city in the body (DA-9: silence, never a hot-path
+	// failure).
 	g := &commonv1.Geo{
 		Country: req.GeoCountry,
 		City:    req.GeoCity,
+	}
+	if g.Country == "" && g.City == "" && h.geoResolver != nil {
+		g = clientip.ResolveAndDiscard(r, h.trustedDepth, h.geoResolver)
 	}
 
 	now := time.Now().UTC()
@@ -299,13 +403,7 @@ func (h *decisionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// including blank (TX-1 invariant).
 	decisionID := telemetry.NewULID()
 
-	rulesCtx := &rules.Context{
-		Geo:         g,
-		SiteURL:     req.SiteURL,
-		UserAgent:   req.UserAgent,
-		RequestTime: now,
-		SiteVars:    req.SiteVars,
-	}
+	rulesCtx := buildRulesContext(req, g, now)
 
 	cascadeReq := cascade.Request{
 		ZoneID:      req.ZoneID,
@@ -609,22 +707,46 @@ func main() {
 	}
 
 	// ---------------------------------------------------------------------------
-	// Geo resolver (I2): MaxMind GeoLite2 in memory.
-	// NOTE: The decision service itself does NOT see raw IPs — geo is derived
-	// by the collector and passed as pre-resolved fields in the JSON body (TX-5).
-	// The geo resolver is kept here for any future direct-client paths.
+	// Geo resolver (I2/DA-9): MaxMind GeoLite2 in memory, consulted on the
+	// served path as the IP-derived fallback (see ServeHTTP). POST /v1/decide
+	// IS a direct browser fetch(), so this service legitimately sees the raw
+	// client IP; internal/clientip.ResolveAndDiscard (the SAME function
+	// services/collector uses) is the sole point that reads it and discards
+	// it immediately after deriving Geo (TX-5/DA-11).
+	//
+	// geoResolver degrades to geo.EmptyResolver{} when GEOIP_DB_PATH is unset
+	// or the file cannot be opened — geo-targeting rules simply won't match,
+	// never a hot-path failure (DA-9). Resolve is an in-memory mmap lookup
+	// (no per-request network I/O — TX-4 budget unaffected).
+	//
+	// Hot-reload (G0/E5): mirrors services/collector — poll the .mmdb file's
+	// mtime and hot-swap the in-memory reader without a restart, via the
+	// SAME geo.RunReloader loop (see the goroutine wired below, after ctx is
+	// created).
 	// ---------------------------------------------------------------------------
 	geoDBPath := envOr("GEOIP_DB_PATH", "")
-	_ = geo.NewMaxMindResolver(geoDBPath, logger) // wired; unused in I2 direct path
+	geoResolver := geo.NewMaxMindResolver(geoDBPath, logger)
+	trustedDepth := clientip.TrustedDepthFromEnv()
 
 	// ---------------------------------------------------------------------------
 	// Capper (I2): Redis-backed with fail-safe (DA-6).
 	// Falls back to NoOpCapper if Redis is not configured.
 	// CAPPING_SALT is validated above; no default fallback here.
+	//
+	// ADR-0005 (perfil BETA de dependência única — Postgres): CAPPING_BACKEND=
+	// memory opts a single-node beta deployment into capping.MemoryClient, a
+	// single-process in-memory RedisClient that reuses the SAME capping.Capper
+	// logic (salted keys, TTL, scope precedence, fail-safe) proven against
+	// Redis — see internal/capping/memory.go. This branch is checked ONLY when
+	// REDIS_ADDR is unset, so REDIS_ADDR always wins if both are set, and the
+	// pre-existing default (NoOpCapper when neither is set) is UNCHANGED —
+	// this is purely additive, opt-in behavior (ADR-0005 §3).
 	// ---------------------------------------------------------------------------
 	var cappingImpl cascade.Capper = cascade.NoOpCapper{}
 	redisAddr := envOr("REDIS_ADDR", "")
-	if redisAddr != "" {
+	cappingBackend := envOr("CAPPING_BACKEND", "")
+	switch {
+	case redisAddr != "":
 		rdb := redis.NewClient(&redis.Options{
 			Addr:         redisAddr,
 			DialTimeout:  10 * time.Millisecond,
@@ -634,7 +756,13 @@ func main() {
 		// cappingSalt is already validated non-empty above.
 		cappingImpl = capping.New(rdb, cappingSalt)
 		logger.Info("capping: Redis-backed capper active", "addr", redisAddr)
-	} else {
+	case cappingBackend == "memory":
+		memClient := capping.NewMemoryClient()
+		cappingImpl = capping.New(memClient, cappingSalt)
+		logger.Warn("capping: CAPPING_BACKEND=memory — SINGLE-PROCESS in-memory capper active (ADR-0005 beta profile). " +
+			"Counters are NOT shared across replicas and are LOST on restart. " +
+			"Do not use this outside a single-node beta; set REDIS_ADDR for production.")
+	default:
 		logger.Warn("capping: REDIS_ADDR not set; using NoOpCapper (no cap enforcement)")
 	}
 
@@ -948,12 +1076,14 @@ func main() {
 	})
 
 	mux.Handle("POST /v1/decide", &decisionHandler{
-		snap:        store,
-		cascade:     cascadeEngine,
-		sink:        sink,
-		logger:      logger,
-		clickSigner: clickSigner,    // nil → click tokens omitted (degraded mode)
-		mlRanker:    activeMLRanker, // nil when RANKER_ENABLED=false (default)
+		snap:         store,
+		cascade:      cascadeEngine,
+		sink:         sink,
+		logger:       logger,
+		clickSigner:  clickSigner,    // nil → click tokens omitted (degraded mode)
+		geoResolver:  geoResolver,    // never nil — degrades to geo.EmptyResolver{}
+		trustedDepth: trustedDepth,   // IP-derived geo fallback (TX-5/DA-11, DA-9)
+		mlRanker:     activeMLRanker, // nil when RANKER_ENABLED=false (default)
 		// Shadow (J3) immutable-during-serving dependencies; nil/zero when
 		// SHADOW_ENABLED=false (default) — wrapped per-request in ServeHTTP.
 		shadowML:           activeShadowML,
@@ -980,6 +1110,18 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Geo hot-reload (G0/E5, DA-9): mirrors services/collector exactly, via
+	// the SAME shared loop (geo.RunReloader) — poll the .mmdb file's mtime
+	// and hot-swap the in-memory reader without restarting this process,
+	// whenever the auto-update job (§4.10) atomically replaces the file on
+	// disk. Only wired when a real *geo.MaxMindResolver is active
+	// (EmptyResolver never reloads). Bound to ctx so it stops at shutdown.
+	if geoDBPath != "" {
+		if mm, ok := geoResolver.(*geo.MaxMindResolver); ok {
+			go geo.RunReloader(ctx, mm, geoDBPath, geo.ReloadIntervalFromEnv(), logger)
+		}
+	}
 
 	// Start the periodic config refresher (no-op when DATABASE_URL is unset).
 	if cfgLoader != nil {

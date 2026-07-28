@@ -1,12 +1,12 @@
 /**
- * Testes do PostgresConfigAdapter — wave 14 (Fase 3).
+ * Testes do PostgresConfigAdapter — wave 14 (Fase 3); seção 7 = wave 30.
  *
  * Espelha postgres-payments.test.ts. Sem Postgres real: um mock de Pool/Client
  * registra a sequência de queries emitidas. Prova, na camada de aplicação, as
  * garantias que o teste de RLS (db/config/tests/rls_isolation_test.sql) prova no
  * banco:
  *
- *   1. TX-3 / CA-1 — isolamento por tenant:
+ *   1. TX-3 / CA-1 — isolamento por tenant (amostra detalhada):
  *      toda operação abre uma transação e injeta
  *        SELECT set_config('adserver.tenant_id', $1, true)
  *      na MESMA conexão ANTES da query de dados; COMMIT ao fim; ROLLBACK+rethrow
@@ -24,6 +24,17 @@
  *   4. buildSet — UPDATE parcial pula `undefined` e preserva `null`.
  *
  *   5. notFound — update/delete de id inexistente (0 linhas) → TRPCError NOT_FOUND.
+ *
+ *   7. TX-3/CA-1 default-deny (wave 30, achado bff-pg-adapter-set-config-not-
+ *      default-deny): a seção 1 acima cobria só 2 dos 39 métodos públicos do
+ *      adapter por amostragem — um método NOVO que usasse this.pool.query
+ *      diretamente (sem passar por withTenant) perdia o GUC de tenant e
+ *      nenhum teste via. A seção 7 enumera TODOS os métodos públicos por
+ *      reflexão sobre o prototype (não uma lista manual) e afirma a mesma
+ *      propriedade — BEGIN → set_config(tenantId) antes de qualquer dado —
+ *      para cada um. Um método novo é coberto automaticamente; um método que
+ *      esqueça o GUC quebra o teste. O piso da sentinela (seção 7 abaixo)
+ *      acompanha a contagem real — ver achado #4 da remediação wave 30.
  */
 
 import { createConfigPool, PostgresConfigAdapter } from "./postgres-config.js";
@@ -420,6 +431,82 @@ describe("HIGH — guarda de parent/owner cross-tenant", () => {
     expect(queries.some((q) => q.text.startsWith("SELECT 1 FROM config.advertisers"))).toBe(true);
     expect(queries.some((q) => q.text.includes("INSERT INTO config.campaigns"))).toBe(true);
   });
+});
+
+// ---------------------------------------------------------------------------
+// 7. TX-3/CA-1 default-deny — TODOS os métodos públicos, por reflexão
+//    (achado wave 30: bff-pg-adapter-set-config-not-default-deny)
+// ---------------------------------------------------------------------------
+
+describe("TX-3/CA-1 default-deny — reflexão sobre TODOS os métodos públicos do adapter", () => {
+  // Allowlist de EXCLUSÃO explícita e comentada — nunca uma lista de inclusão
+  // manual dos métodos cobertos (isso reintroduziria o mesmo ponto-cego).
+  // Cada exceção abaixo é um helper PRIVADO de implementação, não uma
+  // operação de dados chamável pelos routers tRPC:
+  const PRIVATE_HELPER_ALLOWLIST = new Set<string>([
+    // withTenant É o próprio mecanismo (BEGIN + set_config + fn + COMMIT).
+    // Chamá-lo diretamente não prova nem refuta nada sobre um método público
+    // esquecer o guard — ele é o guard sendo testado.
+    "withTenant",
+    // assertParentVisible roda DENTRO de uma transação já aberta por
+    // withTenant — recebe PoolClient como 1º argumento (não tenantId), então
+    // não se encaixa no padrão (tenantId, ...) exercido abaixo. Sua cobertura
+    // vem da seção 6 (HIGH — guarda de parent/owner cross-tenant).
+    "assertParentVisible",
+  ]);
+
+  const proto = PostgresConfigAdapter.prototype as unknown as Record<string, unknown>;
+  const allMethodNames = Object.getOwnPropertyNames(proto).filter(
+    (m) => m !== "constructor" && typeof proto[m] === "function"
+  );
+  const publicDataMethods = allMethodNames.filter(
+    (m) => !PRIVATE_HELPER_ALLOWLIST.has(m)
+  );
+
+  // Sentinela anti-vazio: se a reflexão parar de enumerar métodos (refactor
+  // da classe, mudança de prototype chain), publicDataMethods cai para 0 e
+  // os test.each abaixo simplesmente não geram testes — falso-verde silencioso.
+  // Esta asserção incondicional pega isso.
+  //
+  // LOW (wave 30 remediação, achado #4 — "sentinelas com folga larga
+  // demais"): o piso era 35 contra 38 métodos reais, permitindo remover até
+  // 3 métodos sem alarme. Apertado para o número REAL de hoje (39, após
+  // getDeliveryRule) — `>=` continua permitindo crescimento legítimo (um
+  // método novo não quebra o piso), mas QUALQUER encolhimento agora falha.
+  test("sentinela: a reflexão enumerou pelo menos 39 métodos públicos de dados (piso = contagem real hoje)", () => {
+    expect(publicDataMethods.length).toBeGreaterThanOrEqual(39);
+  });
+
+  test.each(publicDataMethods)(
+    "%s: abre transação com BEGIN -> set_config(tenantId) ANTES de qualquer outra query",
+    async (methodName) => {
+      const { client, queries } = makeMockClient();
+      const adapter = new PostgresConfigAdapter(makeMockPool(client));
+      const TENANT = "default-deny-probe-tenant";
+
+      const method = (
+        adapter as unknown as Record<string, (...args: unknown[]) => Promise<unknown>>
+      )[methodName]!;
+
+      // Argumentos genéricos: tenantId sempre em 1º lugar; os demais são
+      // placeholders permissivos. Todo método público do adapter só acessa
+      // os argumentos posteriores DENTRO do callback async passado a
+      // withTenant — ou seja, depois que BEGIN/set_config já foram emitidos
+      // (ver postgres-config.ts: `return this.withTenant(tenantId, async (c)
+      // => { ...usa input/opts/id aqui... })`). Se o método rejeitar depois
+      // (ex.: NOT_FOUND por causa do placeholder), não importa — o que este
+      // teste prova é que o GUC de tenant é injetado ANTES de qualquer
+      // acesso a dados, para TODO método, sempre.
+      // .call(adapter, ...): método extraído do prototype por reflexão perde
+      // o `this` — sem bind explícito, `this.withTenant(...)` dentro do
+      // método quebraria com TypeError, não com o comportamento real testado.
+      await method.call(adapter, TENANT, {}, {}).catch(() => undefined);
+
+      expect(queries[0]?.text).toBe("BEGIN");
+      expect(queries[1]?.text).toBe("SELECT set_config('adserver.tenant_id', $1, true)");
+      expect(queries[1]?.values).toEqual([TENANT]);
+    }
+  );
 });
 
 // ---------------------------------------------------------------------------

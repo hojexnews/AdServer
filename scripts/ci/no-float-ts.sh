@@ -284,6 +284,69 @@ def strip_ts_non_code(src: str):
     return lines_code
 
 
+# -----------------------------------------------------------------------
+# JANELA DE ANALISE: co-ocorrencia por LOGICAL STATEMENT, nao por linha
+# fisica isolada (achado no-float-multiline-split-defeats-cooccurrence,
+# CRITICAL). O match por-linha-fisica original era derrotado por QUALQUER
+# quebra de linha do Prettier numa atribuicao/expressao longa:
+#   const rateAmount =
+#       12.50;
+# ("rateAmount" cai numa linha, "12.50" cai na proxima — nenhuma das duas
+# isoladas satisfaz a conjuncao E, e a violacao passava despercebida).
+#
+# FIX: agrupa linhas fisicas em "segmentos logicos" antes do match,
+# usando dois sinais de continuacao (TS nao tem tokenizer de linha logica
+# como Python; isto e um backstop textual, nao um parser completo):
+#   (a) parenteses/colchetes/chaves ainda abertos ao fim da linha
+#       (profundidade > 0) — cobre `const x = (\n  12.50\n)`;
+#   (b) a linha termina com um operador binario/atribuicao que exige
+#       continuacao (=, +, -, *, /, %, `,`, `:`, `?`, `&&`, `||`, `??`,
+#       `=>`) — cobre `const rateAmount =\n  12.50;` (sem parenteses).
+# CAP DE SEGURANCA (MAX_SEGMENT_LINES): sem isso, um `return (<JSX
+# gigante>)` classico do React manteria depth>0 por CENTENAS de linhas,
+# transformando o componente inteiro num unico segmento e explodindo
+# falsos-positivos (qualquer texto JSX com "R$ 12.50" en algum lugar do
+# componente co-ocorreria com qualquer sinal de codigo alhures no mesmo
+# JSX). Alem do cap, o segmento e forcado a fechar — cobre o caso real
+# (quebra do Prettier, tipicamente 2-4 linhas) sem se estender a blocos
+# JSX inteiros.
+# -----------------------------------------------------------------------
+CONT_TRAIL_PAT = re.compile(r'(?:(?<=\s)=>|(?<=\s)&&|(?<=\s)\|\||(?<=\s)\?\?|[=+\-*/%,:?])\s*$')
+MAX_SEGMENT_LINES = 6
+
+def build_logical_segments(lines_code: dict, total_lines: int):
+    """
+    Agrupa {lineno: [chars]} (ja sem comentarios/strings) em segmentos
+    logicos. Retorna lista de (start_lineno, {lineno: fragment_str}).
+    """
+    segments = []
+    buf: dict = {}
+    buf_start = None
+    depth = 0
+    for ln in range(1, total_lines + 1):
+        text = ''.join(lines_code.get(ln, []))
+        stripped = text.strip()
+        if buf_start is None:
+            if not stripped:
+                continue
+            buf_start = ln
+        buf[ln] = text
+        depth += text.count('(') + text.count('[') + text.count('{')
+        depth -= text.count(')') + text.count(']') + text.count('}')
+        if depth < 0:
+            depth = 0
+        at_cap = len(buf) >= MAX_SEGMENT_LINES
+        continues = (depth > 0 or (bool(stripped) and CONT_TRAIL_PAT.search(stripped))) and not at_cap
+        if not continues:
+            segments.append((buf_start, buf))
+            buf = {}
+            buf_start = None
+            depth = 0
+    if buf:
+        segments.append((buf_start, buf))
+    return segments
+
+
 found = []
 for path in sys.argv[1:]:
     is_tsx = path.endswith('.tsx')
@@ -291,11 +354,21 @@ for path in sys.argv[1:]:
         src = f.read()
     src_lines = src.splitlines()
     lines_code = strip_ts_non_code(src)
-    for lineno in sorted(lines_code):
-        fragment = ''.join(lines_code[lineno])
-        if line_has_money_identifier(fragment) and line_has_float_pattern(fragment, is_tsx):
-            orig = src_lines[lineno - 1] if lineno <= len(src_lines) else fragment
-            found.append(f"{path}:{lineno}:{orig}")
+    total_lines = len(src_lines)
+    for seg_start, seg_map in build_logical_segments(lines_code, total_lines):
+        joined = '\n'.join(seg_map[ln] for ln in sorted(seg_map))
+        if not (line_has_money_identifier(joined) and line_has_float_pattern(joined, is_tsx)):
+            continue
+        # Reporta na linha onde o padrao de float de fato ocorre (mais
+        # acionavel que a 1a linha do segmento); fallback = inicio do segmento.
+        report_lineno = seg_start
+        for ln in sorted(seg_map):
+            frag = seg_map[ln]
+            if FLOAT_CALL_PAT.search(frag) or FLOAT_LIT_PAT.search(frag):
+                report_lineno = ln
+                break
+        orig = src_lines[report_lineno - 1] if report_lineno <= len(src_lines) else joined
+        found.append(f"{path}:{report_lineno}:{orig}")
 
 if found:
     for hit in found:

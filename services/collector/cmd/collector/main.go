@@ -66,8 +66,12 @@ import (
 
 	commonv1 "github.com/hojex/adserver/gen/go/adserver/common/v1"
 	"github.com/hojex/adserver/internal/clicktoken"
+	"github.com/hojex/adserver/internal/clientip"
 	"github.com/hojex/adserver/internal/geo"
+	"github.com/hojex/adserver/internal/referer"
 	"github.com/hojex/adserver/internal/telemetry"
+	"github.com/hojex/adserver/internal/telemetry/blank"
+	"github.com/hojex/adserver/internal/telemetry/pgsink"
 	"github.com/hojex/adserver/internal/useragent"
 )
 
@@ -185,7 +189,7 @@ func (h *collectorHandler) handleAsyncJS(w http.ResponseWriter, r *http.Request)
 
 	// PRIVACY: sanitize referer — strip query string and fragment to avoid
 	// leaking session tokens or identifiers embedded in URLs.
-	refererURL := sanitizeReferer(r.Referer())
+	refererURL := referer.Sanitize(r.Referer())
 
 	// Record the ad-request event (top-of-funnel).
 	// IP is already discarded above; derivedGeo carries only country+city.
@@ -284,6 +288,17 @@ func (h *collectorHandler) handleAsyncJS(w http.ResponseWriter, r *http.Request)
 //	so the collector can forward it to EmitImpression/EmitClick.  This closes
 //	the loop: every downstream event carries the ranker version that produced
 //	the decision, enabling OPE attribution by model_version in J4.
+//
+// # Privacy (TX-5/DA-11, PRIV-01)
+//
+// site_url is built from location.origin + location.pathname — NOT the full
+// location.href. The query string and fragment are stripped IN THE BROWSER,
+// before anything leaves the page, so that session tokens, UTM parameters,
+// or other identifiers embedded in the URL never travel over the network at
+// all. This is redundant with (belt-and-suspenders for) the server-side
+// sanitization the decision service also applies to whatever site_url it
+// receives (internal/referer.Sanitize) — this endpoint is called directly by
+// the ad tag, so decision cannot assume the client already sanitized it.
 func buildAdTagJS(decisionBase, lgBase, zoneID, tenantID, cachebuster, decisionID string) string {
 	return fmt.Sprintf(`(async function(){
   "use strict";
@@ -294,7 +309,7 @@ func buildAdTagJS(decisionBase, lgBase, zoneID, tenantID, cachebuster, decisionI
       body: JSON.stringify({
         zone_id:   %q,
         user_agent: navigator.userAgent,
-        site_url:   location.href
+        site_url:   location.origin + location.pathname
       })
     });
     if (!resp.ok) return;
@@ -410,8 +425,11 @@ func (h *collectorHandler) handleImpression(w http.ResponseWriter, r *http.Reque
 		servedTier = commonv1.ServedTier(v)
 	}
 
-	blank := servedTier == commonv1.ServedTier_SERVED_TIER_BLANK || bannerID == ""
-	billable := !blank && servedTier != commonv1.ServedTier_SERVED_TIER_UNSPECIFIED
+	// CA-6/CA-2 billing invariant: blank must never be billable. This decision
+	// is made by the single production function blank.ComputeBlankBillable —
+	// the CA-6 parity golden test (tests/parity/ca6_telemetry_golden_test.go)
+	// calls the exact same function, so a regression here fails that gate too.
+	isBlank, billable := blank.ComputeBlankBillable(servedTier, bannerID)
 
 	// model_version is forwarded from the JS tag (passed as "mv" query param).
 	// In J0 (cascade-only) this is always "" (modelVersionDeterministic).
@@ -422,7 +440,7 @@ func (h *collectorHandler) handleImpression(w http.ResponseWriter, r *http.Reque
 
 	h.sink.EmitImpression(
 		tenantID, campaignID, bannerID, zoneID,
-		servedTier, billable, blank,
+		servedTier, billable, isBlank,
 		decisionID, modelVersion,
 	)
 
@@ -933,116 +951,26 @@ func buildVAST4(videoURL, clickURL, impressionURL, decisionID string, width, hei
 // ---------------------------------------------------------------------------
 // Privacy enforcement: resolveAndDiscardIP (TX-5/DA-11)
 //
-// This function is the SOLE location where the client IP is read and used.
-// It resolves the IP to a Geo and returns ONLY the Geo — the IP is never
-// returned, stored in a variable that outlives this function, logged, or
-// forwarded anywhere.
-//
-// The IP variable has a deliberately narrow scope: it is a parameter to
-// geo.Resolver.Resolve() and goes out of scope immediately after the call.
+// Both methods below now DELEGATE to internal/clientip, the SOLE shared
+// implementation of "extract the trusted client IP" and "resolve it to a
+// Geo, discarding the IP" — services/decision's POST /v1/decide (the ad
+// tag's direct browser fetch(), which also sees a raw client IP) calls the
+// SAME package instead of carrying an independent copy of this logic. See
+// internal/clientip's package doc for the full privacy contract and the
+// trusted-proxy-depth semantics; the methods here only thread this
+// handler's own geoResolver/trustedDepth fields through.
 // ---------------------------------------------------------------------------
 
 // resolveAndDiscardIP derives geo from the request and discards the IP.
-//
-// PRIVACY (TX-5/DA-11): the raw IP is used solely as input to geo.Resolve.
-// After this function returns, the IP is NOT stored anywhere in the process.
-// The returned *commonv1.Geo carries only country and city — no coordinates,
-// no postal code, no re-identifiable data.
+// See internal/clientip.ResolveAndDiscard (this method's sole implementation).
 func (h *collectorHandler) resolveAndDiscardIP(r *http.Request) *commonv1.Geo {
-	// Step 1: extract the real client IP (X-Forwarded-For or RemoteAddr).
-	// The IP is stored in a local variable with scope limited to this function.
-	clientIP := h.extractClientIP(r) // IP consumed here, not propagated further
-
-	// Step 2: derive Geo.  The resolver reads the IP and returns only country+city.
-	derivedGeo := h.geoResolver.Resolve(clientIP) // IP is the input, Geo is the output
-
-	// Step 3: IP is now out of scope — it is NEVER returned, logged, stored,
-	// or forwarded.  Only derivedGeo (country + city) leaves this function.
-	// (TX-5/DA-11 enforcement point — verified by privacy-compliance-auditor)
-	return derivedGeo
+	return clientip.ResolveAndDiscard(r, h.trustedDepth, h.geoResolver)
 }
 
 // extractClientIP extracts the real client IP from the request.
-//
-// Security (security #8 — trusted proxies):
-//
-//	X-Forwarded-For is honoured ONLY when the request arrives through the
-//	configured number of trusted proxy hops (h.trustedDepth).
-//	The Cilium/ingress layer is the boundary of trust; IPs injected by the
-//	client in the XFF chain are ignored.
-//
-//	With trustedDepth=1 (default): the ingress proxy appends one entry to XFF.
-//	The rightmost entry is the most-recently-added (by the trusted proxy) and
-//	is taken as the client IP.  The leftmost entry (claimed by the client) is
-//	NOT used when trustedDepth=1 and len(parts)>1.
-//
-//	With trustedDepth=0: XFF is ignored entirely; RemoteAddr is used.
-//
-// The returned string is transient: callers must NOT persist it.
+// See internal/clientip.Extract (this method's sole implementation).
 func (h *collectorHandler) extractClientIP(r *http.Request) string {
-	depth := h.trustedDepth
-	if depth < 0 {
-		depth = 0
-	}
-
-	if depth > 0 {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			parts := strings.Split(xff, ",")
-			// The trusted proxy appends to the right.  With depth=N, we trust
-			// the Nth-from-right entry (index len-N) as the true client IP.
-			// With depth=1 and a single proxy, that is parts[len-1] (rightmost).
-			// With a direct connection through one proxy, parts[0] is the client.
-			// For depth=1 we take the entry just before the trusted proxy's own
-			// addition, i.e. index max(0, len(parts)-depth).
-			idx := len(parts) - depth
-			if idx < 0 {
-				idx = 0
-			}
-			if ip := strings.TrimSpace(parts[idx]); ip != "" {
-				return ip
-			}
-		}
-	}
-
-	// Fall back to RemoteAddr (strip port).
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
-}
-
-// sanitizeReferer strips the query string and fragment from a referer URL,
-// retaining only scheme + host + path.
-//
-// PRIVACY: query strings and fragments frequently carry session tokens,
-// user identifiers, UTM parameters, and other identifying information.
-// We retain only the structural page location (scheme + host + path).
-//
-// If the URL cannot be parsed, does not have an absolute scheme (http/https),
-// or has no host, the empty string is returned — emit nothing rather than
-// risk leaking a token buried in a malformed value.
-func sanitizeReferer(raw string) string {
-	if raw == "" {
-		return ""
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return ""
-	}
-	// Require an absolute URL with a recognised scheme and a non-empty host.
-	// Relative URLs, opaque URIs, and anything without http/https are discarded.
-	scheme := strings.ToLower(u.Scheme)
-	if (scheme != "http" && scheme != "https") || u.Host == "" {
-		return ""
-	}
-	// Reconstruct with only scheme + host + path (no query, no fragment).
-	clean := &url.URL{
-		Scheme: u.Scheme,
-		Host:   u.Host,
-		Path:   u.Path,
-	}
-	return clean.String()
+	return clientip.Extract(r, h.trustedDepth)
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,24 +1032,59 @@ func main() {
 		}
 	}
 
-	// Trusted proxy depth for X-Forwarded-For (security #8).
-	trustedDepth := 1 // default: one trusted proxy (ingress/Cilium)
-	if v := os.Getenv("TRUSTED_PROXY_DEPTH"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-			trustedDepth = n
-		}
-	}
+	// Trusted proxy depth for X-Forwarded-For (security #8). Shared parsing
+	// with services/decision via internal/clientip — see that package's doc
+	// for why this must not be a second, independently maintained copy.
+	trustedDepth := clientip.TrustedDepthFromEnv()
 
 	// Geo resolver: MaxMind if configured, stub otherwise.
 	geoDBPath := envOr("GEOIP_DB_PATH", "")
 	geoResolver := geo.NewMaxMindResolver(geoDBPath, logger)
 
-	// Telemetry producer: Redpanda if configured, no-op otherwise.
+	// Telemetry sink selection (mutually exclusive, in priority order):
+	//
+	//  1. TELEMETRY_PG_DSN set  -> PostgresSink (internal/telemetry/pgsink).
+	//     "Perfil BETA" (addon §3.3): single additional dependency
+	//     (Postgres, already required elsewhere in the stack) instead of
+	//     standing up Redpanda/ClickHouse/Iceberg. Persists to
+	//     stats.events_raw; read by the BFF via stats.live_kpis ("ao vivo",
+	//     never faturável — DA-7).
+	//  2. Else, REDPANDA_BROKERS set -> telemetry.Producer (unchanged path).
+	//  3. Else -> noopSink (unchanged: every event measured and discarded).
+	//
+	// Exactly ONE sink is ever active: TELEMETRY_PG_DSN present makes this
+	// process skip the Redpanda branch entirely, so there is never a
+	// double-write or two independently-minted event_ids for the same
+	// logical event. Every branch logs explicitly which backend is active
+	// (or that none is) — silence here previously meant every impression/
+	// click/conversion pixel was measured and immediately discarded with no
+	// visible signal (the exact gap this sink closes).
+	pgDSN := envOr("TELEMETRY_PG_DSN", "")
 	brokers := envOr("REDPANDA_BROKERS", "")
 	walPath := envOr("TELEMETRY_WAL_PATH", "")
 
+	// PRECEDENCIA: o backend de PRODUCAO vence SEMPRE (achado B5, tech-lead).
+	//
+	// A primeira versao desta onda tinha a precedencia INVERTIDA — TELEMETRY_PG_DSN
+	// ganhava de REDPANDA_BROKERS. Num ambiente com os dois configurados (Redpanda
+	// real de producao + um TELEMETRY_PG_DSN esquecido de um teste), a cadeia
+	// faturavel DA-7 (Redpanda -> ClickHouse -> Iceberg) era desligada EM SILENCIO
+	// e os eventos passavam a ir so para a tabela-ponte do perfil BETA, que o
+	// COMMENT ON VIEW declara explicitamente como NUNCA faturavel. Perda de dado de
+	// faturamento causada por ordem de if.
+	//
+	// A forma correta ja existia no mesmo repo, no capper de services/decision:
+	// REDIS_ADDR (producao) vence, e o backend em memoria so entra quando o real
+	// esta ausente. Aqui e o espelho disso.
 	var sink EventSink = noopSink{}
-	if brokers != "" {
+	if brokers != "" && pgDSN != "" {
+		// Nunca silencioso: quem configurou os dois precisa saber qual perdeu.
+		logger.Warn("telemetry: REDPANDA_BROKERS e TELEMETRY_PG_DSN ambos definidos — " +
+			"usando Redpanda (caminho faturavel DA-7) e IGNORANDO TELEMETRY_PG_DSN. " +
+			"O sink Postgres e do perfil BETA (ADR-0005) e nunca substitui a cadeia faturavel.")
+	}
+	switch {
+	case brokers != "":
 		p, err := telemetry.NewProducer(telemetry.Config{
 			Brokers:    strings.Split(brokers, ","),
 			WALPath:    walPath,
@@ -1135,7 +1098,25 @@ func main() {
 		} else {
 			sink = &producerAdapter{p: p}
 			defer p.Close()
+			logger.Info("telemetry: sink active", "backend", "redpanda")
 		}
+	case pgDSN != "":
+		ps, err := pgsink.New(pgsink.Config{
+			DSN:    pgDSN,
+			Logger: logger,
+		})
+		if err != nil {
+			logger.Error("telemetry: pgsink init failed; falling back to no-op sink — "+
+				"perfil BETA persistence UNAVAILABLE, every event will be measured and discarded",
+				"err", err)
+		} else {
+			sink = ps
+			defer ps.Close()
+			logger.Info("telemetry: sink active", "backend", "postgres", "table", "stats.events_raw")
+		}
+	default:
+		logger.Warn("telemetry: no sink configured (TELEMETRY_PG_DSN and REDPANDA_BROKERS both unset) — " +
+			"every event will be measured and discarded (backend=noop)")
 	}
 
 	h := &collectorHandler{
@@ -1178,7 +1159,7 @@ func main() {
 	// EmptyResolver never reload). Bound to ctx so it stops at shutdown.
 	if geoDBPath != "" {
 		if mm, ok := geoResolver.(*geo.MaxMindResolver); ok {
-			go runGeoReloader(ctx, mm, geoDBPath, geoReloadInterval(), logger)
+			go geo.RunReloader(ctx, mm, geoDBPath, geo.ReloadIntervalFromEnv(), logger)
 		}
 	}
 
@@ -1210,66 +1191,8 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-// ---------------------------------------------------------------------------
-// Geo hot-reload (G0/E5, DA-9)
-// ---------------------------------------------------------------------------
-
-// geoReloadInterval reads GEOIP_RELOAD_INTERVAL (a Go duration like "1h")
-// and falls back to 1h on absence or parse error.
-func geoReloadInterval() time.Duration {
-	const def = time.Hour
-	v := os.Getenv("GEOIP_RELOAD_INTERVAL")
-	if v == "" {
-		return def
-	}
-	d, err := time.ParseDuration(v)
-	if err != nil || d <= 0 {
-		return def
-	}
-	return d
-}
-
-// runGeoReloader polls dbPath's mtime on a fixed interval and hot-swaps the
-// in-memory GeoLite2 database (via mm.Reload) whenever the file has been
-// atomically replaced on disk by the auto-update job (§4.10). This is the
-// substrate DA-9 relies on to keep GeoLite2 fresh without manual
-// intervention (CA-9) and without a service restart (G0/E5).
-//
-// mm.Reload already serialises against concurrent Resolve calls internally
-// (RWMutex) — this loop only decides *when* to call it, based on mtime.
-// On a failed reload the previous database keeps serving (see Reload's
-// doc); the next tick retries since lastMod is only advanced on success.
-//
-// This function never sees or logs a client IP; it only stats/opens a
-// config file path on local disk (TX-5/DA-11 unaffected).
-func runGeoReloader(ctx context.Context, mm *geo.MaxMindResolver, dbPath string, interval time.Duration, logger *slog.Logger) {
-	var lastMod time.Time
-	if fi, err := os.Stat(dbPath); err == nil {
-		lastMod = fi.ModTime()
-	}
-
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			fi, err := os.Stat(dbPath)
-			if err != nil {
-				logger.Warn("geo: reload check skipped — cannot stat mmdb file", "path", dbPath, "err", err)
-				continue
-			}
-			if !fi.ModTime().After(lastMod) {
-				continue // unchanged since the last successful reload
-			}
-			if err := mm.Reload(dbPath); err != nil {
-				logger.Warn("geo: hot-reload failed; keeping previous database in memory (DA-9)",
-					"path", dbPath, "err", err)
-				continue // mtime still stale here, so the next tick retries
-			}
-			lastMod = fi.ModTime()
-			logger.Info("geo: hot-reloaded GeoLite2 database (no restart)", "path", dbPath)
-		}
-	}
-}
+// Geo hot-reload (G0/E5, DA-9): the polling loop itself now lives in
+// internal/geo (geo.RunReloader / geo.ReloadIntervalFromEnv) so
+// services/decision can wire the SAME hot-reload behavior for the same
+// *geo.MaxMindResolver type instead of duplicating this loop. See the call
+// site above (`go geo.RunReloader(...)`).

@@ -174,8 +174,16 @@ type Campaign struct {
 	GoalClicks      int64
 	GoalConversions int64
 
-	// Delivered counts loaded from the stats store at snapshot build time.
-	// These are APPROXIMATE; the authoritative source is the batch ledger.
+	// Delivered counts loaded from the stats store at snapshot build time
+	// (internal/configload.PostgresLoader.loadDelivered, aggregating
+	// stats.events_raw — the perfil BETA Postgres telemetry sink, ADR-0005 /
+	// db/stats/migrations/0001_stats_schema_up.sql). These are APPROXIMATE;
+	// the authoritative source for billing is the batch ledger/Iceberg
+	// (DA-7) — this field feeds DA-4 pacing (computeDeficit) and the
+	// ranker's featurizer only, never money. When the stats schema/grant is
+	// unavailable (older database, or a deployment without the Postgres
+	// telemetry sink wired), the loader degrades to leaving these at their
+	// zero value with a WARN log — never a failed snapshot build (DA-6/DA-9).
 	DeliveredImpressions int64
 	DeliveredClicks      int64
 	DeliveredConversions int64

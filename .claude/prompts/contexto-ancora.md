@@ -31,11 +31,11 @@ git status --porcelain
 grep -n "ª onda" README.md | tail -4
 ```
 
-**Numeração de ondas:** a última onda commitada é a **31ª** (`edb7751`). O README
-(≈ linha 1170) registra uma **colisão a reconciliar**: existe trabalho não-commitado
-de outra sessão que também se intitula "31ª onda" (conserto do gate `web-ci`/`a11y`
-+ console) — ele deve ser renumerado para **32ª** ao ser commitado. Confirme a
-numeração real antes de escrever qualquer registro.
+**Numeração de ondas:** a última onda commitada é a **32ª**. A colisão que este
+arquivo registrava está **reconciliada**: o trabalho da outra sessão (metade BFF da
+31ª + perfil BETA/ADR-0005 + console, commits `f952ae5`/`73cd2e4`/`0caeb84`) foi
+absorvido pelo fecho da 32ª, que também registrou a **31ª no plano §5** — ela vivia
+só no README até então. Confirme a numeração real antes de escrever qualquer registro.
 
 **Sessão concorrente:** este repo já sofreu colisão entre sessões. Antes de editar,
 cheque `git status`, `ps aux | grep -i claude` e mtimes dos arquivos-alvo. Se houver
@@ -102,16 +102,25 @@ make parity-golden       # CA-2…CA-6 (parity-golden-short p/ ciclo curto)
 make ml-test data-validate db-lint copilot-test
 make bff-ci web-ci web-a11y
 make platform-validate   # tofu + kubeconform + kyverno + otel + openbao + cell-consistency
-make db-check-migration-pairing db-check-schema-list
+make db-check-migration-pairing db-check-schema-list db-check-provisioners
 make proto-gen-check     # fora do verify: depende de rede/plugins remotos
+python3 scripts/ci/workflow-paths-mirror-check.py   # push.paths espelha pull_request.paths
+# Banco de verdade (PG16 nativo, sem Docker) — o caminho que a 32ª consertou:
+make dev-db-setup DEV_DB=<scratch>
+DATABASE_URL="postgres://$(id -un)@/<scratch>?host=/var/run/postgresql&sslmode=disable" \
+  make db-test db-test-compliance db-test-ledger db-test-ledger-immutability \
+       db-test-vector db-test-stats go-test-integration
 ```
 
 Notas que já causaram falso-verde/falso-RED:
 - `make no-float` roda **6** guards (`scripts/ci/no-float-{proto,go,ts,py,sql,data-sql}.sh`)
   com sentinela `NO_FLOAT_SCRIPTS_EXPECTED := 6` no Makefile. **Escopo é DEFAULT-DENY**;
   a fonte normativa é `contracts/lint/no-float.md` §Escopo — **não reproduza a lista**.
-- O repo vive em um path **com espaço** (`/home/agencia/Hojex News/AdServer`): recipes
-  com binário absoluto **têm de ficar aspados** (24ª onda).
+- O repo vive em um path **com espaço** (hoje `/home/agencia/Agencia Studio/AdServer`;
+  já foi `/home/agencia/Hojex News/AdServer` — **derive o path, não o copie daqui**):
+  recipes com binário absoluto **têm de ficar aspados** (24ª onda). O gate que impõe
+  isso é `make-quoting-check`, e desde a 32ª ele mora em `repo-gates.yml` — antes
+  estava em `buf.yml`, cujo `paths: proto/**` o deixava órfão para todo `make/*.mk`.
 - Gates que selecionam por `git ls-files` são **cegos a arquivo untracked**. Torne o
   código novo visível ao índice (`git add` real) antes de alegar cobertura.
 

@@ -25,18 +25,24 @@ const nextConfig: NextConfig = {
     ];
   },
 
-  // O BFF roda em :3001 — proxy apenas em dev
-  async rewrites() {
-    if (process.env.NODE_ENV !== "production") {
-      return [
-        {
-          source: "/api/trpc/:path*",
-          destination: "http://localhost:3001/:path*",
-        },
-      ];
-    }
-    return [];
-  },
+  /**
+   * SEM rewrites para /api/trpc.
+   *
+   * O proxy para o BFF é um ROUTE HANDLER — src/app/api/trpc/[trpc]/route.ts.
+   *
+   * Historicamente havia aqui uma rewrite condicionada a
+   * `NODE_ENV !== "production"`, o que deixava o console SEM control-plane em
+   * produção (achado CRÍTICO da 31ª onda: `rewrites()` devolvia [], não havia
+   * route handler, e nenhuma regra de ingress em deploy//platform/ cobria o
+   * caminho — toda chamada tRPC 404ava).
+   *
+   * Tornar a rewrite incondicional NÃO resolve: `rewrites()` só é avaliado
+   * durante `next build` e o destino já interpolado é congelado em
+   * .next/routes-manifest.json. Uma `BFF_INTERNAL_URL` injetada no container em
+   * tempo de deploy (o padrão do repo para SESSION_SECRET/ALLOWED_ORIGINS via
+   * OpenBao) seria silenciosamente ignorada, mantendo o localhost do build.
+   * O route handler lê a env var por requisição e falha fechado sem ela.
+   */
 };
 
 export default nextConfig;

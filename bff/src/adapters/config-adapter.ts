@@ -122,6 +122,13 @@ export interface ConfigAdapter {
     tenantId: string,
     opts: { ownerType: "campaign" | "banner"; ownerId: string }
   ): Promise<DeliveryRule[]>;
+  /**
+   * Busca uma regra por id (usado pelo backstop CA-4 de
+   * deliveryRule.update — precisa do ownerType/ownerId e do estado ATUAL da
+   * regra para montar o candidato pós-update antes de checar contradição
+   * contra as regras irmãs). `null` se não encontrada sob RLS do tenant.
+   */
+  getDeliveryRule(tenantId: string, id: string): Promise<DeliveryRule | null>;
   createDeliveryRule(
     tenantId: string,
     input: CreateDeliveryRuleInput

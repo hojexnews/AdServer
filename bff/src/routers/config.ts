@@ -7,6 +7,7 @@ import { z } from "zod";
 import { TRPCError } from "@trpc/server";
 import { router, tenantProcedure } from "../lib/trpc.js";
 import type { ConfigAdapter } from "../adapters/config-adapter.js";
+import { detectContradictions, type RuleCandidate } from "../lib/contradiction.js";
 import {
   IdSchema,
   CreateAdvertiserInputSchema,
@@ -27,6 +28,72 @@ import {
   CreateCapInputSchema,
   UpdateCapInputSchema,
 } from "../schemas/config.js";
+
+/**
+ * Backstop CA-4 compartilhado por TODOS os mutadores de DeliveryRule que
+ * podem produzir um estado ativo novo (create, update — nunca delete: remover
+ * uma regra só pode ELIMINAR uma contradição, nunca introduzir uma).
+ *
+ * DEFAULT-DENY (wave 30 remediação, achado #3 — "bypass trivial do controle
+ * recém-adicionado"): antes desta correção, só deliveryRule.create chamava
+ * detectContradictions(); deliveryRule.update escrevia o novo vector/operator/
+ * value/logicalOp direto no adapter sem checagem alguma — bastava criar a
+ * regra sem contradição e depois dar update para o estado contraditório.
+ * bff/src/routers/config.test.ts prova, por REFLEXÃO sobre os mutadores
+ * REAIS do sub-router deliveryRule (não uma lista manual), que todo mutador
+ * não isento roda este guard — um mutador novo (ex.: um futuro "reorder" ou
+ * "bulkUpdate") que grave vector/operator/value/logicalOp sem passar por
+ * aqui quebra aquele teste em vez de escapar silenciosamente.
+ *
+ * `excludeRuleId` (update) evita comparar a regra contra ela mesma quando
+ * ela já está entre as regras existentes do owner.
+ */
+async function assertNoContradiction(
+  adapter: ConfigAdapter,
+  tenantId: string,
+  params: {
+    ownerType: "campaign" | "banner";
+    ownerId: string;
+    candidate: RuleCandidate;
+    excludeRuleId?: string;
+    acknowledgeContradiction: boolean;
+  }
+): Promise<void> {
+  const existing = await adapter.listDeliveryRules(tenantId, {
+    ownerType: params.ownerType,
+    ownerId: params.ownerId,
+  });
+  const existingCandidates: RuleCandidate[] = existing
+    .filter((r) => r.active && r.id !== params.excludeRuleId)
+    .map((r) => ({
+      vector: r.vector,
+      operator: r.operator,
+      value: r.value,
+      logicalOp: r.logicalOp,
+    }));
+  const result = detectContradictions([
+    ...existingCandidates,
+    params.candidate,
+  ]);
+  // Só os conflitos que envolvem O CANDIDATO sugerido importam aqui
+  // (identidade de referência: params.candidate é o mesmo objeto inserido
+  // acima — detectContradictions não clona as entradas). Conflitos
+  // pré-existentes só entre regras já salvas não bloqueiam esta mutação
+  // específica.
+  const relevant = result.conflicts.filter(
+    (c) => c.ruleA === params.candidate || c.ruleB === params.candidate
+  );
+  if (relevant.length > 0 && !params.acknowledgeContradiction) {
+    throw new TRPCError({
+      code: "CONFLICT",
+      message:
+        `Contradição detectada (CA-4): a regra entra em conflito com ` +
+        `${relevant.length} regra(s) já existente(s). ` +
+        relevant.map((c) => c.reason).join(" ") +
+        ` Reenvie com acknowledgeContradiction=true para salvar mesmo assim.`,
+    });
+  }
+}
 
 export function createConfigRouter(adapter: ConfigAdapter) {
   return router({
@@ -292,15 +359,73 @@ export function createConfigRouter(adapter: ConfigAdapter) {
 
       create: tenantProcedure
         .input(CreateDeliveryRuleInputSchema)
-        .mutation(({ ctx, input }) =>
-          adapter.createDeliveryRule(ctx.tenantId, input)
-        ),
+        .mutation(async ({ ctx, input }) => {
+          // CA-4 backstop server-side (wave 30, achado
+          // contradiction-vector-allowlist-gap): a UI (app/rules/page.tsx)
+          // já roda esta MESMA validação antes de enviar a mutação, mas a
+          // UI sozinha não é fronteira de confiança — um cliente que chame
+          // este procedimento diretamente (bypassando o builder) não pode
+          // persistir uma regra AND mutuamente exclusiva sem confirmação
+          // explícita.
+          const candidate: RuleCandidate = {
+            vector: input.vector,
+            operator: input.operator,
+            value: input.value,
+            logicalOp: input.logicalOp,
+          };
+          await assertNoContradiction(adapter, ctx.tenantId, {
+            ownerType: input.ownerType,
+            ownerId: input.ownerId,
+            candidate,
+            acknowledgeContradiction: input.acknowledgeContradiction,
+          });
+          return adapter.createDeliveryRule(ctx.tenantId, input);
+        }),
 
+      // CA-4 backstop server-side também em update (wave 30 remediação,
+      // achado #3 — "bypass trivial do controle recém-adicionado": antes
+      // desta correção, deliveryRule.update NÃO rodava detectContradictions,
+      // então bastava criar a regra sem contradição e depois dar update para
+      // o estado contraditório). UpdateDeliveryRuleInputSchema só carrega
+      // `id` + campos PARCIAIS opcionais, então buscamos o estado ATUAL via
+      // adapter.getDeliveryRule para saber ownerType/ownerId e montar o
+      // candidato pós-update (campos não enviados mantêm o valor existente).
       update: tenantProcedure
         .input(UpdateDeliveryRuleInputSchema)
-        .mutation(({ ctx, input }) =>
-          adapter.updateDeliveryRule(ctx.tenantId, input)
-        ),
+        .mutation(async ({ ctx, input }) => {
+          const existingRule = await adapter.getDeliveryRule(
+            ctx.tenantId,
+            input.id
+          );
+          // Regra inexistente (ou de outro tenant sob RLS): sem o registro
+          // atual não há ownerType/ownerId para checar — deixa o adapter
+          // recusar com NOT_FOUND como já fazia antes desta correção.
+          if (existingRule === null) {
+            return adapter.updateDeliveryRule(ctx.tenantId, input);
+          }
+          const finalActive = input.active ?? existingRule.active;
+          // Desativar uma regra (ou mantê-la inativa) nunca introduz uma
+          // contradição NOVA — só regras ativas entram no cálculo de CA-4
+          // (mesma regra que rege as regras "irmãs" em assertNoContradiction
+          // e no builder). Pular o guard aqui evita bloquear o caso comum de
+          // "desativar uma regra problemática" atrás de um CONFLICT confuso.
+          if (finalActive) {
+            const candidate: RuleCandidate = {
+              vector: input.vector ?? existingRule.vector,
+              operator: input.operator ?? existingRule.operator,
+              value: input.value ?? existingRule.value,
+              logicalOp: input.logicalOp ?? existingRule.logicalOp,
+            };
+            await assertNoContradiction(adapter, ctx.tenantId, {
+              ownerType: existingRule.ownerType,
+              ownerId: existingRule.ownerId,
+              candidate,
+              excludeRuleId: existingRule.id,
+              acknowledgeContradiction: input.acknowledgeContradiction,
+            });
+          }
+          return adapter.updateDeliveryRule(ctx.tenantId, input);
+        }),
 
       delete: tenantProcedure
         .input(z.object({ id: IdSchema }))

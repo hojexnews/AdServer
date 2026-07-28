@@ -80,10 +80,61 @@ const CHROME_PATH = process.env.CHROME_PATH ?? "/usr/bin/google-chrome";
 // Tags WCAG 2.0/2.1/2.2 nível A + AA (mandato: WCAG 2.2 AA).
 const AXE_TAGS = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"];
 
-// Páginas auditadas — só o harness determinístico (props-fixture, sem
-// BFF/tRPC vivo). As rotas reais do app (dashboard/rules/billing/copilot)
-// dependem de dados de um BFF vivo e ficam fora deste gate mecânico.
-const PAGES_TO_AUDIT = ["/a11y-harness"];
+// Páginas auditadas (wave 30, achado a11y-ci-harness-only-real-pages-unaudited).
+//
+// Antes desta correção, PAGES_TO_AUDIT só continha "/a11y-harness" (rota
+// sintética, client-only, fixtures estáticas dos componentes do design
+// system isolados) — as 9 rotas REAIS do console (2332+ linhas de JSX real:
+// formulários RHF+Zod, tabelas, o dashboard com gráfico Recharts, o builder
+// de segmentação real) nunca eram renderizadas nem auditadas pelo axe-core
+// em CI nenhum.
+//
+// COBERTURA HONESTA (o que este gate PROVA e o que NÃO prova):
+//   Este runner NÃO sobe o BFF. ATENÇÃO — o motivo MUDOU na 31ª onda e este
+//   comentário foi corrigido junto (achado R1-a11y-doclie-rewrite-rationale):
+//   a justificativa anterior dizia que "next.config.ts só reescreve /api/trpc/*
+//   quando NODE_ENV!=='production'". Essa condicional NÃO EXISTE MAIS: o
+//   proxy para o BFF passou a ser um route handler
+//   (src/app/api/trpc/[trpc]/route.ts) que vale em TODO ambiente, porque a
+//   ausência dele em produção deixava o console inteiro sem control-plane.
+//   O motivo real, hoje, é mais simples: este runner não INICIA um processo do
+//   BFF nem um Postgres, então /api/trpc/* alcança o route handler e recebe
+//   502 (upstream inalcançável). Subir a stack inteira aqui transformaria um
+//   gate de acessibilidade em teste de integração — fora do escopo deste alvo.
+//   Consequência mensurável por página:
+//     - /rules e /copilot: NÃO dependem de nenhuma query tRPC para o
+//       primeiro render — o formulário do builder (RHF+Zod, <select> de
+//       vetor, cada campo do form) e o layout do chat renderizam por
+//       INTEIRO e são auditados de verdade. Foi precisamente a ausência
+//       desta cobertura que deixou passar a regressão de contraste do <h1>
+//       de /rules (ver a mutação de regressão abaixo).
+//     - /billing: os headings/seções (h1, h2, aria-labelledby) renderizam
+//       incondicionalmente; só o CONTEÚDO de cada seção fica atrás de
+//       isLoading/error (que também são auditados, aninhados).
+//     - /advertisers, /banners, /campaigns, /sites, /zones, /dashboard:
+//       fazem `if (isLoading) return <LoadingState/>` / `if (error) return
+//       <ErrorState/>` ANTES do JSX específico da página — sem BFF, a
+//       query tRPC falha (retry:1, ver components/providers.tsx) e a
+//       página estaciona no ErrorState compartilhado. Isso AINDA é uma
+//       auditoria real (prova que o wrapper de rota + ErrorState daquela
+//       página específica são acessíveis — o mesmo tipo de regressão de
+//       contraste/estrutura pode viver no wrapper), mas NÃO alcança o JSX
+//       de tabela/formulário do caminho de sucesso. Não finjo cobertura
+//       além disso: fechar esse restante exige um BFF real acessível a
+//       partir de `next start` (infra pendente — ver next.config.ts) e fica
+//       para uma wave futura.
+const PAGES_TO_AUDIT = [
+  "/a11y-harness",
+  "/advertisers",
+  "/campaigns",
+  "/banners",
+  "/sites",
+  "/zones",
+  "/rules",
+  "/dashboard",
+  "/billing",
+  "/copilot",
+];
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));

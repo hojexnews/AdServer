@@ -41,10 +41,19 @@ Sem dependencias de outros schemas. Aplica primeiro — o ledger e o BFF depende
 psql "$PGURL" -f db/config/migrations/0001_config_schema_up.sql
 psql "$PGURL" -f db/config/migrations/0002_config_rls_up.sql
 psql "$PGURL" -f db/config/migrations/0003_campaign_zones_rls_up.sql
+psql "$PGURL" -f db/config/migrations/0004_campaign_zones_with_check_up.sql
 ```
 
-Aplicar em ordem (0001 -> 0002 -> 0003). As migracoes de RLS dependem do schema criado
-pela 0001.
+Aplicar em ordem (0001 -> 0002 -> 0003 -> 0004). As migracoes de RLS dependem do schema
+criado pela 0001.
+
+**Atencao (0004):** a `0003` cria `campaign_zones_tenant_isolation` como policy `FOR ALL`
+**USING-only** — o isolamento de ESCRITA existe apenas por fallback implicito do Postgres
+(`pg_policy.polwithcheck` fica NULL). A `0004` grava o `WITH CHECK` explicito no catalogo.
+Omiti-la faz `db/config/tests/rls_isolation_test.sql` falhar no BLOCO 5.5 (introspecao
+default-deny de `pg_policy`) — verificado de 1a mao contra Postgres 16 nativo:
+sem a 0004 o teste aborta com `ASSERT FALHOU [WITH CHECK ausente no catalogo pg_policy]`;
+com a 0004 imprime `== RLS ISOLATION: ALL TESTS PASSED ==`.
 
 ### 2.3 Schema `ledger`
 
@@ -52,12 +61,49 @@ pela 0001.
 psql "$PGURL" -f db/ledger/migrations/0001_ledger_schema_up.sql
 psql "$PGURL" -f db/ledger/migrations/0002_reconciliation_exceptions_up.sql
 psql "$PGURL" -f db/ledger/migrations/0003_ledger_rls_up.sql
+psql "$PGURL" -f db/ledger/migrations/0004_ledger_postings_immutable_up.sql
 ```
 
-**Atencao:** `deploy/local/postgres/10-init.sh` (hook do Docker local) aplica APENAS a
-`0001_ledger_schema_up.sql`. As migracoes `0002` (reconciliation_exceptions) e `0003`
-(RLS por tenant) **precisam ser aplicadas explicitamente** em producao. Omiti-las resulta
-em falha do smoke-payments (trilho c + d) e ausencia de RLS no ledger.
+**Atencao:** producao NAO roda nenhum dos provisionadores de dev — nem
+`make dev-db-setup` nem o hook de initdb `deploy/local/postgres/10-init.sh`. Os dois
+aplicam hoje TODAS as migrations de TODOS os schemas (derivadas por glob + sort, na ordem
+de `db/schema-order.txt`), mas isso vale para o banco LOCAL; aqui a aplicacao e explicita
+e e sua responsabilidade. Derive a lista do diretorio em vez de confiar nesta prosa:
+`ls db/ledger/migrations/*_up.sql`. Omitir qualquer uma resulta em falha do smoke-payments
+(trilho c + d), ausencia de RLS no ledger e — no caso da `0004` — um ledger em que
+`UPDATE`/`DELETE` de postings ja lancados sao ACEITOS pelo banco.
+
+> Ate a 32a onda este paragrafo dizia que o `10-init.sh` aplicava "APENAS a
+> `0001_ledger_schema_up.sql`". Era verdade quando foi escrito e deixou de ser no mesmo
+> diff que reescreveu o hook — o tipo de doc-lie que so aparece quando alguem le o runbook
+> as 3h da manha. Regra que ficou: quem muda um provisionador roda
+> `git grep -n "10-init.sh" docs/` antes de fechar a onda.
+
+#### 2.3.1 Least-privilege de `ledger.postings` (passo manual — NAO esta na migration)
+
+A `0004` instala os triggers `postings_immutable_trg` e `journal_entries_immutable_trg`
+(garantia **primaria**, vale ate para superusuario e para acesso direto a uma particao).
+A metade **least-privilege** do controle **nao esta dentro de nenhum arquivo de migration**
+— hoje ela existe nos quatro provisionadores de teste/dev (`make/db.mk` do Postgres efemero
+de `db-test-all`, `make/dev.mk`, `deploy/local/postgres/10-init.sh` e o SQL inline de
+`.github/workflows/db.yml`), em nenhuma migration. Em producao ela precisa ser executada a
+mao, **depois** dos GRANTs de schema:
+
+```bash
+psql "$PGURL" -v ON_ERROR_STOP=1 \
+  -c "REVOKE UPDATE, DELETE ON ledger.postings FROM adserver_app;"
+```
+
+Mudanca de comportamento ZERO para a aplicacao (`internal/ledger/posting.go` so faz
+INSERT/SELECT em postings). Correcoes contabeis sao **sempre** um novo par invertido via
+`RecordReversal`, nunca edicao do posting original.
+
+**Verificacao de 1a mao (Postgres 16 nativo, executada nesta revisao do runbook):**
+aplicar apenas `0001+0002+0003` — isto e, o que este runbook mandava ate agora — e rodar
+`psql "$PGURL" -f db/ledger/tests/postings_immutability_test.sql` **falha** com
+`ASSERT FALHOU [(b) UPDATE posting lancado]: banco ACEITOU — trigger de imutabilidade
+ausente ou ineficaz`. Com `0004` + o REVOKE acima, o mesmo teste imprime
+`== LEDGER POSTINGS IMMUTABILITY: ALL TESTS PASSED ==`.
 
 ### 2.4 Schema `vector`
 
@@ -66,7 +112,12 @@ psql "$PGURL" -f db/vector/migrations/0001_vector_schema_up.sql
 psql "$PGURL" -f db/vector/migrations/0002_vector_rls_up.sql
 ```
 
-Aplicar em ordem (0001 -> 0002).
+Aplicar em ordem (0001 -> 0002). `db/seed/dev_roles.sql` depende deste schema
+existir ANTES de rodar (faz `GRANT ... ON SCHEMA vector_store TO
+adserver_copilot`) — tanto `make dev-db-setup` (`make/dev.mk`) quanto o gate de
+CI (`.github/workflows/db.yml`) aplicam 0001/0002 antes de chamar
+`dev_roles.sql` (achado HIGH / bundle F: `make dev-db-setup` costumava pular
+o schema vector e abortar no GRANT).
 
 ### 2.5 Schema `compliance` (instancia separada — celula AML/KYC)
 
@@ -140,8 +191,9 @@ nunca estaticas. Cada celula tem seu proprio role Postgres com privilegios minim
 | Celula | Role Postgres | Permissoes |
 |--------|--------------|-----------|
 | delivery | `adserver_app` | SELECT/INSERT/UPDATE em schemas config, asset_registry (via RLS) |
-| ml | `adserver_ml` | SELECT em asset_registry; INSERT em vector (RLS) |
-| pci | `adserver_pci` | SELECT/INSERT/UPDATE em ledger (RLS); BYPASSRLS para `adserver_loader` |
+| ml (pipeline batch de embeddings) | `adserver_ml` | SELECT em asset_registry; INSERT em vector (RLS). **Nao materializado em nenhuma migration/seed** — role futuro do pipeline batch (J2/J6) que escreve `vector_store.creative_embeddings`; distinto do role do copiloto abaixo (que so LE). Fora do escopo deste bundle (achado #7 e so sobre o DSN do copiloto). |
+| copiloto (RAG, servico `services/copilot`) | `adserver_copilot` | SELECT-only em `vector_store.{creative_embeddings,help_doc_embeddings}` (RLS); **NOBYPASSRLS explicito** (`db/seed/dev_roles.sql`) — as queries pgvector do RAG (`services/copilot/tools/gateway.py`) dependem 100% do RLS para isolar tenant; usar `adserver_loader` (BYPASSRLS) aqui seria um buraco de isolamento cross-tenant (achado #7, auditoria bundle F). |
+| pci | `adserver_pci` | SELECT/INSERT em `ledger.postings` (**nunca UPDATE/DELETE** — append-only, §2.3.1); SELECT/INSERT/UPDATE nas demais tabelas de ledger (RLS); BYPASSRLS para `adserver_loader` |
 | aml-kyc | `adserver_compliance` | SELECT/INSERT/UPDATE em compliance (RLS); sem acesso a ledger de outros tenants |
 
 ---
@@ -171,7 +223,21 @@ make db-test-all
 ```
 
 Valida isolamento por tenant (RLS) nos schemas config, ledger, vector e compliance.
-Inclui os testes de ledger que cobrem 0002 (reconciliation) e 0003 (RLS).
+Inclui os testes de ledger que cobrem 0002 (reconciliation), 0003 (RLS) e 0004
+(`db/ledger/tests/postings_immutability_test.sql`, append-only).
+
+**Lacuna FECHADA na mesma 30a onda (nao reabra a mao):** por algumas horas o alvo
+`db-test-all` (`make/db.mk`) enumerava as migrations de `config` a mao e parava na `0003`,
+enquanto `db/config/tests/rls_isolation_test.sql` (BLOCO 5.5) ja exigia a
+`0004_campaign_zones_with_check_up.sql` — `make db-test-all` falhava por lista
+desatualizada, nao por regressao de RLS. A correcao **eliminou a forma do defeito**, nao a
+instancia: `make/db.mk` e `.github/workflows/db.yml` agora derivam a lista do proprio
+diretorio (`ls db/<schema>/migrations/*_up.sql | sort`, e `sort -r` no rollback), com
+sentinela que FALHA se um diretorio de migrations vier vazio. Uma `0005_*_{up,down}.sql`
+nova e aplicada automaticamente; nenhum runner precisa ser editado. A **ordem entre
+schemas** (asset_registry → config → … → compliance) continua explicita, porque e
+dependencia real. Requisito que permanece: prefixo numerico de 4 digitos zero-padded, que
+e o que faz a ordem lexicografica coincidir com a numerica.
 
 ### Passo 2 — Smoke do trilho de pagamentos
 
@@ -186,7 +252,8 @@ Exercita os 4 invariantes do trilho (a)(b)(c)(d):
 - (c) Reconciliacao abre excecao, nunca autocorrige.
 - (d) Status via BFF: string DECIMAL sem float (TX-2), isolamento RLS (IDOR).
 
-Pre-requisito: migracoes 0001+0002+0003 do ledger aplicadas, roles dev criados.
+Pre-requisito: migracoes 0001+0002+0003+0004 do ledger aplicadas, o REVOKE de §2.3.1
+executado, e roles dev criados.
 
 ### Passo 3 — Gates de contratos e no-float
 
@@ -209,7 +276,7 @@ numa maquina com `npm install` ja executado — ver `make/go.mk`).
 ### Passo 5 — Suites BFF/pytest
 
 ```bash
-# BFF (Node/TypeScript) — typecheck + lint + 73 testes
+# BFF (Node/TypeScript) — typecheck + lint + suite Jest
 make bff-ci
 
 # ML — OPE, features, training, calibration, promote (make ml-test)
@@ -234,6 +301,43 @@ Passo 4) e os de Python injetam `PYTHONPATH=.` na raiz do repositorio — sem is
 nao-supervisionado). `make ml-deep-test` cobre o K1 (TwoTowerDCNv2); deep permanece
 default-off — DEEP_ENABLED=false ate uplift A/B provado (K8 gate, ADR-0004).
 
+#### Nota sobre contagens de teste
+
+Versoes anteriores deste runbook fixavam contagens ("73 testes", "22 testes") como se
+fossem sentinelas de encolhimento de suite. **Nao eram.** Nao existe, em nenhum alvo
+`make`, script de CI ou workflow, qualquer assercao sobre numero de testes
+(`grep -rnE 'numPassedTests|testsuites|baseline.*count' make/ .github/workflows/ scripts/ci/`
+retorna vazio). Um numero em prosa nao detecta suite encolhida — ele apenas envelhece e
+passa a mentir, exatamente como o `//nolint:<linter>` sem linter configurado.
+
+O que vale como gate e o **exit code** do alvo `make`. Para deteccao de regressao por
+remocao de teste, o criterio verificavel e a **presenca nominal** dos testes-guarda de
+seguranca/dinheiro criados nas ondas 27a–29a — se algum destes arquivos ou casos sumir,
+a suite regrediu ainda que o alvo fique verde:
+
+- `bff/src/routers/copilot.test.ts` — HITL obrigatorio + IDOR do copiloto.
+- `bff/src/lib/trpc.test.ts` — ACL `tenantProcedure` server-side (CA-1).
+- `db/ledger/tests/postings_immutability_test.sql` — append-only (§2.3.1).
+- `db/config/tests/rls_isolation_test.sql` BLOCO 5.5 — `WITH CHECK` por introspecao.
+- `tests/parity/ca{2,3,4,5,6}_*_golden_test.go` — os 5 goldens de paridade.
+
+**Este runbook nao registra contagens.** Nao ha numero de teste escrito aqui, de
+proposito: um numero em prosa nasce correto e apodrece no commit seguinte — a
+revisao de 2026-07-19 provou isso ao reintroduzir contagens que ja estavam erradas
+ao serem medidas de 1a mao no mesmo dia. Se voce precisa da contagem de hoje, ela
+tem uma fonte-unica executavel; derive, nao copie:
+
+```bash
+make bff-ci        # rodape do Jest: "Tests: N passed" / "Test Suites: N passed"
+make copilot-test  # rodape do pytest: "N passed"
+make ml-deep-test  # idem
+make web-ci        # idem
+```
+
+A contagem nao e criterio de aceitacao em nenhum destes passos. Os criterios sao o
+**exit code** do alvo e a **presenca nominal** da lista acima — ambos gateados, nenhum
+sujeito a apodrecimento.
+
 ### Passo 6 — Validacao de plataforma
 
 ```bash
@@ -255,6 +359,15 @@ Confirma:
 - [ ] Kyverno PCI proibe volumes hostPath e imagens sem digest na celula pci.
 - [ ] Kyverno AML/KYC proibe acesso a secret de outra celula e imagens sem digest.
 - [ ] OpenBao: nenhuma credencial estatica em imagem ou git.
+- [ ] `DATABASE_URL` do copiloto (`services/copilot`) provisionado via OpenBao com o
+      role `adserver_copilot` (`db/seed/dev_roles.sql`) — **NOBYPASSRLS explicito**,
+      SELECT-only em `vector_store.{creative_embeddings,help_doc_embeddings}`.
+      NUNCA usar `adserver_loader` (BYPASSRLS) neste DSN: as queries pgvector do RAG
+      (`services/copilot/tools/gateway.py`) dependem 100% do RLS por tenant_id (TX-3)
+      para isolar os embeddings de um tenant dos demais — um role BYPASSRLS aqui
+      apagaria esse isolamento sem que nenhum erro apareca em teste funcional
+      (achado #7, auditoria bundle F; prova de mutacao em
+      `db/vector/tests/vector_rls_isolation_test.sql` BLOCO 8).
 - [ ] cosign + Trivy + Falco ativos no cluster antes de redirecionar trafego.
 - [ ] SHA256 dos binarios de CI verificados (kubeconform, kyverno, tofu — M-1 fechado).
 
@@ -263,8 +376,13 @@ Confirma:
 Confirma:
 - [ ] OTel Collector em producao usa a mesma config de `platform/observability/otel-collector.yaml`.
 - [ ] `otelcol validate` VERDE na imagem de producao (CI gate otel-validate passando — TX-5).
-- [ ] Pipelines `traces` e `logs` contem `transform/redact-pii` E `redaction/allowlist-*`.
-- [ ] `allow_all_keys: false` em AMBAS as allowlists.
+- [ ] **TODO** pipeline de `service.pipelines` (hoje `traces`, `metrics` e `logs`) contem
+      `transform/redact-pii` E o `redaction/allowlist-<tipo>` do seu tipo de sinal — nao
+      apenas os dois historicos. Nao confira a olho: rode
+      `python3 platform/observability/otel-pipeline-redaction-check.py platform/observability/otel-collector.yaml`,
+      que enumera os pipelines existentes e reprova qualquer um sem redacao (default-deny,
+      30a onda — antes o gate so olhava os nomes literais "traces"/"logs").
+- [ ] `allow_all_keys: false` em TODAS as allowlists (hoje 3: traces, logs, metrics).
 - [ ] IP bruto descartado no servico antes de chegar ao OTel Collector (TX-5 defense-in-depth).
 - [ ] PII/KYC confinada na celula AML/KYC; telemetria exportada sem PII.
 - [ ] Cifra KMS-envelope ativa sobre dados `compliance` (chave real em HSM/KMS — §3.1).
@@ -272,7 +390,10 @@ Confirma:
 ### money-ledger-guardian
 
 Confirma:
-- [ ] Migracoes 0001+0002+0003 do ledger aplicadas (inclusive 0002 recon + 0003 RLS — NAO apenas 0001 como no Docker local).
+- [ ] TODAS as migrations do ledger aplicadas (`ls db/ledger/migrations/*_up.sql` — hoje 0001 schema + 0002 recon + 0003 RLS + 0004 imutabilidade). Nao enumere a mao ao conferir: derive do diretorio, que e o que todo provisionador faz desde a 32a onda.
+- [ ] `REVOKE UPDATE, DELETE ON ledger.postings FROM adserver_app;` executado em producao (§2.3.1 — **nao** vem em nenhuma migration; hoje so existe nos provisionadores de teste/dev: `make/db.mk`, `make/dev.mk`, `deploy/local/postgres/10-init.sh` e `.github/workflows/db.yml`). A garantia primaria de append-only NAO depende dele: e o trigger `postings_immutable_trg` da migration 0004, que vale inclusive para superusuario.
+- [ ] `psql "$PGURL" -f db/ledger/tests/postings_immutability_test.sql` VERDE contra o banco de PRODUCAO ja migrado (imprime `== LEDGER POSTINGS IMMUTABILITY: ALL TESTS PASSED ==`). Este e o unico check que prova que a 0004 pegou de fato.
+- [ ] Migration `0004_campaign_zones_with_check_up.sql` do schema config aplicada (§2.2 — `WITH CHECK` explicito no catalogo).
 - [ ] `smoke-payments.sh` VERDE: todos os 4 invariantes (a)(b)(c)(d).
 - [ ] Nenhum float em codigos de ledger (`make verify` no-float TX-2 VERDE).
 - [ ] USDC com scale=6 inserido no `asset_registry.assets` antes do primeiro deposito.
@@ -286,7 +407,7 @@ Confirma:
 
 - [ ] `make go-test` VERDE — gate canonico: unit tests + golden tests com `-race` (toolchain Go 1.26, filtra `node_modules/`; destravado pelo swap `spaolacci`→`twmb/murmur3` na 7a onda).
 - [ ] `make parity-golden-short` VERDE — sem regressao no motor de decisao.
-- [ ] `make ml-deep-test` VERDE — K1 deep ranker (22 testes: TwoTowerDCNv2 + paridade ONNX) + invariante default-off (DEEP_ENABLED=false ate uplift A/B provado — K8 gate, ADR-0004).
+- [ ] `make ml-deep-test` VERDE — K1 deep ranker (TwoTowerDCNv2 + paridade ONNX) + invariante default-off (DEEP_ENABLED=false ate uplift A/B provado — K8 gate, ADR-0004). Conferir que os testes de paridade ONNX **rodaram** e nao foram SKIPPED por falta de `onnxscript` (sentinela anti-skip, 28a/29a onda).
 - [ ] Deep ranking (Triton/GPU) NAO ativo no hot path sem uplift A/B provado (K8 pendente).
 - [ ] Fail-open deterministico do ranker verificado: timeout duro retorna cascata pura.
 
@@ -321,12 +442,14 @@ psql "$PGURL_COMPLIANCE" -f db/compliance/migrations/0001_compliance_schema_down
 psql "$PGURL" -f db/vector/migrations/0002_vector_rls_down.sql
 psql "$PGURL" -f db/vector/migrations/0001_vector_schema_down.sql
 
-# 3. ledger (ordem inversa: 0003, 0002, 0001)
+# 3. ledger (ordem inversa: 0004, 0003, 0002, 0001)
+psql "$PGURL" -f db/ledger/migrations/0004_ledger_postings_immutable_down.sql
 psql "$PGURL" -f db/ledger/migrations/0003_ledger_rls_down.sql
 psql "$PGURL" -f db/ledger/migrations/0002_reconciliation_exceptions_down.sql
 psql "$PGURL" -f db/ledger/migrations/0001_ledger_schema_down.sql
 
-# 4. config (ordem inversa: 0003, 0002, 0001)
+# 4. config (ordem inversa: 0004, 0003, 0002, 0001)
+psql "$PGURL" -f db/config/migrations/0004_campaign_zones_with_check_down.sql
 psql "$PGURL" -f db/config/migrations/0003_campaign_zones_rls_down.sql
 psql "$PGURL" -f db/config/migrations/0002_config_rls_down.sql
 psql "$PGURL" -f db/config/migrations/0001_config_schema_down.sql
@@ -334,6 +457,13 @@ psql "$PGURL" -f db/config/migrations/0001_config_schema_down.sql
 # 5. asset_registry
 psql "$PGURL" -f db/asset_registry/migrations/0001_asset_registry_down.sql
 ```
+
+**Atencao (0004_down):** reverter a `0004` do ledger **remove a garantia de append-only**
+— `UPDATE`/`DELETE` em `ledger.postings` e em `journal_entries` ja finalizadas voltam a
+ser aceitos pelo banco. Se o objetivo do rollback nao for descartar o schema inteiro, NAO
+reverta a `0004`: ela nao tem dependencia estrutural com as demais e pode permanecer.
+Reverter a `0004` exige aprovacao explicita do guardiao de ledger, e o REVOKE de §2.3.1
+deve ser mantido mesmo assim (ele nao e desfeito por nenhum `_down`).
 
 **Atencao:** o rollback do ledger (`0001_down`) remove o schema `ledger` inteiro,
 incluindo `journal_entries`, `postings` e `reconciliation_exceptions`. Toda a

@@ -4,6 +4,11 @@
 proto/gen/
 # Binários locais de tooling
 .bin/
+# Runtime do perfil BETA (ADR-0005): PIDs e logs de `make beta-up`.
+# NAO ignoramos `News/` de proposito: aquele diretorio so aparecia por causa do
+# bug de path-com-espaco no alvo `tools` — ignora-lo mascararia o defeito em vez
+# de corrigi-lo. O gate `make-quoting-check` impede a reincidencia.
+.beta/
 # State de IaC (NUNCA versionar)
 *.tfstate
 *.tfstate.*

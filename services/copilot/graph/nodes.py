@@ -34,7 +34,7 @@ from langchain_core.messages import AIMessage, ToolMessage, SystemMessage
 from langgraph.types import interrupt
 
 from graph.state import CopilotState
-from tools.gateway import ToolGateway
+from tools.gateway import ToolGateway, _detect_pii_in_html, _publishable_text_fields
 from tools.schemas import (
     WriteDiff,
     SimulateForecastInput,
@@ -75,6 +75,17 @@ READ_TOOL_NAMES = frozenset({
     "search_similar_creatives",
     "search_help_docs",
 })
+
+# Achado PRIV-03 remediação #5 (31ª onda): dispatch estrutural (não uma lista
+# de CAMPOS de PII) do tool_name de banner para o schema Pydantic do seu
+# PRÓPRIO payload de escrita. Usado por `_run_creative_validation` para
+# escanear PII no payload real (`CreateBannerDraftInput`/
+# `UpdateBannerDraftInput`), não apenas no schema-espelho
+# `ValidateCreativeInput` — ver comentário completo em `_run_creative_validation`.
+_BANNER_DRAFT_INPUT_BY_TOOL: dict[str, type] = {
+    "create_banner_draft": CreateBannerDraftInput,
+    "update_banner_draft": UpdateBannerDraftInput,
+}
 
 
 def make_agent_node(
@@ -277,6 +288,112 @@ def make_tool_execute_node(gateway: ToolGateway):
     return tool_execute_node
 
 
+# Achado PRIV-03 remediação #6 (32ª onda, mutation-hardening): extraída de
+# dentro de `make_write_draft_node` para o nível de MÓDULO. Antes, esta
+# função só era exercitável indiretamente através de `write_draft_node`
+# (que por sua vez só é chamado através do grafo completo) — um teste que
+# mutasse esta função só podia detectar a mutação observando o `WriteDiff`
+# final, um nível de indireção a mais que introduz confundidores incidentais
+# (ex.: `update_banner_draft` sem `dest_url` já reprova o gate por outro
+# motivo, mascarando parcialmente o sinal específico do scan de PII). Ao ser
+# top-level, `_run_creative_validation(gateway, tenant_id, tool_name,
+# tool_input)` pode ser importada e chamada DIRETAMENTE em teste — ver
+# `TestRunCreativeValidationDirect` em `tests/test_security.py` — isolando
+# precisamente a lógica sob teste, sem depender do resto do nó. `gateway` é
+# passado explicitamente como argumento em vez de capturado por closure;
+# `make_write_draft_node` abaixo apenas repassa o `gateway` que já recebe.
+async def _run_creative_validation(
+    gateway: ToolGateway,
+    tenant_id: str,
+    tool_name: str,
+    tool_input: dict,
+) -> dict | None:
+    """
+    Executa validate_creative para operações de banner.
+    Retorna o modelo dump do ValidateCreativeOutput ou None se não aplicável.
+
+    Achado PRIV-03 remediação #5 (31ª onda) — PII scan sobre o PAYLOAD DE
+    ESCRITA, não só sobre o schema-espelho:
+      `gateway.validate_creative` escaneia PII (TX-5/DA-11) somente sobre
+      os campos de `ValidateCreativeInput` (asset_url/html_content/
+      dest_url) — um schema-ESPELHO montado aqui a partir de `tool_input`
+      só com os campos relevantes ao gate de proveniência C2PA/SynthID.
+      Mas o nome do banner/campanha (`CreateBannerDraftInput.name` /
+      `UpdateBannerDraftInput.name`) é texto livre PUBLICÁVEL — aparece na
+      UI do anunciante, é persistido e é LOGADO verbatim — e nunca existiu
+      em `ValidateCreativeInput`, então nunca era escaneado: o
+      default-deny por introspecção Pydantic estava aplicado ao schema
+      errado (o espelho, não a escrita real).
+      Fix: reconstrói o PRÓPRIO tipo de draft (`CreateBannerDraftInput`/
+      `UpdateBannerDraftInput`, via `_BANNER_DRAFT_INPUT_BY_TOOL` — dispatch
+      estrutural por tool_name, já necessário para saber qual schema o
+      `tool_input` representa) e roda `_publishable_text_fields` — agora
+      generalizada para qualquer `BaseModel` — sobre ELE. Um campo de
+      texto livre novo em qualquer um dos dois schemas (ex.: `alt_text`,
+      `caption`) entra na varredura por construção, sem precisar ser
+      listado aqui: DEFAULT-DENY real, não uma lista de 1 campo corrigida
+      ad-hoc.
+    """
+    # `banner_ops` é derivado das CHAVES de `_BANNER_DRAFT_INPUT_BY_TOOL`
+    # (fonte única) — não uma lista separada mantida à mão em paralelo.
+    banner_ops = frozenset(_BANNER_DRAFT_INPUT_BY_TOOL)
+    if tool_name not in banner_ops:
+        return None
+    draft_input_cls = _BANNER_DRAFT_INPUT_BY_TOOL[tool_name]
+
+    # Extrai campos relevantes do input para validação criativa
+    creative_type_str = tool_input.get("creative_type", "image")
+    try:
+        creative_type = CreativeType(creative_type_str)
+    except ValueError:
+        creative_type = CreativeType.IMAGE
+
+    val_inp = ValidateCreativeInput(
+        creative_type=creative_type,
+        asset_url=tool_input.get("asset_url"),
+        html_content=tool_input.get("html_content"),
+        is_ai_generated=tool_input.get("is_ai_generated", False),
+        ai_generation_tool=tool_input.get("ai_generation_tool"),
+        dest_url=tool_input.get("dest_url"),
+    )
+    val_result = await gateway.validate_creative(tenant_id, val_inp)
+    result_dict = val_result.model_dump()
+
+    # PII scan adicional sobre o PAYLOAD DE ESCRITA real (ver docstring
+    # acima). Campos já cobertos pelo scan de `val_inp` (asset_url/
+    # dest_url) não são reportados duas vezes.
+    try:
+        draft_inp = draft_input_cls(**tool_input)
+    except Exception:
+        # Shape inválido do draft: a validação/erro "de verdade" ocorre
+        # logo abaixo em write_draft_node, ao reconstruir o mesmo tipo
+        # para gerar o WriteDiff. Aqui, sem instância válida, não há o
+        # que escanear além do que `val_inp` já cobriu.
+        draft_inp = None
+
+    if draft_inp is not None:
+        already_scanned = {name for name, _ in _publishable_text_fields(val_inp)}
+        extra_violations: list[str] = []
+        for field_name, field_value in _publishable_text_fields(draft_inp):
+            if field_name in already_scanned:
+                continue
+            if field_value and _detect_pii_in_html(field_value):
+                extra_violations.append(
+                    f"PII detectado em '{field_name}' do banner (TX-5/DA-11). "
+                    "Remova dados pessoais antes de publicar."
+                )
+        if extra_violations:
+            result_dict["pii_detected"] = True
+            result_dict["is_valid"] = False
+            result_dict["gate_passed"] = False
+            result_dict["violations"] = [
+                *result_dict.get("violations", []),
+                *extra_violations,
+            ]
+
+    return result_dict
+
+
 def make_write_draft_node(gateway: ToolGateway):
     """
     Nó que prepara o WriteDiff para escrita.
@@ -288,37 +405,6 @@ def make_write_draft_node(gateway: ToolGateway):
       Se gate_passed=False, o diff ainda é gerado mas marcado como inválido
       (permite ao humano ver o problema no HITL antes de bloquear).
     """
-
-    async def _run_creative_validation(
-        tenant_id: str,
-        tool_name: str,
-        tool_input: dict,
-    ) -> dict | None:
-        """
-        Executa validate_creative para operações de banner.
-        Retorna o modelo dump do ValidateCreativeOutput ou None se não aplicável.
-        """
-        banner_ops = {"create_banner_draft", "update_banner_draft"}
-        if tool_name not in banner_ops:
-            return None
-
-        # Extrai campos relevantes do input para validação criativa
-        creative_type_str = tool_input.get("creative_type", "image")
-        try:
-            creative_type = CreativeType(creative_type_str)
-        except ValueError:
-            creative_type = CreativeType.IMAGE
-
-        val_inp = ValidateCreativeInput(
-            creative_type=creative_type,
-            asset_url=tool_input.get("asset_url"),
-            html_content=tool_input.get("html_content"),
-            is_ai_generated=tool_input.get("is_ai_generated", False),
-            ai_generation_tool=tool_input.get("ai_generation_tool"),
-            dest_url=tool_input.get("dest_url"),
-        )
-        val_result = await gateway.validate_creative(tenant_id, val_inp)
-        return val_result.model_dump()
 
     async def write_draft_node(state: CopilotState) -> dict[str, Any]:
         """
@@ -338,7 +424,7 @@ def make_write_draft_node(gateway: ToolGateway):
         try:
             # M2: valida criativo ANTES de criar o draft (para banner ops)
             creative_validation = await _run_creative_validation(
-                tenant_id, tool_name, tool_input
+                gateway, tenant_id, tool_name, tool_input
             )
 
             if tool_name == "create_campaign_draft":
@@ -462,6 +548,58 @@ def make_hitl_approval_node():
     return hitl_approval_node
 
 
+# Achado remediação copilot-honestidade #2 (30ª onda): allowlist ESTREITA e
+# EXPLÍCITA de `entity_type` para os quais um WriteDiff sem
+# `validation_result` é um caminho LEGÍTIMO — não um buraco fail-open geral.
+#
+# Critério: a entidade não carrega conteúdo de criativo (C2PA/SynthID/
+# disclosure/PII — EU AI Act Art. 50, ver `validate_creative`) nem regras de
+# entrega sujeitas a anti-contradição (§4.6/CA-4, ver `validate_segmentation`).
+#   - "campaign": metadados de campanha (nome/orçamento/datas) — sem asset.
+#   - "cap": limite numérico de frequência/orçamento — sem texto publicável.
+#   - "campaign_zone": vínculo campanha↔zona (só IDs) — sem texto publicável.
+#
+# "banner" (contém asset_url/dest_url/creative_type — é o próprio criativo)
+# e "delivery_rule" (regras §4.6) NÃO estão aqui: um WriteDiff desses tipos
+# sem validation_result é bloqueado (fail-closed), nunca silenciosamente
+# aplicado.
+#
+# Achado remediação copilot-honestidade #9 (31ª onda, PRIV-05, doc-lie):
+# este comentário afirmava que "`create_banner_draft` ainda não invoca
+# `validate_creative`" — falso já na 30ª onda que o escreveu.
+#
+# Correção (32ª onda, reincidência LEVE apontada pelo guardião de
+# privacidade): a versão anterior deste comentário atribuía a
+# `validate_segmentation` o MESMO ponto de invocação de `validate_creative`
+# ("no mesmo ponto" / mesmo mecanismo de anexação) — o que também não
+# corresponde ao código. Os dois gates rodam em pontos DIFERENTES:
+#   - `validate_creative`: invocada em `_run_creative_validation` (função de
+#     módulo, acima, neste arquivo), chamada por `write_draft_node` ANTES de
+#     construir o `WriteDiff` para `create_banner_draft`/`update_banner_draft`.
+#     O `validation_result` resultante é anexado ao diff JÁ CONSTRUÍDO via
+#     `diff.model_copy(update={"validation_result": ...})`, em
+#     `write_draft_node` (ver bloco `if creative_validation is not None:`).
+#   - `validate_segmentation`: invocada DENTRO de
+#     `ToolGateway.create_delivery_rule_draft` (tools/gateway.py) — um método
+#     de gateway diferente, não em `graph/nodes.py`. Esse método já retorna o
+#     `WriteDiff` com `validation_result=val_result.model_dump()` passado
+#     diretamente ao construtor — não há `model_copy` posterior em
+#     `write_draft_node` para `create_delivery_rule_draft` (o `if
+#     creative_validation is not None:` em `write_draft_node` só é
+#     verdadeiro para as duas tool_names de banner, ver
+#     `_BANNER_DRAFT_INPUT_BY_TOOL`).
+# Por isso `validation_result=None` para `entity_type in {"banner",
+# "delivery_rule"}` só pode significar que o diff foi montado por um caminho
+# que PULOU a etapa de validação correspondente (bug ou diff forjado) —
+# nunca um "ainda não implementado" legítimo — e é tratado como reprovação
+# (fail-closed) em `apply_write_node`, abaixo.
+_ENTITY_TYPES_EXEMPT_FROM_VALIDATION_GATE: frozenset[str] = frozenset({
+    "campaign",
+    "cap",
+    "campaign_zone",
+})
+
+
 def make_apply_write_node(gateway: ToolGateway):
     """
     Nó que aplica o WriteDiff APROVADO pelo humano.
@@ -481,6 +619,19 @@ def make_apply_write_node(gateway: ToolGateway):
       humano tenha clicado em aprovar no HITL (a UI deve impedir aprovação de
       diffs reprovados, mas o backend não pode confiar só nisso: fail-closed
       em profundidade). Nenhuma exceção — retorna next_action='error'.
+
+    SEGURANÇA (Achado remediação copilot-honestidade #2, 30ª onda —
+    FAIL-CLOSED quando validation_result é None):
+      Um WriteDiff SEM validation_result (None) só é aplicado se
+      diff.entity_type estiver na allowlist estreita e explícita
+      `_ENTITY_TYPES_EXEMPT_FROM_VALIDATION_GATE` (entidades que
+      estruturalmente não carregam criativo nem regra de entrega). Para
+      qualquer outro entity_type (ex.: "banner"), a AUSÊNCIA de
+      validation_result é tratada como reprovação — o gate de conformidade
+      do EU AI Act Art. 50 (vigor 02/08/2026) não pode ser contornado por
+      omissão. Antes desta remediação, validation_result=None pulava o gate
+      inteiro para QUALQUER entity_type — um WriteDiff de banner sem
+      validação alguma persistia sem checagem nenhuma.
     """
 
     async def apply_write_node(state: CopilotState) -> dict[str, Any]:
@@ -512,7 +663,29 @@ def make_apply_write_node(gateway: ToolGateway):
         # validation_result reprovou (gate_passed=False e/ou is_valid=False)
         # NUNCA chega a gateway.apply_write, independentemente de hitl_approved.
         validation = diff.validation_result
-        if validation is not None:
+        if validation is None:
+            # Achado remediação copilot-honestidade #2: FAIL-CLOSED por padrão.
+            # Só é legítimo pular o gate se entity_type estiver na allowlist
+            # estreita e explícita (entidades sem criativo/regra de entrega).
+            if diff.entity_type not in _ENTITY_TYPES_EXEMPT_FROM_VALIDATION_GATE:
+                log.error(
+                    "apply_write_node.validation_result_missing",
+                    tenant_id=tenant_id,
+                    operation=diff.operation,
+                    entity_type=diff.entity_type,
+                )
+                return {
+                    "next_action": "error",
+                    "error_message": (
+                        "Escrita bloqueada: nenhum resultado de validação de "
+                        "proveniência (C2PA/SynthID/PII) ou anti-contradição "
+                        "(§4.6/CA-4) foi anexado a este diff. Gere um novo "
+                        "draft com validação antes de aplicar."
+                    ),
+                    "pending_diff": None,
+                    "hitl_approved": None,
+                }
+        else:
             gate_passed = validation.get("gate_passed", True)
             is_valid = validation.get("is_valid", True)
             if gate_passed is False or is_valid is False:
@@ -550,9 +723,14 @@ def make_apply_write_node(gateway: ToolGateway):
             result = await gateway.apply_write(tenant_id, diff)
             # C1/L2: não incluir tenant_id no resultado retornado ao LLM
             safe_result = {k: v for k, v in result.items() if k != "tenant_id"}
+            # Achado remediação copilot-honestidade #3 (30ª onda): o status
+            # relatado ao LLM/humano é o que gateway.apply_write REALMENTE
+            # retornou (ex.: "pending_dispatch" enquanto o dispatch por
+            # operação não existir) — nunca um "applied" hardcoded que
+            # afirmaria uma persistência que pode não ter ocorrido.
             tool_msg = ToolMessage(
                 content=json.dumps({
-                    "status": "applied",
+                    "status": safe_result.get("status", "unknown"),
                     "operation": diff.operation,
                     "result": safe_result,
                 }, ensure_ascii=False),

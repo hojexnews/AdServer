@@ -4,7 +4,59 @@
 # O IP bruto é DESCARTADO após derivar geo; chaves de capping são
 # hasheadas; atributos reidentificáveis são removidos ANTES de qualquer
 # export (TX-5/DA-11). Observabilidade do copiloto (Langfuse) é
-# self-hosted; este collector cuida de traces/metrics/logs de infra+app.
+# self-hosted; este collector é o ponto de redação DESTINADO a
+# traces/metrics/logs de infra+app assim que forem cabeados (ver ressalva
+# sinal-por-sinal abaixo: nenhum dos três está vigente hoje).
+#
+# COBERTURA: os TRÊS pipelines de sinal (traces, metrics, logs) passam
+# pela mesma dupla de barreiras — transform/redact-pii (remoção por chave
+# conhecida) seguido do redaction/allowlist-<tipo> específico do tipo de
+# sinal (fail-closed: só o que está na allowlist sobrevive). O gate
+# `make platform-otel-validate` (via
+# platform/observability/otel-pipeline-redaction-check.py) enumera TODOS
+# os pipelines definidos em service.pipelines — não uma lista hardcoded —
+# e reprova por construção qualquer pipeline (deste ou de qualquer nome,
+# incluindo `<tipo>/<id>` como `traces/raw`) que não tenha as duas
+# barreiras cabeadas em .processors (achados `otel-gate-hardcoded-
+# pipeline-names` e `otel-metrics-pipeline-sem-redacao-e-sem-gate`, 30ª
+# onda de auditoria adversarial).
+#
+# RESSALVA HONESTA — SINAL POR SINAL (achados
+# `otel-redacao-orfa-do-caminho-real-de-logs`, 30ª onda, e
+# `otel-doc-lie-traces-metrics-vigentes`, 31ª onda de remediação): esta
+# config valida ESTRUTURALMENTE a redação para os três tipos de sinal, mas
+# "estrutural" não é o mesmo que "vigente" — vigente exige um emissor real
+# no código apontando para este collector. Reverificado de 1ª mão (grep por
+# OTLPLogExporter/LoggerProvider/OTLPSpanExporter/OTLPMetricExporter/
+# TracerProvider/MeterProvider/otlptrace/otlpmetric/sdktrace/OTEL_EXPORTER_
+# OTLP em services/, internal/, bff/src, web/console/src e go.mod; e por
+# opentelemetry.metrics.get_meter sem nenhum set_meter_provider/
+# set_tracer_provider em services/copilot):
+#
+#   - LOGS: NÃO vigente. Nenhum serviço exporta logs via OTLP; structlog/
+#     slog escrevem em stdout; o collector não tem receiver `filelog`.
+#   - TRACES: NÃO vigente. Nenhum serviço instancia um TracerProvider OTLP
+#     nem chama um exporter otlptrace/otlphttp. `services/copilot/
+#     pyproject.toml` declara `opentelemetry-api/-sdk/-exporter-otlp` como
+#     dependência, mas nada no código chama `set_tracer_provider` — a
+#     dependência está listada, não cabeada.
+#   - METRICS: NÃO vigente. `services/copilot/observability/
+#     langfuse_setup.py::record_otel_usage` chama
+#     `opentelemetry.metrics.get_meter(...)` mas nunca instala um
+#     MeterProvider com um OTLPMetricExporter — sem um provider configurado
+#     a API do OTel usa o meter no-op global por padrão, então
+#     `counter.add(...)` não emite nada para lugar nenhum, muito menos
+#     para este collector.
+#
+# Ou seja: para os TRÊS sinais, a redação aqui é uma barreira ESTRUTURAL
+# PRONTA (o gate `make platform-otel-validate` garante que, no dia em que
+# um sinal passar a ser emitido de fato, ele já nasce redigido), não uma
+# garantia HOJE VIGENTE sobre nenhum dos três. Não existe hoje nenhum
+# caminho real de app -> collector para traces, metrics ou logs. Cabear
+# os serviços (TracerProvider/MeterProvider com exporter OTLP apontando
+# para este collector, e um receiver `filelog` ou emissor de log OTLP para
+# logs) é trabalho pendente para os três — nenhum dos três deve ser lido
+# como "já protegido em produção" só porque esta config existe.
 #
 # Validação estrutural: é YAML bem-formado; a validação semântica completa
 # (`otelcol validate --config`) roda no CI de imagem do collector (Fase 1),
@@ -28,6 +80,9 @@ processors:
   # 2) REDAÇÃO DE PII (TX-5). Remove atributos que carregam ou derivam
   #    identidade. O IP bruto nunca deve chegar até aqui (descartado no
   #    serviço após derivar geo); esta é a barreira em profundidade.
+  #    Cobre os três contextos (span, datapoint, log) — nenhum tipo de
+  #    sinal fica de fora (achado `otel-metrics-pipeline-sem-redacao-e-
+  #    sem-gate`, 30ª onda: o contexto `datapoint` estava ausente).
   transform/redact-pii:
     error_mode: ignore
     trace_statements:
@@ -44,6 +99,23 @@ processors:
           - delete_key(attributes, "user.id")
           - delete_key(attributes, "user.email")
           # Chave de capping: efêmera e hasheada (TX-5). Se aparecer, hashear.
+          - set(attributes["capping.key"], SHA256(attributes["capping.key"])) where attributes["capping.key"] != nil
+    metric_statements:
+      - context: datapoint
+        statements:
+          # Mesma barreira de traces/logs, aplicada aos atributos do
+          # datapoint — o exporter prometheusremotewrite promove esses
+          # atributos a LABELS exportados, então eles precisam da mesma
+          # redação (achado `otel-metrics-pipeline-sem-redacao-e-sem-
+          # gate`, 30ª onda).
+          - delete_key(attributes, "client.address")
+          - delete_key(attributes, "http.client_ip")
+          - delete_key(attributes, "net.sock.peer.addr")
+          - delete_key(attributes, "net.peer.ip")
+          - delete_key(attributes, "url.full")        # pode conter querystring com PII
+          - delete_key(attributes, "enduser.id")
+          - delete_key(attributes, "user.id")
+          - delete_key(attributes, "user.email")
           - set(attributes["capping.key"], SHA256(attributes["capping.key"])) where attributes["capping.key"] != nil
     log_statements:
       - context: log
@@ -131,6 +203,34 @@ processors:
       - "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}" # e-mail
     summary: debug
 
+  # 3c) Allow-list final para METRICS: o exporter prometheusremotewrite
+  #     promove atributos de DATAPOINT a LABELS remote-write — mesma
+  #     postura fail-closed de traces/logs, restrita a dimensões de
+  #     agregação (achado `otel-metrics-pipeline-sem-redacao-e-sem-gate`,
+  #     30ª onda: até aqui o pipeline metrics não tinha allowlist alguma).
+  #
+  #     Chaves permitidas e justificativa de não-PII: mesmo racional da
+  #     allowlist de logs — nenhuma delas identifica pessoa natural.
+  redaction/allowlist-metrics:
+    allow_all_keys: false
+    allowed_keys:
+      - service.name
+      - service.namespace
+      - tenant_id
+      - zone_id
+      - site_id
+      - served_tier
+      - model_version
+      - geo.country
+      - http.request.method
+      - http.response.status_code
+      - otel.status_code
+    # Mesmos bloqueios de valor sensível dos demais pipelines.
+    blocked_values:
+      - "\\b\\d{1,3}(\\.\\d{1,3}){3}\\b"               # IPv4
+      - "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}" # e-mail
+    summary: debug
+
   # 4) Lote para eficiência de export.
   batch:
     timeout: 5s
@@ -155,7 +255,10 @@ service:
       exporters: [otlphttp/tempo]
     metrics:
       receivers: [otlp]
-      processors: [memory_limiter, batch]
+      # transform/redact-pii primeiro (remoção por chave conhecida nos
+      # atributos do datapoint), redaction/allowlist-metrics depois
+      # (fail-closed: só a allowlist sobrevive antes do remote-write).
+      processors: [memory_limiter, transform/redact-pii, redaction/allowlist-metrics, batch]
       exporters: [prometheusremotewrite]
     logs:
       receivers: [otlp]

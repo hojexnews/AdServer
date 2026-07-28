@@ -78,6 +78,87 @@ def _make_hmac_sig(tenant_id: str, timestamp: str, secret: str) -> str:
     return hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
 
 
+# ---------------------------------------------------------------------------
+# FakeDBPool — achados copilot-rag-isolation-asserts-commented-code e
+# h2-sql-injection-gate-tests-dead-comments.
+#
+# Lição das ondas 25-27 ("testar cópia != testar produção"): isto NÃO
+# reimplementa a lógica de segurança do gateway. É apenas um stub da
+# interface asyncpg (acquire/execute/fetch/transaction) que permite ao
+# código REAL de ToolGateway (search_similar_creatives, search_help_docs,
+# apply_write) rodar de ponta a ponta em teste, registrando fielmente a
+# query-texto e os args posicionais REALMENTE emitidos pela função de
+# produção — para que possamos asserir sobre a query construída (tenant_id
+# vinculado como parâmetro $N, nunca interpolado via f-string), não sobre
+# comentários ou texto-fonte via inspect.getsource.
+# ---------------------------------------------------------------------------
+
+class _FakeAsyncCtx:
+    """Async context manager trivial — usado para conn.transaction()."""
+
+    async def __aenter__(self) -> "_FakeAsyncCtx":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> bool:
+        return False
+
+
+class FakeConnection:
+    def __init__(self, pool: "FakeDBPool") -> None:
+        self._pool = pool
+
+    def transaction(self) -> _FakeAsyncCtx:
+        return _FakeAsyncCtx()
+
+    async def execute(self, query: str, *args: Any) -> str:
+        self._pool.queries.append((query, args))
+        return "OK"
+
+    async def fetch(self, query: str, *args: Any) -> list[dict]:
+        self._pool.queries.append((query, args))
+        return self._pool.fetch_rows
+
+    async def fetchrow(self, query: str, *args: Any) -> dict | None:
+        self._pool.queries.append((query, args))
+        return self._pool.fetch_rows[0] if self._pool.fetch_rows else None
+
+
+class _FakeAcquireCtx:
+    def __init__(self, pool: "FakeDBPool") -> None:
+        self._pool = pool
+
+    async def __aenter__(self) -> FakeConnection:
+        self._pool.connections_acquired += 1
+        return FakeConnection(self._pool)
+
+    async def __aexit__(self, *exc: Any) -> bool:
+        return False
+
+
+class FakeDBPool:
+    """Stub mínimo de asyncpg.Pool: acquire() dedicado por chamada."""
+
+    def __init__(self, fetch_rows: list[dict] | None = None) -> None:
+        self.queries: list[tuple[str, tuple]] = []
+        self.fetch_rows = fetch_rows or []
+        self.connections_acquired = 0
+
+    def acquire(self) -> _FakeAcquireCtx:
+        return _FakeAcquireCtx(self)
+
+
+def make_gateway_with_fake_db(
+    fetch_rows: list[dict] | None = None,
+) -> tuple[ToolGateway, FakeDBPool]:
+    s = make_settings()
+    import httpx
+    ml_mock = AsyncMock()
+    ml_mock.post = AsyncMock(side_effect=httpx.ConnectError("offline"))
+    fake_pool = FakeDBPool(fetch_rows=fetch_rows)
+    gw = ToolGateway(s, db_pool=fake_pool, ml_client=ml_mock)
+    return gw, fake_pool
+
+
 # =============================================================================
 # H1 — HMAC fail-closed
 #
@@ -179,67 +260,125 @@ class TestH1HmacFailClosed:
 # =============================================================================
 
 class TestH2SqlInjectionAndSchema:
-    """H2: set_config parametrizado e schema vector_store correto."""
+    """
+    H2: set_config parametrizado e schema vector_store correto.
 
-    def test_search_similar_creatives_uses_vector_store_schema(self) -> None:
+    Achados copilot-rag-isolation-asserts-commented-code /
+    h2-sql-injection-gate-tests-dead-comments: até esta correção, TODO o SQL
+    de produção em search_similar_creatives/search_help_docs/apply_write
+    estava dentro de COMENTÁRIOS Python — as funções eram stubs que nunca
+    executavam SQL, e os testes abaixo faziam inspect.getsource(...) + assert
+    de substring, satisfeitos exclusivamente pelo texto comentado. Uma
+    implementação real com f-string vulnerável (comentários intactos) fazia
+    o gate passar; remover só os comentários (função continua stub) fazia o
+    gate falhar. Ambos os sentidos provam tautologia.
+
+    Correção: o SQL agora é CÓDIGO EXECUTÁVEL real (tools/gateway.py) e os
+    testes abaixo chamam as funções de PRODUÇÃO com FakeDBPool (stub de
+    interface asyncpg, não uma reimplementação da lógica de segurança) e
+    asserem sobre a query e os args REALMENTE emitidos — tenant_id sempre
+    como parâmetro posicional, nunca interpolado no texto do SQL.
+    """
+
+    @pytest.mark.asyncio
+    async def test_search_similar_creatives_real_execution_parametrizes_tenant_id(self) -> None:
         """
-        O SQL gerado para search_similar_creatives deve referenciar
-        vector_store.creative_embeddings (não vector.creative_embeddings).
-        Verificamos via inspeção do código fonte da função.
+        search_similar_creatives REAL: set_config é a PRIMEIRA query emitida,
+        com tenant_id como argumento posicional (nunca dentro do texto SQL).
         """
-        from tools import gateway as gw_module
+        from tools.schemas import SearchSimilarCreativesInput
 
-        source = inspect.getsource(gw_module.ToolGateway.search_similar_creatives)
-        # Schema correto deve estar presente
-        assert "vector_store.creative_embeddings" in source, (
-            "search_similar_creatives deve referenciar vector_store.creative_embeddings"
+        gw, fake_pool = make_gateway_with_fake_db(fetch_rows=[{
+            "banner_id": "b1",
+            "campaign_id": "c1",
+            "creative_type": "html5",
+            "ctr": 0.05,
+            "similarity_score": 0.9,
+            "description_snippet": "banner de verão",
+        }])
+        inp = SearchSimilarCreativesInput(query_text="banner verão", top_k=5)
+
+        result = await gw.search_similar_creatives(TENANT_A, inp)
+
+        assert len(fake_pool.queries) == 2, "set_config + SELECT devem ser as únicas queries"
+        set_config_query, set_config_args = fake_pool.queries[0]
+        assert "set_config('adserver.tenant_id', $1, true)" in set_config_query
+        assert set_config_args == (TENANT_A,), (
+            "tenant_id deve ser passado como PARÂMETRO posicional, nunca interpolado"
         )
-        # Schema errado NÃO deve estar presente
-        assert "FROM vector.creative_embeddings" not in source, (
-            "Schema 'vector' é errado — deve ser 'vector_store'"
-        )
+        # tenant_id NUNCA deve aparecer interpolado no texto do SQL (SQL injection)
+        assert TENANT_A not in set_config_query
+        select_query, _select_args = fake_pool.queries[1]
+        assert TENANT_A not in select_query
 
-    def test_search_help_docs_uses_vector_store_schema(self) -> None:
-        """search_help_docs deve referenciar vector_store.help_doc_embeddings."""
-        from tools import gateway as gw_module
+        assert result.total_searched == 1
+        assert result.results[0].banner_id == "b1"
 
-        source = inspect.getsource(gw_module.ToolGateway.search_help_docs)
-        assert "vector_store.help_doc_embeddings" in source, (
-            "search_help_docs deve referenciar vector_store.help_doc_embeddings"
-        )
+    @pytest.mark.asyncio
+    async def test_search_similar_creatives_uses_vector_store_schema_real_execution(self) -> None:
+        """A SELECT real referencia vector_store.creative_embeddings (não vector.)."""
+        from tools.schemas import SearchSimilarCreativesInput
 
-    def test_set_config_parametrized_in_search(self) -> None:
+        gw, fake_pool = make_gateway_with_fake_db(fetch_rows=[])
+        inp = SearchSimilarCreativesInput(query_text="banner verão", top_k=5)
+        await gw.search_similar_creatives(TENANT_A, inp)
+
+        select_query, _args = fake_pool.queries[1]
+        assert "vector_store.creative_embeddings" in select_query
+        assert "FROM vector.creative_embeddings" not in select_query
+
+    @pytest.mark.asyncio
+    async def test_search_help_docs_real_execution_parametrizes_tenant_id(self) -> None:
+        """search_help_docs REAL: mesma disciplina de parametrização do H2."""
+        from tools.schemas import SearchHelpDocsInput
+
+        gw, fake_pool = make_gateway_with_fake_db(fetch_rows=[{
+            "doc_id": "d1",
+            "title": "Como criar campanha",
+            "snippet": "Passo a passo...",
+            "relevance_score": 0.8,
+        }])
+        inp = SearchHelpDocsInput(query="como criar campanha", top_k=3)
+
+        result = await gw.search_help_docs(TENANT_A, inp)
+
+        set_config_query, set_config_args = fake_pool.queries[0]
+        assert "set_config('adserver.tenant_id', $1, true)" in set_config_query
+        assert set_config_args == (TENANT_A,)
+        assert TENANT_A not in set_config_query
+
+        select_query, _args = fake_pool.queries[1]
+        assert "vector_store.help_doc_embeddings" in select_query
+        assert result.results[0].doc_id == "d1"
+
+    @pytest.mark.asyncio
+    async def test_apply_write_real_execution_parametrizes_tenant_id(self) -> None:
         """
-        O set_config em search_similar_creatives deve ser parametrizado ($1),
-        nunca via f-string com tenant_id interpolado.
+        apply_write REAL: set_config é chamado com tenant_id como parâmetro
+        antes de qualquer mutação — nunca via f-string ("SET LOCAL ... = '...'").
         """
-        from tools import gateway as gw_module
-
-        source = inspect.getsource(gw_module.ToolGateway.search_similar_creatives)
-        # Verifica que usa set_config parametrizado
-        assert "set_config('adserver.tenant_id', $1, true)" in source, (
-            "set_config deve ser parametrizado com $1, nunca f-string"
-        )
-        # Garante que não existe a interpolação f-string insegura
-        assert "SET LOCAL adserver.tenant_id = '" not in source, (
-            "Interpolação f-string de tenant_id é proibida (SQL injection)"
+        gw, fake_pool = make_gateway_with_fake_db()
+        diff = WriteDiff(
+            operation="create_campaign",
+            entity_type="campaign",
+            after={"tenant_id": TENANT_A, "name": "Campanha X"},
         )
 
-    def test_apply_write_no_fstring_interpolation(self) -> None:
-        """
-        apply_write não deve conter f-string que interpola tenant_id no SQL.
-        """
-        from tools import gateway as gw_module
+        result = await gw.apply_write(TENANT_A, diff)
+        # Achado remediação copilot-honestidade #3 (30ª onda): apply_write não
+        # emite INSERT/UPDATE algum (dispatch por operação pendente de G1) —
+        # o status retornado tem de dizer a verdade ("pending_dispatch"), não
+        # "applied" (que afirmaria uma persistência que não ocorreu).
+        assert result["status"] == "pending_dispatch"
+        assert result["operation"] == "create_campaign"
+        assert "tenant_id" not in result
 
-        source = inspect.getsource(gw_module.ToolGateway.apply_write)
-        # A interpolação insegura original deve estar removida
-        assert "f\"SET LOCAL adserver.tenant_id = '{tenant_id}'" not in source, (
-            "Interpolação f-string de tenant_id no SQL é proibida (SQL injection)"
-        )
-        # O padrão correto deve estar documentado
-        assert "set_config('adserver.tenant_id', $1, true)" in source, (
-            "apply_write deve documentar o uso de set_config parametrizado"
-        )
+        assert len(fake_pool.queries) == 1
+        set_config_query, set_config_args = fake_pool.queries[0]
+        assert "set_config('adserver.tenant_id', $1, true)" in set_config_query
+        assert set_config_args == (TENANT_A,)
+        assert TENANT_A not in set_config_query
+        assert "SET LOCAL adserver.tenant_id = '" not in set_config_query
 
     @pytest.mark.asyncio
     async def test_search_similar_creatives_stub_returns_empty_without_db(self) -> None:
@@ -251,18 +390,28 @@ class TestH2SqlInjectionAndSchema:
         assert result.results == []
         assert result.total_searched == 0
 
-    def test_each_db_function_acquires_dedicated_connection(self) -> None:
+    @pytest.mark.asyncio
+    async def test_each_db_function_acquires_dedicated_connection_real_execution(self) -> None:
         """
-        Cada função de DB deve documentar acquire() dedicado para evitar
-        vazamento de tenant_id em transaction-pooling/PgBouncer.
+        Cada chamada a search_similar_creatives/search_help_docs/apply_write
+        REAL deve adquirir exatamente UMA conexão dedicada do pool (anti-leak
+        de tenant_id em transaction-pooling/PgBouncer) — contamos
+        connections_acquired do FakeDBPool, não grep de 'acquire()' no texto.
         """
-        from tools import gateway as gw_module
+        from tools.schemas import SearchSimilarCreativesInput, SearchHelpDocsInput
 
-        source = inspect.getsource(gw_module.ToolGateway.search_similar_creatives)
-        # Deve documentar que cada operação usa conexão dedicada
-        assert "acquire()" in source, (
-            "search_similar_creatives deve documentar acquire() dedicado (anti-PgBouncer leak)"
-        )
+        gw, fake_pool = make_gateway_with_fake_db(fetch_rows=[])
+        await gw.search_similar_creatives(TENANT_A, SearchSimilarCreativesInput(query_text="x y z"))
+        assert fake_pool.connections_acquired == 1
+
+        gw2, fake_pool2 = make_gateway_with_fake_db(fetch_rows=[])
+        await gw2.search_help_docs(TENANT_A, SearchHelpDocsInput(query="ajuda pix"))
+        assert fake_pool2.connections_acquired == 1
+
+        gw3, fake_pool3 = make_gateway_with_fake_db()
+        diff = WriteDiff(operation="create_campaign", entity_type="campaign", after={})
+        await gw3.apply_write(TENANT_A, diff)
+        assert fake_pool3.connections_acquired == 1
 
 
 # =============================================================================
@@ -414,6 +563,14 @@ class TestC1HitlCrossTenantIDOR:
         """
         graph/nodes.py/apply_write_node deve verificar divergência de tenant
         entre diff.after['tenant_id'] e state['tenant_id'].
+
+        Achado copilot-c1-tenant-guard-substring-only: esta checagem por
+        SUBSTRING é apenas complementar/documental — escopada à FUNÇÃO
+        apply_write_node (não ao arquivo inteiro) para reduzir (mas não
+        eliminar) o risco de casar código morto/comentário. A prova real
+        e não-tautológica de que o guard C1 está ATIVO é
+        TestC1TenantMismatchRealExecution abaixo, que executa
+        make_apply_write_node de verdade.
         """
         with open(
             os.path.join(os.path.dirname(__file__), "../graph/nodes.py"),
@@ -421,31 +578,19 @@ class TestC1HitlCrossTenantIDOR:
         ) as f:
             source = f.read()
 
-        assert "diff_tenant != tenant_id" in source, (
+        # Isola o corpo de make_apply_write_node/apply_write_node (mesma
+        # técnica de ancoragem usada em test_get_session_state_source_has_tenant_check)
+        fn_start = source.index("def make_apply_write_node(")
+        fn_section = source[fn_start:]
+        next_fn = fn_section.index("\n\ndef ", 1)
+        fn_section = fn_section[:next_fn]
+
+        assert "diff_tenant != tenant_id" in fn_section, (
             "apply_write_node deve verificar divergência entre tenant do diff e do estado"
         )
-        assert "divergência de tenant" in source, (
+        assert "divergência de tenant" in fn_section, (
             "apply_write_node deve registrar/retornar erro de divergência de tenant"
         )
-
-    def test_apply_write_tenant_mismatch_logic(self) -> None:
-        """
-        Verifica a lógica de comparação de tenant no WriteDiff:
-        tenant_id no diff.after (dono do recurso) deve coincidir com
-        tenant_id do estado da sessão.
-        """
-        # Simula a comparação que apply_write_node faz
-        diff_after_tenant = TENANT_B
-        session_tenant = TENANT_A
-
-        # A lógica que o nó aplica
-        mismatch = diff_after_tenant is not None and diff_after_tenant != session_tenant
-        assert mismatch is True, "Tenants diferentes devem ser detectados"
-
-        # Caso positivo — mesmos tenants
-        diff_after_tenant_ok = TENANT_A
-        mismatch_ok = diff_after_tenant_ok is not None and diff_after_tenant_ok != session_tenant
-        assert mismatch_ok is False, "Tenants iguais não devem ser detectados como mismatch"
 
     def test_tenant_id_in_state_not_from_body(self) -> None:
         """
@@ -505,6 +650,87 @@ class TestC1HitlCrossTenantIDOR:
         assert "get_session_state.tenant_mismatch" in fn_section, (
             "get_session_state deve logar tenant_mismatch com log estruturado"
         )
+
+
+# =============================================================================
+# Achado copilot-c1-tenant-guard-substring-only — apply_write_node REAL (C1,
+# defesa em profundidade): cross-tenant NUNCA persiste. Substitui a
+# reimplementação local (test_apply_write_tenant_mismatch_logic, removida)
+# que recalculava `mismatch = ...` dentro do próprio teste sem jamais chamar
+# make_apply_write_node — uma mutação que apagasse o guard real em
+# graph/nodes.py não derrubava nenhum teste. Aqui exercitamos a FUNÇÃO REAL.
+# =============================================================================
+
+class TestC1TenantMismatchRealExecution:
+    """Guard C1 do apply_write_node REAL: cross-tenant nunca persiste."""
+
+    @staticmethod
+    def _base_state(diff: WriteDiff, tenant_id: str) -> dict[str, Any]:
+        return {
+            "tenant_id": tenant_id,
+            "session_id": "s1",
+            "requested_model_tier": None,
+            "messages": [],
+            "pending_diff": diff,
+            "hitl_approved": True,
+            "hitl_rejection_reason": None,
+            "last_tool_result": None,
+            "judge_result": None,
+            "langfuse_trace_id": None,
+            "input_tokens_used": 0,
+            "output_tokens_used": 0,
+            "next_action": None,
+            "error_message": None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_apply_write_node_real_refuses_cross_tenant_diff(self) -> None:
+        """
+        make_apply_write_node REAL: a sessão pertence a TENANT_A mas o diff
+        aprovado tem tenant_id=TENANT_B em `after` (ex.: diff forjado/
+        adulterado antes do HITL) — o guard C1 deve recusar ANTES de chamar
+        gateway.apply_write, mesmo com hitl_approved=True.
+        """
+        from graph.nodes import make_apply_write_node
+
+        gw = make_gateway()
+        gw.apply_write = AsyncMock(return_value={"status": "applied"})
+        node = make_apply_write_node(gw)
+
+        diff = WriteDiff(
+            operation="create_campaign",
+            entity_type="campaign",
+            after={"tenant_id": TENANT_B, "name": "Campanha cross-tenant"},
+        )
+        state = self._base_state(diff, tenant_id=TENANT_A)
+
+        result = await node(state)
+
+        assert result["next_action"] == "error", (
+            "apply_write_node REAL deve recusar diff com tenant divergente"
+        )
+        gw.apply_write.assert_not_called()  # NUNCA persiste cross-tenant
+
+    @pytest.mark.asyncio
+    async def test_apply_write_node_real_persists_when_tenant_matches(self) -> None:
+        """Contraste: mesmo tenant no diff e no estado -> persiste normalmente."""
+        from graph.nodes import make_apply_write_node
+
+        gw = make_gateway()
+        gw.apply_write = AsyncMock(return_value={"status": "applied"})
+        node = make_apply_write_node(gw)
+
+        diff = WriteDiff(
+            operation="create_campaign",
+            entity_type="campaign",
+            after={"tenant_id": TENANT_A, "name": "Campanha ok"},
+        )
+        state = self._base_state(diff, tenant_id=TENANT_A)
+
+        result = await node(state)
+
+        assert result["next_action"] == "respond"
+        gw.apply_write.assert_called_once()
 
 
 # =============================================================================
@@ -602,6 +828,285 @@ class TestM2CreativeGateInWriteDraft:
         assert "model_copy" in source, (
             "write_draft_node deve usar model_copy para anexar validation_result"
         )
+
+
+# =============================================================================
+# Achado PRIV-03 remediação #5 (31ª onda) — PII scan sobre o PAYLOAD DE
+# ESCRITA real (CreateBannerDraftInput/UpdateBannerDraftInput), não apenas
+# sobre o schema-espelho ValidateCreativeInput. `name` (nome do banner) é
+# texto livre PUBLICÁVEL — aparece na UI do anunciante, é persistido e
+# LOGADO verbatim — e antes do fix NUNCA era escaneado por PII porque
+# `_run_creative_validation` só construía um `ValidateCreativeInput`
+# (asset_url/html_content/dest_url/creative_type/is_ai_generated/
+# ai_generation_tool) a partir de `tool_input`, descartando `name`
+# silenciosamente.
+# =============================================================================
+
+class TestPiiScanCoversWritePayloadNotJustMirror:
+    """
+    MUTATION-PROOF: PII no NOME do banner deve bloquear o gate mesmo quando
+    nenhum outro campo (asset_url/html_content/dest_url) carrega PII —
+    prova que a varredura cobre o payload de escrita real, não só o
+    schema-espelho ValidateCreativeInput (que nem tem campo `name`).
+    """
+
+    @staticmethod
+    def _base_state(tenant_id: str, write_tool: str, tool_input: dict) -> dict[str, Any]:
+        return {
+            "tenant_id": tenant_id,
+            "session_id": "s1",
+            "requested_model_tier": None,
+            "messages": [],
+            "pending_diff": None,
+            "hitl_approved": None,
+            "hitl_rejection_reason": None,
+            "last_tool_result": {"write_tool": write_tool, "input": tool_input},
+            "judge_result": None,
+            "langfuse_trace_id": None,
+            "input_tokens_used": 0,
+            "output_tokens_used": 0,
+            "next_action": None,
+            "error_message": None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_pii_in_banner_name_blocks_gate_on_create(self) -> None:
+        """
+        CPF no `name` de create_banner_draft (nenhum outro campo com PII)
+        deve reprovar o gate de validação — antes do fix, `name` não
+        existia em ValidateCreativeInput e a varredura de PII nunca via
+        este campo, deixando pii_detected estruturalmente False.
+        """
+        from graph.nodes import make_write_draft_node
+
+        gw = make_gateway()
+        node = make_write_draft_node(gw)
+        state = self._base_state(
+            TENANT_A,
+            "create_banner_draft",
+            {
+                "campaign_id": 1,
+                "name": "Promo João CPF 123.456.789-00",
+                "creative_type": "image",
+                "asset_url": "https://cdn.example.com/banner.png",
+                "dest_url": "https://anunciante.com",
+                "width": 300,
+                "height": 250,
+                "is_ai_generated": False,
+            },
+        )
+
+        result = await node(state)
+
+        diff = result["pending_diff"]
+        assert diff is not None, "draft deve ser gerado mesmo com gate reprovado (humano decide no HITL)"
+        validation = diff.validation_result
+        assert validation is not None
+        assert validation["pii_detected"] is True, (
+            "PII no nome do banner deve ser detectado — a varredura tem de "
+            "cobrir o payload de escrita real (CreateBannerDraftInput), não "
+            "só o schema-espelho ValidateCreativeInput"
+        )
+        assert validation["gate_passed"] is False
+        assert validation["is_valid"] is False
+        assert any("name" in v for v in validation["violations"]), (
+            "A violação deve identificar o campo 'name' como fonte do PII"
+        )
+        # Contraste: nenhum PII em asset_url/dest_url/html_content — a única
+        # fonte de PII é o campo `name`, fora do schema-espelho.
+        assert result["next_action"] == "await_hitl"
+
+    @pytest.mark.asyncio
+    async def test_pii_in_banner_name_blocks_gate_on_update(self) -> None:
+        """
+        Mesma cobertura para update_banner_draft (e-mail no nome).
+
+        NOTA (32ª onda, hardening anti-confundidor): `dest_url`/`asset_url`
+        são preenchidos de propósito para que o schema-espelho
+        (`ValidateCreativeInput`) já reprove por ausência de `dest_url` NÃO
+        seja o motivo do `gate_passed is False` abaixo — isolando o sinal
+        para que só possa vir do scan de PII sobre o payload de escrita
+        (`name`). Sem isto, uma mutação que desligasse o scan adicional
+        ainda deixaria `gate_passed is False` verdadeiro pelo motivo ERRADO
+        (dest_url ausente), mascarando parcialmente a checagem — por isso
+        a asserção de `pii_detected is True` é a que carrega o peso da
+        prova (ver também `TestRunCreativeValidationDirect`, que testa a
+        função isoladamente, sem depender do resto do nó).
+        """
+        from graph.nodes import make_write_draft_node
+
+        gw = make_gateway()
+        node = make_write_draft_node(gw)
+        state = self._base_state(
+            TENANT_A,
+            "update_banner_draft",
+            {
+                "banner_id": 42,
+                "name": "Contato joao@example.com para detalhes",
+                "asset_url": "https://cdn.example.com/banner.png",
+                "dest_url": "https://anunciante.com",
+            },
+        )
+
+        result = await node(state)
+
+        diff = result["pending_diff"]
+        assert diff is not None
+        validation = diff.validation_result
+        assert validation is not None
+        assert validation["pii_detected"] is True, (
+            "PII no nome do banner (update) deve ser detectado mesmo com "
+            "dest_url/asset_url válidos e sem PII — isola o sinal para a "
+            "varredura do payload de escrita, não para o gate mirror"
+        )
+        assert validation["gate_passed"] is False
+        assert any("name" in v for v in validation["violations"])
+
+    @pytest.mark.asyncio
+    async def test_no_pii_in_banner_name_passes_gate(self) -> None:
+        """Contraste: nome sem PII não deve gerar falso-positivo."""
+        from graph.nodes import make_write_draft_node
+
+        gw = make_gateway()
+        node = make_write_draft_node(gw)
+        state = self._base_state(
+            TENANT_A,
+            "create_banner_draft",
+            {
+                "campaign_id": 1,
+                "name": "Promoção de verão 50% OFF",
+                "creative_type": "image",
+                "asset_url": "https://cdn.example.com/banner.png",
+                "dest_url": "https://anunciante.com",
+                "width": 300,
+                "height": 250,
+                "is_ai_generated": False,
+            },
+        )
+
+        result = await node(state)
+
+        diff = result["pending_diff"]
+        validation = diff.validation_result
+        assert validation["pii_detected"] is False
+        assert validation["gate_passed"] is True
+
+
+# =============================================================================
+# Achado PRIV-03 remediação #6 (32ª onda, mutation-hardening) —
+# `_run_creative_validation` chamada DIRETAMENTE, isolada do resto de
+# `write_draft_node`/`make_write_draft_node`.
+#
+# Por que este teste existe além de `TestPiiScanCoversWritePayloadNotJustMirror`
+# (que já cobre o mesmo achado ponta-a-ponta via o nó completo): testar só
+# através do nó insere uma camada de indireção (branching do tool_name,
+# reconstrução de `WriteDiff` via `gateway.create_banner_draft`/
+# `update_banner_draft`, `model_copy`) entre a mutação e a asserção — e ao
+# menos um cenário ponta-a-ponta (update sem dest_url) tinha um confundidor
+# incidental (`gate_passed=False` por outro motivo, dest_url ausente) que já
+# foi corrigido acima, mas serve de lição: quanto mais indireção, mais fácil
+# um mutante sobreviver por coincidência. Chamando `_run_creative_validation`
+# diretamente com um `tool_input` mínimo e limpo (sem nenhum outro campo que
+# possa reprovar o gate-espelho), a ÚNICA forma do dict retornado indicar
+# `pii_detected=True` é o scan sobre o payload de escrita realmente ter
+# rodado — nenhum caminho alternativo, nenhuma coincidência possível.
+# =============================================================================
+
+class TestRunCreativeValidationDirect:
+    """
+    MUTATION-PROOF (camada direta): chama `_run_creative_validation` sem
+    passar por `write_draft_node`, isolando precisamente a lógica do scan de
+    PII sobre o payload de escrita (CreateBannerDraftInput/
+    UpdateBannerDraftInput) — ver docstring do módulo acima.
+    """
+
+    @pytest.mark.asyncio
+    async def test_pii_only_in_write_payload_name_is_detected(self) -> None:
+        from graph.nodes import _run_creative_validation
+
+        gw = make_gateway()
+        tool_input = {
+            "campaign_id": 1,
+            "name": "Contato CPF 123.456.789-00",
+            "creative_type": "image",
+            "asset_url": "https://cdn.example.com/banner.png",
+            "dest_url": "https://anunciante.com",
+            "width": 300,
+            "height": 250,
+            "is_ai_generated": False,
+        }
+
+        result = await _run_creative_validation(
+            gw, TENANT_A, "create_banner_draft", tool_input
+        )
+
+        assert result is not None
+        assert result["pii_detected"] is True, (
+            "sem nenhum confundidor (dest_url/asset_url válidos, sem PII "
+            "neles), pii_detected só pode vir do scan do payload de escrita "
+            "(campo 'name') — se uma mutação pular esse scan (return "
+            "antecipado, condição invertida, loop desativado), este dict "
+            "permaneceria pii_detected=False e este assert vai VERMELHO"
+        )
+        assert result["gate_passed"] is False
+        assert result["is_valid"] is False
+        assert any("name" in v for v in result["violations"])
+
+    @pytest.mark.asyncio
+    async def test_pii_only_in_write_payload_name_is_detected_on_update(self) -> None:
+        from graph.nodes import _run_creative_validation
+
+        gw = make_gateway()
+        tool_input = {
+            "banner_id": 42,
+            "name": "Falar com joao@example.com",
+            "asset_url": "https://cdn.example.com/banner.png",
+            "dest_url": "https://anunciante.com",
+        }
+
+        result = await _run_creative_validation(
+            gw, TENANT_A, "update_banner_draft", tool_input
+        )
+
+        assert result is not None
+        assert result["pii_detected"] is True
+        assert result["gate_passed"] is False
+
+    @pytest.mark.asyncio
+    async def test_clean_name_does_not_trigger_false_positive(self) -> None:
+        """Contraste — evita que o hardening acima vire um mutante na direção oposta (sempre True)."""
+        from graph.nodes import _run_creative_validation
+
+        gw = make_gateway()
+        tool_input = {
+            "campaign_id": 1,
+            "name": "Campanha de inverno",
+            "creative_type": "image",
+            "asset_url": "https://cdn.example.com/banner.png",
+            "dest_url": "https://anunciante.com",
+            "width": 300,
+            "height": 250,
+            "is_ai_generated": False,
+        }
+
+        result = await _run_creative_validation(
+            gw, TENANT_A, "create_banner_draft", tool_input
+        )
+
+        assert result is not None
+        assert result["pii_detected"] is False
+        assert result["gate_passed"] is True
+
+    @pytest.mark.asyncio
+    async def test_non_banner_tool_returns_none(self) -> None:
+        """Guarda de forma: tool_name fora de `_BANNER_DRAFT_INPUT_BY_TOOL` retorna None (não aplicável)."""
+        from graph.nodes import _run_creative_validation
+
+        gw = make_gateway()
+        result = await _run_creative_validation(
+            gw, TENANT_A, "create_cap_draft", {"owner_type": "campaign", "scope": "campaign_total"}
+        )
+        assert result is None
 
 
 # =============================================================================
@@ -723,8 +1228,17 @@ class TestL2TenantIdNotLeakedInResult:
         assert '"tenant_id": tenant_id' not in source, (
             "apply_write não deve retornar tenant_id no resultado"
         )
-        # A remoção deve acontecer
-        assert '"status": "applied"' in source
+        # Achado remediação copilot-honestidade #3 (30ª onda): apply_write
+        # não emite nenhum INSERT/UPDATE (dispatch por operação pendente de
+        # G1) — o status retornado tem de ser honesto ("pending_dispatch"),
+        # nunca "applied" (que afirmaria uma persistência inexistente).
+        assert '"status": "pending_dispatch"' in source, (
+            "apply_write deve retornar um status honesto enquanto o dispatch "
+            "por operação não existir — nunca 'applied' sem ter aplicado nada"
+        )
+        assert '"status": "applied"' not in source, (
+            "apply_write não deve afirmar 'applied' sem emitir nenhuma mutação"
+        )
 
     def test_apply_write_node_filters_tenant_id_from_result(self) -> None:
         """
@@ -1756,16 +2270,18 @@ class TestValidationGateBlocksApplyWrite:
         gw.apply_write.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_apply_write_node_persists_when_no_validation_result(self) -> None:
+    async def test_apply_write_node_persists_when_no_validation_result_for_exempt_entity(self) -> None:
         """
-        Contraste: diff sem validation_result (None) -> apply_write_node segue
-        o fluxo normal (sem regressao para operacoes que nao passam por
-        validate_creative/validate_segmentation, ex.: create_campaign_draft).
+        Contraste: diff sem validation_result (None) PARA UM entity_type na
+        allowlist estreita e explícita `_ENTITY_TYPES_EXEMPT_FROM_VALIDATION_GATE`
+        (ex.: "campaign" — sem asset, sem regra de entrega) -> apply_write_node
+        segue o fluxo normal. Isto NÃO é um bypass geral: é o caminho legítimo
+        e estreito descrito no Achado remediação copilot-honestidade #2.
         """
         from graph.nodes import make_apply_write_node
 
         gw = make_gateway()
-        gw.apply_write = AsyncMock(return_value={"status": "applied", "tenant_id": TENANT_A})
+        gw.apply_write = AsyncMock(return_value={"status": "pending_dispatch", "tenant_id": TENANT_A})
         node = make_apply_write_node(gw)
 
         diff = WriteDiff(
@@ -1795,3 +2311,52 @@ class TestValidationGateBlocksApplyWrite:
 
         assert result["next_action"] == "respond"
         gw.apply_write.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_apply_write_node_blocks_when_no_validation_result_for_gated_entity(self) -> None:
+        """
+        FAIL-CLOSED (Achado remediação copilot-honestidade #2, 30ª onda):
+        diff sem validation_result para um entity_type FORA da allowlist de
+        exceção (ex.: "banner" — é o próprio criativo, sujeito a C2PA/SynthID/
+        disclosure/PII, EU AI Act Art. 50) NUNCA deve persistir. Antes desta
+        remediação, validation_result=None pulava o gate para QUALQUER
+        entity_type — este teste prova que a lacuna foi fechada.
+        """
+        from graph.nodes import make_apply_write_node
+
+        gw = make_gateway()
+        gw.apply_write = AsyncMock(return_value={"status": "pending_dispatch", "tenant_id": TENANT_A})
+        node = make_apply_write_node(gw)
+
+        diff = WriteDiff(
+            operation="create_banner",
+            entity_type="banner",
+            after={"tenant_id": TENANT_A, "name": "Banner sem validação"},
+            # validation_result deliberadamente ausente (None) — nenhum
+            # validate_creative foi chamado para este diff.
+        )
+
+        state: dict[str, Any] = {
+            "tenant_id": TENANT_A,
+            "session_id": "s1",
+            "requested_model_tier": None,
+            "messages": [],
+            "pending_diff": diff,
+            "hitl_approved": True,
+            "hitl_rejection_reason": None,
+            "last_tool_result": None,
+            "judge_result": None,
+            "langfuse_trace_id": None,
+            "input_tokens_used": 0,
+            "output_tokens_used": 0,
+            "next_action": None,
+            "error_message": None,
+        }
+
+        result = await node(state)
+
+        assert result["next_action"] == "error", (
+            "apply_write_node deve recusar diff sem validation_result para "
+            "entity_type fora da allowlist de exceção (fail-closed)"
+        )
+        gw.apply_write.assert_not_called()  # NUNCA persiste sem prova de validação

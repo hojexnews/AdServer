@@ -45,15 +45,20 @@ collector) — o Makefile resolve o contrato de env sozinho.
    réplicas do `decision` e se perde a cada restart. Válido só para um nó.
 4. **Geo funcional por padrão.** Sem `GEOIP_DB_PATH` apontando para um `.mmdb` real, o
    resolver de geo é `EmptyResolver` (log: `"geo: MaxMind dbPath is empty; falling back
-   to EmptyResolver (DA-9)"`) e regra de entrega por país **não dispara**. Mais: mesmo
-   com um `.mmdb` real, o caminho servido de produção (`POST /v1/decide` chamado
-   diretamente pelo navegador via `/asyncjs`) **nunca preenche** `geo_country`/`geo_city`
-   a partir do IP — isso é uma lacuna de wiring do próprio `services/decision`
-   (documentada no cabeçalho de `DecideRequest.GeoCountry` em
-   `services/decision/cmd/decision/main.go`), não uma limitação do perfil beta. A única
-   forma de exercitar uma regra por país hoje é enviar `geo_country` explícito no corpo
-   de `/v1/decide` — é exatamente como `deploy/local/smoke.sh` (reusado por
-   `make beta-check`) exercita `SERVED_TIER_CONTRACT` para BR.
+   to EmptyResolver (DA-9)"`) e regra de entrega por país **não dispara**.
+
+   **Isto mudou nesta onda** (a versão anterior deste parágrafo dizia que o caminho
+   servido "nunca preenche" geo a partir do IP — era verdade até aqui, deixou de ser):
+   `POST /v1/decide` agora **deriva** o geo do IP do cliente (`internal/clientip`,
+   resolve-e-descarta, TX-5/DA-11) quando o corpo **não** traz `geo_country`/`geo_city`.
+   Precedência: **o corpo vence sempre**. Com `GEOIP_DB_PATH` ausente o comportamento
+   degrada exatamente como antes, então no perfil beta a única forma de exercitar uma
+   regra por país continua sendo mandar `geo_country` explícito — é como
+   `deploy/local/smoke.sh` (reusado por `make beta-check`) exercita `SERVED_TIER_CONTRACT`
+   para BR. Consequência de segurança declarada no ADR-0005: como o corpo vence e o
+   perfil beta não tem proxy à frente, `beta-up` exporta `TRUSTED_PROXY_DEPTH=0` e faz
+   bind em **loopback** — a segmentação por país seria falsificável pelo navegador se os
+   endpoints ficassem expostos.
 5. **Gestor do BFF/console.** `make beta-up`/`beta-down` NUNCA tocam nas portas `:3001`
    (BFF) / `:3005` (console) — ver §6.
 
@@ -87,9 +92,13 @@ duplicar a lógica de provisionamento — mesmo schema, mesmos seeds (`db/seed/d
 Env que `beta-up` resolve e injeta (ver `.beta/decision.env` / `.beta/collector.env`
 para o snapshot exato da última subida — `beta-status` já mostra isso):
 
-- `DATABASE_URL` / `TELEMETRY_PG_DSN` →
-  `postgres://adserver_loader:loader_dev_only@localhost:5432/$(BETA_DB)?sslmode=disable`
-  (papel BYPASSRLS, mesmo formato de `make/dev.mk`).
+- `DATABASE_URL` (decision) → `postgres://adserver_loader:...` — papel **BYPASSRLS**,
+  correto AQUI: o construtor de snapshot precisa ler a config de todos os tenants.
+- `TELEMETRY_PG_DSN` (collector) → `postgres://adserver_stats_writer:...` — papel
+  dedicado **NOBYPASSRLS**, com INSERT/SELECT só em `stats.events_raw`. **Não reuse o
+  loader aqui** (privilégio a mais, e ele não tem grant de escrita em `stats` — o
+  sintoma é `permission denied for schema stats` só na etapa de persistência do
+  `beta-check`, depois de decide/pixel/clique passarem).
 - `CAPPING_BACKEND=memory` — sem `REDIS_ADDR` (nunca setado pelo perfil beta).
 - `CAPPING_SALT` / `CK_HMAC_SECRET` — valores de dev fixos (nunca reais; produção usa
   OpenBao).
@@ -122,9 +131,14 @@ exatamente qual foi:
    precisa responder `HTTP 302` (valida a cadeia completa de assinatura entre os dois
    processos — se `CK_HMAC_SECRET` divergir entre eles, esta etapa falha com 400).
 5. **persistência (`stats.events_raw`)** — confirma via `psql` que a tabela existe
-   (`to_regclass`) e que o número de linhas aumentou após os passos 3–4. Se o schema
-   ainda não existir neste checkout, falha **nesta etapa nomeada**, não silenciosamente
-   nem numa etapa anterior.
+   (`to_regclass`) e que existe **pelo menos uma linha com o `decision_id` DESTA
+   execução**. Não é contagem total: a versão anterior fazia `count(*) > 0` sem filtro
+   e foi **provada tautológica** na barreira de guardiões — com o INSERT revogado da
+   role do writer, `/lg` e `/ck` respondiam, nenhuma linha nova era gravada, e o gate
+   ainda dizia PASS medindo linhas de execuções anteriores. O passo também compara o
+   DSN que o collector **no ar** usa (`.beta/collector.env`) com o `BETA_DB` consultado,
+   e falha alto se divergirem — antes, apontado para outro banco, ele acusava
+   "collector não grava" enquanto o collector gravava perfeitamente, em outro lugar.
 
 Ao final, `beta-check` imprime **uma linha só** com o resultado agregado, pensada para
 colar num relatório, por exemplo:
@@ -154,7 +168,7 @@ Confirme antes se as portas de exemplo abaixo (`3011`/`3015`) estão livres
 **BFF**, apontando para o Postgres do beta:
 
 ```
-cd bff && BFF_PG_DSN="postgres://adserver_loader:loader_dev_only@localhost:5432/adserver_beta?sslmode=disable" \
+cd bff && BFF_PG_DSN="postgres://adserver_app:app_dev_only@localhost:5432/adserver_beta?sslmode=disable" \
   ALLOWED_ORIGINS="http://localhost:3015" PORT=3011 npx tsx src/index.ts
 ```
 
@@ -213,6 +227,9 @@ cd web/console && SESSION_COOKIE_NAME="betasess" ALLOWED_ORIGINS="http://localho
   (`PRECONDITION_FAILED`); não existe fonte faturável fora do pipeline Iceberg real
   (DA-7, ADR-0001). O console nunca soma "ao vivo" com "consolidado" nem apresenta o
   ao vivo como faturável (rótulo + `aria-label` de `DataSourceBadge`).
-- Ver `requests` (pré-impressão) reais ou custo real na série ao vivo — são placeholders
-  documentados (`inventoryLoss=0`, `totalCost.amount="0.00"`) enquanto o coletor não
-  rastrear ad-requests e não houver pipeline de custo ligado ao ledger.
+- Ver `requests` (pré-impressão), `inventoryLoss` ou custo na série ao vivo — os três
+  saem **`null`** ("não disponível nesta fonte"), e o console mostra **"—"**. Não são
+  zeros: um ad request precede a escolha de campanha e não é atribuível a um anunciante,
+  e `stats.live_kpis` não tem ligação alguma com o ledger. O `money-ledger-guardian`
+  bloqueou a onda quando `totalCost` saía como `"0.00"` fixo — `R$ 0,00` ao lado de
+  impressões reais é indistinguível de "não gastei nada".

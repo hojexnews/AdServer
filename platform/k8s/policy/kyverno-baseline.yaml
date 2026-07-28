@@ -63,9 +63,21 @@ spec:
               kinds: [Pod]
       validate:
         message: "Imagem deve ter tag explícita e versionada (nunca :latest)."
+        # spec.containers é obrigatório (âncora simples). spec.initContainers e
+        # spec.ephemeralContainers usam a âncora de IGUALDADE "=(chave)": só são
+        # validados SE presentes no Pod — um Pod sem initContainers continua
+        # passando, mas um initContainer com :latest é rejeitado igual a um
+        # container principal (achado `kyverno-baseline-initcontainer-
+        # blindspot`, 30ª onda: initContainers rodam ANTES do container
+        # principal, muitas vezes com mais privilégio/acesso a volumes
+        # compartilhados — vetor real de supply-chain com imagem mutável).
         pattern:
           spec:
             containers:
+              - image: "!*:latest"
+            =(initContainers):
+              - image: "!*:latest"
+            =(ephemeralContainers):
               - image: "!*:latest"
 ---
 apiVersion: kyverno.io/v1
@@ -85,9 +97,30 @@ spec:
               kinds: [Pod]
       validate:
         message: "Todo container deve declarar requests e limits de cpu/memória."
+        # Mesma âncora de igualdade "=(chave)" do disallow-latest-tag: init/
+        # ephemeral containers só são exigidos a ter requests/limits SE
+        # existirem no Pod (achado `kyverno-baseline-initcontainer-
+        # blindspot`, 30ª onda — initContainer sem limits era um vetor real
+        # de exaustão de recursos não coberto). Escopo estrito do fix: só
+        # espelha para initContainers/ephemeralContainers o MESMO pattern já
+        # existente para containers (não altera o pattern em si).
         pattern:
           spec:
             containers:
+              - resources:
+                  requests:
+                    memory: "?*"
+                    cpu: "?*"
+                  limits:
+                    memory: "?*"
+            =(initContainers):
+              - resources:
+                  requests:
+                    memory: "?*"
+                    cpu: "?*"
+                  limits:
+                    memory: "?*"
+            =(ephemeralContainers):
               - resources:
                   requests:
                     memory: "?*"
